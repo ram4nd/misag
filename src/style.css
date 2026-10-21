@@ -1,5 +1,5 @@
 :root {
-  /* Chrome light UI around an xfce4-terminal black terminal. */
+  /* Light tab chrome around a black terminal. --term-bg must match THEME.background in main.ts. */
   --strip: #dee1e6;
   --surface: #e8eaed;
   --panel: #e8eaed;
@@ -29,7 +29,7 @@ body { display: flex; flex-direction: column; }
   flex: 0 1 240px; min-width: 48px; height: 34px; padding: 0 8px 0 14px;
   border-radius: 8px 8px 0 0; color: var(--muted); cursor: default;
 }
-/* Separator between inactive tabs. */
+/* Separator between adjacent tabs, hidden next to the active or hovered tab. */
 .tab + .tab::before {
   content: ""; position: absolute; left: 0; top: 9px; bottom: 9px;
   width: 1px; background: var(--line);
@@ -39,7 +39,8 @@ body { display: flex; flex-direction: column; }
 .tab.active::before, .tab.active + .tab::before, .tab:hover::before, .tab:hover + .tab::before {
   display: none;
 }
-/* Concave corners that blend the active tab into the toolbar band below. */
+/* Concave corners that blend the active tab into the band below.
+   The 8px sizes must match .tab border-radius. */
 .tab.active::after {
   content: ""; position: absolute; bottom: 0; left: -8px; right: -8px; height: 8px;
   background:
@@ -64,7 +65,7 @@ body { display: flex; flex-direction: column; }
 #toggle-sidebar { display: grid; place-items: center; margin-right: 4px; }
 
 /* ---------- sidebar ---------- */
-/* White band under the tabs, like Chrome's toolbar, framing the black terminal. */
+/* Band under the tabs (same colour as the active tab) framing the terminal. */
 #content { flex: 1; display: flex; min-height: 0; padding-top: 4px; background: var(--surface); }
 #sidebar {
   flex: none; width: 240px; overflow: hidden; background: var(--panel);
@@ -95,4 +96,5 @@ dialog {
 dialog::backdrop { background: rgb(0 0 0 / .5); }
 dialog form { display: flex; flex-direction: column; gap: 10px; }
 menu { display: flex; gap: 8px; margin: 0; padding: 0; }
+menu .primary { order: 1; }
 .spacer { flex: 1; }

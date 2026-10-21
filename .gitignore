@@ -1,4 +1,15 @@
+# Logs
+*.log
+logs
+
 node_modules
 dist
+*.local
 src-tauri/target
 src-tauri/gen
+
+# Editor and OS files
+.idea
+.vscode/*
+.DS_Store
+*.sw?

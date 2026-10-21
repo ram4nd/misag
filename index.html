@@ -27,8 +27,9 @@
         <input name="command" placeholder="Command (default: login shell), e.g. claude" />
         <menu>
           <span class="spacer"></span>
-          <button value="cancel" formnovalidate>Cancel</button>
+          <!-- Start comes first so Enter submits it; CSS moves it to the end. -->
           <button value="ok" class="primary">Start</button>
+          <button value="cancel" formnovalidate>Cancel</button>
         </menu>
       </form>
     </dialog>
