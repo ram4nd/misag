@@ -126,6 +126,45 @@ fn is_posix_shell(shell: &str) -> bool {
     POSIX_SHELLS.contains(&name)
 }
 
+/// Variables that only a running Claude Code session sets, to mark its own
+/// process and its children (seen in Claude Code 2.1). They describe whatever
+/// launched raterm, such as a Claude Code session running a dev build, not the
+/// user's environment, so tabs never inherit them; otherwise a `claude` in a tab
+/// would behave as a child of that session. Update when Claude Code adds markers.
+/// User settings (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_*`,
+/// ...) are not on this list.
+pub const LAUNCHER_ENV: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_PID",
+];
+
+/// Variables Claude Code also sets for the commands it runs (for example
+/// `GIT_EDITOR=true`, which makes `git commit` without `-m` abort). A user may set
+/// these on purpose, so they are dropped only when raterm itself was started from
+/// Claude Code (`CLAUDECODE` is set), which is where they then came from.
+pub const CLAUDE_CODE_SHELL_ENV: &[&str] = &[
+    "CLAUDE_EFFORT",
+    "GIT_EDITOR",
+    "DISABLE_UPDATES",
+    "DISABLE_INSTALLATION_CHECKS",
+    "AI_AGENT",
+    "COREPACK_ENABLE_AUTO_PIN",
+    "NoDefaultCurrentDirectoryInExePath",
+];
+
+/// The variables tabs must not inherit, given whether raterm was started from Claude Code.
+pub fn launcher_vars(started_from_claude_code: bool) -> Vec<&'static str> {
+    let extra = if started_from_claude_code { CLAUDE_CODE_SHELL_ENV } else { &[] };
+    LAUNCHER_ENV.iter().chain(extra).copied().collect()
+}
+
 /// Environment variable carrying the program and arguments for `raterm --exec`.
 pub const EXEC_ENV: &str = "RATERM_EXEC";
 pub const EXEC_FLAG: &str = "--exec";
@@ -141,6 +180,8 @@ pub struct Sessions {
     /// raterm's own binary, which runs `Launch::Program` under non-POSIX shells.
     trampoline: Option<String>,
     kill_grace: Duration,
+    /// Inherited variables removed from every tab (see `launcher_vars`).
+    strip_env: Vec<&'static str>,
     next_id: AtomicU32,
     map: Arc<Mutex<HashMap<u32, Arc<Session>>>>,
 }
@@ -161,6 +202,7 @@ impl Sessions {
             shell: shell.into(),
             trampoline: None,
             kill_grace,
+            strip_env: launcher_vars(std::env::var_os("CLAUDECODE").is_some()),
             next_id: AtomicU32::new(0),
             map: Arc::default(),
         }
@@ -191,7 +233,11 @@ impl Sessions {
         let mut writer = pair.master.take_writer().map_err(|e| format!("PTY writer: {e:#}"))?;
 
         let mut cmd = CommandBuilder::new(shell);
-        // Caller variables first, so they cannot override the terminal type.
+        // Launcher state first; `req.env` may still set any of these on purpose.
+        for key in &self.strip_env {
+            cmd.env_remove(key);
+        }
+        // Caller variables before the terminal type, so they cannot override it.
         for (key, value) in &req.env {
             cmd.env(key, value);
         }
@@ -603,6 +649,13 @@ mod tests {
         let p = spawn_with(&s, Launch::Program { program: "printf".into(), args }, None, vec![]);
         p.exit_code();
         assert!(p.text().contains(r#"a b|it's|$HOME|"q"|"#), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn shell_settings_are_dropped_only_when_started_from_claude_code() {
+        assert!(!launcher_vars(false).contains(&"GIT_EDITOR"), "a user's own GIT_EDITOR is kept");
+        assert!(launcher_vars(true).contains(&"GIT_EDITOR"));
+        assert!(LAUNCHER_ENV.iter().all(|k| launcher_vars(false).contains(k)), "session markers always go");
     }
 
     #[test]
