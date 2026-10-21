@@ -20,9 +20,23 @@
     </nav>
     <div id="notice" role="status" hidden><span></span><button title="Dismiss">✕</button></div>
     <div id="content">
-      <aside id="sidebar"></aside>
+      <aside id="sidebar">
+        <button id="open-settings" title="Settings"><span class="icon"></span>Settings</button>
+      </aside>
       <main id="terminals">
         <p id="empty-state">No tabs open. Start a Claude session with the button at the top right.</p>
+        <!-- The settings tab's page, shown in place of the terminals (see showActive in main.ts). Every change is saved right away. -->
+        <section id="settings" class="page" aria-label="Settings" tabindex="-1">
+          <form novalidate>
+            <fieldset>
+              <h2>Claude</h2>
+              <label class="check"><input name="skipPermissions" type="checkbox" /> Skip permission prompts (<code>--dangerously-skip-permissions</code>)</label>
+              <p class="hint">Claude then runs every tool without asking. Applies to Claude tabs started or restarted from now on, which show a red <b>!</b>.</p>
+            </fieldset>
+            <p class="hint not-saving" hidden>raterm is running without its database, so settings last only until it quits.</p>
+            <p class="error" role="alert" hidden></p>
+          </form>
+        </section>
       </main>
     </div>
 

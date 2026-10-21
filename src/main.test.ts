@@ -18,7 +18,9 @@ const fakes = vi.hoisted(() => {
     written: string[] = [];
     handlers: Record<string, Handler> = {};
     disposed = false;
-    constructor() {
+    options: Record<string, unknown>;
+    constructor(options: Record<string, unknown> = {}) {
+      this.options = { ...options };
       FakeTerminal.all.push(this);
     }
     get output() {
@@ -122,6 +124,11 @@ let storeReport: {
 };
 let reported: Set<string>;
 let missingDirs: Set<string>;
+type Settings = Record<string, unknown>;
+let storedSettings: Settings;
+/** settings_load waits for this, so a test can hold the load back. */
+let settingsLoadGate: Promise<void>;
+const DEFAULTS: Settings = { skipPermissions: false };
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -188,6 +195,8 @@ beforeEach(() => {
   storeReport = { store: { state: "saving" }, hookProblem: null };
   reported = new Set();
   missingDirs = new Set();
+  storedSettings = { ...DEFAULTS };
+  settingsLoadGate = Promise.resolve();
   win.closeRequested = undefined;
   win.prevented = false;
   try {
@@ -208,11 +217,18 @@ beforeEach(() => {
       const id = spawnBehaviour(missing ? { ...call, cwd: null } : call, ++nextId);
       // Like the backend: only Claude tabs with a database are tracked.
       const tracked = call.kind === "claude" && storeReport.store.state !== "notSaving";
-      return Promise.resolve(id).then((id) => ({ id, fellBackToHome: missing, tracked, startedAt: 1000 }));
+      const skipsPermissions = call.kind === "claude" && storedSettings.skipPermissions === true;
+      return Promise.resolve(id).then((id) => ({ id, fellBackToHome: missing, tracked, skipsPermissions, startedAt: 1000 }));
     }
     if (cmd === "store_status") return storeReport;
     if (cmd === "claude_reported") return reported.has((args as { tabId: string }).tabId);
     if (cmd === "layout_load") return savedLayout;
+    if (cmd === "settings_load") return settingsLoadGate.then(() => storedSettings);
+    if (cmd === "settings_save") {
+      // Like the backend: stores and returns what it stored.
+      storedSettings = (args as { settings: Settings }).settings;
+      return storedSettings;
+    }
     if (cmd === "pty_cwds") {
       // Like the backend, only the requested sessions are answered.
       const ids = (args as { ids: number[] }).ids;
@@ -584,6 +600,160 @@ describe("saving tabs", () => {
     const saves = callsOf("layout_save").map((c) => (c.args.layout as Layout).tabs.length);
     expect(saves.length).toBeGreaterThan(0);
     expect(saves.every((n) => n === 2)).toBe(true);
+  });
+});
+
+describe("settings", () => {
+  const page = () => document.querySelector<HTMLElement>("#settings")!;
+  const pageShown = () => page().classList.contains("active");
+  const setting = (name: string) =>
+    page().querySelector("form")!.elements.namedItem(name) as HTMLInputElement;
+  const pageError = () => page().querySelector<HTMLElement>(".error")!;
+  const disabled = () => page().querySelector("fieldset")!.disabled;
+  async function openSettings() {
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    for (let i = 0; i < 3; i++) await flush();
+  }
+  async function change(name: string, value: boolean) {
+    setting(name).checked = value;
+    setting(name).dispatchEvent(new Event("change", { bubbles: true }));
+    for (let i = 0; i < 3; i++) await flush();
+  }
+  const settingsTabX = () => tabs().at(-1)!.querySelector<HTMLButtonElement>(".x")!;
+
+  test("the sidebar button opens a settings tab over the terminals, and closing it goes back", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    await openSettings();
+    expect(tabNames()).toEqual(["Claude 1", "Claude 2", "Settings"]);
+    expect(tabs().map((t) => t.classList.contains("active"))).toEqual([false, false, true]);
+    expect(pageShown()).toBe(true);
+    expect([...document.querySelectorAll(".term.active")]).toHaveLength(0);
+    expect(document.activeElement).toBe(page());
+    expect(setting("skipPermissions").checked).toBe(false);
+
+    await openSettings();
+    expect(tabNames()).toEqual(["Claude 1", "Claude 2", "Settings"]);
+    tabs()[0].click();
+    expect(pageShown()).toBe(false);
+    expect(tabs().map((t) => t.classList.contains("active"))).toEqual([true, false, false]);
+    tabs()[2].click();
+    expect(pageShown()).toBe(true);
+    settingsTabX().click();
+    expect(tabNames()).toEqual(["Claude 1", "Claude 2"]);
+    expect(document.querySelectorAll(".term")[0].classList.contains("active")).toBe(true);
+  });
+
+  test("with no other tabs, the settings tab opens and closes back to the empty state", async () => {
+    await boot();
+    await openSettings();
+    expect(tabNames()).toEqual(["Settings"]);
+    expect(pageShown()).toBe(true);
+    settingsTabX().click();
+    expect(tabs()).toHaveLength(0);
+    expect(pageShown()).toBe(false);
+    expect(noTabs()).toBe(true);
+  });
+
+  test("the settings tab is not saved with the tabs", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await openSettings();
+    await win.closeRequested!();
+    expect(lastSaved()!.tabs.map((t) => t.name)).toEqual(["Claude 1"]);
+  });
+
+  test("closing the terminal under a shown settings tab keeps settings shown", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    await openSettings();
+    tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
+    expect(pageShown()).toBe(true);
+    expect(document.querySelectorAll(".term.active")).toHaveLength(0);
+    settingsTabX().click();
+    expect(document.querySelectorAll(".term")[0].classList.contains("active")).toBe(true);
+  });
+
+  test("the page shows the stored value each time it opens, and saves changes", async () => {
+    await boot();
+    await openSettings();
+    expect(setting("skipPermissions").checked).toBe(false);
+    await change("skipPermissions", true);
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ skipPermissions: true });
+    expect(pageError().hidden).toBe(true);
+    settingsTabX().click();
+    // Changed outside the page (another window, or a tab writing the database).
+    storedSettings = { skipPermissions: false };
+    await openSettings();
+    expect(setting("skipPermissions").checked).toBe(false);
+  });
+
+  test("the form stays disabled until the stored settings are read", async () => {
+    storedSettings = { skipPermissions: true };
+    let release!: () => void;
+    settingsLoadGate = new Promise((r) => (release = r));
+    await boot();
+    await openSettings();
+    expect(disabled()).toBe(true);
+    release();
+    await flush();
+    await flush();
+    expect(disabled()).toBe(false);
+    expect(setting("skipPermissions").checked).toBe(true);
+  });
+
+  test("a failed save is shown and the checkbox goes back to the stored value", async () => {
+    await boot();
+    await openSettings();
+    failing.add("settings_save");
+    await change("skipPermissions", true);
+    expect(pageError().hidden).toBe(false);
+    expect(pageError().textContent).toContain("settings_save failed");
+    expect(setting("skipPermissions").checked).toBe(false);
+    failing.delete("settings_save");
+    await change("skipPermissions", true);
+    expect(pageError().hidden).toBe(true);
+    expect(storedSettings.skipPermissions).toBe(true);
+  });
+
+  test("saves run in order", async () => {
+    await boot();
+    await openSettings();
+    await change("skipPermissions", true);
+    await change("skipPermissions", false);
+    expect(callsOf("settings_save").map((c) => (c.args.settings as Settings).skipPermissions)).toEqual([true, false]);
+    expect(storedSettings.skipPermissions).toBe(false);
+  });
+
+  test("unreadable settings are shown and cannot be changed", async () => {
+    failing.add("settings_load");
+    await boot();
+    await openSettings();
+    expect(disabled()).toBe(true);
+    expect(pageError().textContent).toContain("Claude tabs start with the defaults");
+  });
+
+  test("Claude tabs started with skipped permissions are marked", async () => {
+    storedSettings = { skipPermissions: true };
+    await boot();
+    await openClaudeTabs(1);
+    expect(tabs()[0].querySelector(".badge")).not.toBeNull();
+    expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
+    storedSettings = { skipPermissions: false };
+    terms()[0].handlers.title?.("busy");
+    expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
+    // The restart picks up the current setting.
+    spawns()[0].onExit.onmessage(0);
+    terms()[0].handlers.data("\r");
+    for (let i = 0; i < 3; i++) await flush();
+    expect(tabs()[0].querySelector(".badge")).toBeNull();
+  });
+
+  test("without a database the page says settings are not kept", async () => {
+    storeReport = { store: { state: "notSaving", reason: "no data dir" }, hookProblem: null };
+    await boot();
+    await openSettings();
+    expect(page().querySelector<HTMLElement>(".not-saving")!.hidden).toBe(false);
   });
 });
 

@@ -6,6 +6,7 @@ use crate::claude::{self, HookProblem, SessionId};
 use crate::db::{Db, StoreStatus};
 use crate::layout::{Layout, TabId};
 use crate::session::{self, Launch, SpawnError, Sessions, SpawnRequest};
+use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -71,6 +72,8 @@ pub struct Spawned {
     tracked: bool,
     /// When the tab started (unix seconds), for `claude_reported`.
     started_at: u64,
+    /// A Claude tab started with `--dangerously-skip-permissions`, so the UI can mark it.
+    skips_permissions: bool,
 }
 
 /// Serialised as `code` in `CommandError`, so failures can be told apart without
@@ -124,6 +127,8 @@ pub enum LaunchPlan<'a> {
         hook: Option<HookTarget<'a>>,
         /// Resume the session's conversation rather than start a new one under its id.
         resume: bool,
+        /// The settings as of this launch.
+        settings: Settings,
     },
 }
 
@@ -144,18 +149,26 @@ pub fn launch_plan<'a>(tab: &'a TabLaunch, exe: &'a AppExe, db: &'a Db) -> Resul
     let resume = claude::should_resume(&session, reported.as_deref(), projects.as_deref())
         .map_err(|e| format!("cannot tell whether Claude session {session} has a conversation to resume: {e}"))?;
     let hook = db.hook_path().map(|db| HookTarget { exe, db });
-    Ok(LaunchPlan::Claude { tab_id: &tab.tab_id, session, hook, resume })
+    // The defaults are the cautious choice (Claude asks before running tools), so an
+    // unreadable setting never blocks a tab; the Settings tab shows the error.
+    let settings = db.load_settings().unwrap_or_else(|e| {
+        eprintln!("raterm: {e}; starting Claude with the default settings");
+        Settings::default()
+    });
+    Ok(LaunchPlan::Claude { tab_id: &tab.tab_id, session, hook, resume, settings })
 }
 
 /// Terminal tabs run their command (a blank one is a login shell). Claude tabs run
-/// Claude Code pinned to their session, with the hook environment that lets
-/// `raterm --claude-hook` record session changes for this tab.
+/// Claude Code pinned to their session, preceded by the arguments the settings add,
+/// with the hook environment that lets `raterm --claude-hook` record session
+/// changes for this tab.
 pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
     match plan {
         LaunchPlan::Terminal { command: Some(c) } => (Launch::Command((*c).to_owned()), vec![]),
         LaunchPlan::Terminal { command: None } => (Launch::LoginShell, vec![]),
-        LaunchPlan::Claude { tab_id, session, hook, resume } => {
-            let args = claude::args(session, *resume, hook.map(|h| h.exe));
+        LaunchPlan::Claude { tab_id, session, hook, resume, settings } => {
+            let mut args = settings.claude_args();
+            args.extend(claude::args(session, *resume, hook.map(|h| h.exe)));
             let env = match hook {
                 // `Db` only keeps a UTF-8 path, so nothing is lost here.
                 Some(HookTarget { db, .. }) => vec![
@@ -175,18 +188,20 @@ pub struct SpawnPlan {
     pub request: SpawnRequest,
     pub fell_back_to_home: bool,
     pub tracked: bool,
+    pub skips_permissions: bool,
 }
 
 pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db) -> Result<SpawnPlan, CommandError> {
     let plan = launch_plan(tab, exe, db)?;
     let tracked = matches!(plan, LaunchPlan::Claude { hook: Some(_), .. });
+    let skips_permissions = matches!(&plan, LaunchPlan::Claude { settings, .. } if settings.skip_permissions);
     let (launch, env) = launch_for(&plan);
     let (cwd, fell_back_to_home) = match tab.fallback_to_home {
         true => session::cwd_or_home(tab.cwd.clone())?,
         false => (tab.cwd.clone(), false),
     };
     let request = SpawnRequest { cols: tab.cols, rows: tab.rows, cwd, launch, env };
-    Ok(SpawnPlan { request, fell_back_to_home, tracked })
+    Ok(SpawnPlan { request, fell_back_to_home, tracked, skips_permissions })
 }
 
 /// Starts a tab's process; see `plan_spawn`.
@@ -210,7 +225,8 @@ pub fn pty_spawn(
             }
         },
     )?;
-    Ok(Spawned { id, fell_back_to_home: plan.fell_back_to_home, tracked: plan.tracked, started_at })
+    let SpawnPlan { fell_back_to_home, tracked, skips_permissions, .. } = plan;
+    Ok(Spawned { id, fell_back_to_home, tracked, skips_permissions, started_at })
 }
 
 #[tauri::command]
@@ -238,6 +254,17 @@ pub fn pty_reset(state: State<'_, Sessions>) {
 #[tauri::command(async)]
 pub fn pty_cwds(state: State<'_, Sessions>, ids: Vec<u32>) -> HashMap<u32, String> {
     ids.into_iter().filter_map(|id| Some((id, state.cwd(id)?))).collect()
+}
+
+#[tauri::command(async)]
+pub fn settings_load(db: State<'_, Db>) -> Result<Settings, CommandError> {
+    Ok(db.load_settings()?)
+}
+
+/// Stores the settings and returns them as stored.
+#[tauri::command(async)]
+pub fn settings_save(db: State<'_, Db>, settings: Settings) -> Result<Settings, CommandError> {
+    Ok(db.save_settings(settings)?)
 }
 
 #[tauri::command(async)]
@@ -318,7 +345,7 @@ mod tests {
     fn claude_tabs_run_claude_with_the_hook_environment() {
         let tab_id = tid("tab-1");
         let hook = Some(HookTarget { exe: Path::new(EXE), db: Path::new("/data/raterm.db") });
-        let plan = LaunchPlan::Claude { tab_id: &tab_id, session: session(), hook, resume: false };
+        let plan = LaunchPlan::Claude { tab_id: &tab_id, session: session(), hook, resume: false, settings: Settings::default() };
         let (launch, env) = launch_for(&plan);
         let Launch::Program { program, args } = launch else { panic!("expected a program") };
         assert_eq!(program, "claude");
@@ -332,7 +359,7 @@ mod tests {
     #[test]
     fn without_a_database_claude_runs_without_the_hook() {
         let tab_id = tid("tab-1");
-        let (launch, env) = launch_for(&LaunchPlan::Claude { tab_id: &tab_id, session: session(), hook: None, resume: false });
+        let (launch, env) = launch_for(&LaunchPlan::Claude { tab_id: &tab_id, session: session(), hook: None, resume: false, settings: Settings::default() });
         let Launch::Program { args, .. } = launch else { panic!("expected a program") };
         assert_eq!(args, ["--session-id", ID]);
         assert!(env.is_empty());
@@ -347,7 +374,7 @@ mod tests {
         let hook = Some(HookTarget { exe: Path::new(EXE), db: path.as_path() });
         assert_eq!(
             launch_plan(&request, &exe, &db).unwrap(),
-            LaunchPlan::Claude { tab_id: &request.tab_id, session: session(), hook, resume: false }
+            LaunchPlan::Claude { tab_id: &request.tab_id, session: session(), hook, resume: false, settings: Settings::default() }
         );
 
         let transcript = path.with_extension("jsonl");
@@ -355,6 +382,34 @@ mod tests {
         record_claude_session(&connect_existing(&path).unwrap(), &report(&request.tab_id, &session(), transcript.to_str()))
             .unwrap();
         assert!(matches!(launch_plan(&request, &exe, &db).unwrap(), LaunchPlan::Claude { resume: true, .. }));
+    }
+
+    #[test]
+    fn claude_tabs_get_the_arguments_the_settings_add() {
+        let db = Db::open(temp_db("plan-args")).unwrap();
+        let request = claude_tab();
+        let exe = exe();
+        assert!(!plan_spawn(&request, &exe, &db).unwrap().skips_permissions);
+
+        db.save_settings(Settings { skip_permissions: true }).unwrap();
+        let plan = launch_plan(&request, &exe, &db).unwrap();
+        let (Launch::Program { args, .. }, _) = launch_for(&plan) else { panic!("expected a program") };
+        let mut expected = vec!["--dangerously-skip-permissions".to_string()];
+        expected.extend(claude::args(&session(), false, db.hook_path().map(|_| Path::new(EXE))));
+        assert_eq!(args, expected);
+        assert!(plan_spawn(&request, &exe, &db).unwrap().skips_permissions);
+        assert!(!plan_spawn(&terminal_tab(), &exe, &db).unwrap().skips_permissions, "only Claude tabs");
+    }
+
+    #[test]
+    fn unreadable_settings_start_claude_with_the_defaults() {
+        let path = temp_db("plan-bad-settings");
+        let db = Db::open(path.clone()).unwrap();
+        db.save_settings(Settings { skip_permissions: true }).unwrap();
+        connect_existing(&path).unwrap().execute("DELETE FROM settings", []).unwrap();
+        let request = claude_tab();
+        let LaunchPlan::Claude { settings, .. } = launch_plan(&request, &exe(), &db).unwrap() else { panic!() };
+        assert_eq!(settings, Settings::default());
     }
 
     #[test]

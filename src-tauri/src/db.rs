@@ -8,6 +8,7 @@
 
 use crate::claude::SessionId;
 use crate::layout::{Layout, Tab, TabId, TabKind};
+use crate::settings::Settings;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::fmt;
@@ -44,6 +45,15 @@ const MIGRATIONS: &[&str] = &[r#"
         transcript_path TEXT,
         updated_at      INTEGER NOT NULL
     );
+"#, r#"
+    -- The user's settings: one row, one column per setting. A new setting is a new
+    -- migration adding a column with a default; like every schema change, it makes
+    -- older raterm versions refuse the database.
+    CREATE TABLE settings (
+        id               INTEGER PRIMARY KEY CHECK (id = 1),
+        skip_permissions INTEGER NOT NULL DEFAULT 0 CHECK (skip_permissions IN (0, 1))
+    );
+    INSERT INTO settings (id) VALUES (1);
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -359,6 +369,27 @@ impl Db {
         tx.commit().map_err(sql)
     }
 
+    /// The stored settings (the migration created their row with the defaults).
+    pub fn load_settings(&self) -> Result<Settings, String> {
+        self.conn()
+            .query_row("SELECT skip_permissions FROM settings WHERE id = 1", [], |r| {
+                Ok(Settings { skip_permissions: r.get(0)? })
+            })
+            .map_err(sql)
+    }
+
+    /// Stores the settings, returning them as stored.
+    pub fn save_settings(&self, settings: Settings) -> Result<Settings, String> {
+        let changed = self
+            .conn()
+            .execute("UPDATE settings SET skip_permissions = ?1 WHERE id = 1", [settings.skip_permissions])
+            .map_err(sql)?;
+        if changed != 1 {
+            return Err("the settings row is missing, so nothing was saved".into());
+        }
+        self.load_settings()
+    }
+
     /// The transcript the hook last reported for `session`, if any. Two tabs can be
     /// in the same session (`/resume` of it in both); the newest report wins.
     pub fn transcript_for(&self, session: &SessionId) -> Result<Option<PathBuf>, String> {
@@ -551,6 +582,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn upgrading_a_first_version_database_keeps_its_data_and_adds_the_settings() {
+        let path = temp_db("upgrade-v1");
+        let mut conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO tabs (position, tab_id, kind, name, renamed, claude_session) VALUES (0, 'a', 'claude', 'tab a', 0, ?1)",
+            [S1],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let db = Db::open(path.clone()).unwrap();
+        assert_eq!(db.load_layout().unwrap().tabs, vec![Tab { cwd: None, ..claude_tab("a", Some(S1)) }]);
+        assert_eq!(db.load_settings().unwrap(), Settings::default());
+        drop(db);
+        // Opening again does not run the migration twice (a second settings row would fail).
+        let db = Db::open(path).unwrap();
+        assert!(db.save_settings(Settings { skip_permissions: true }).unwrap().skip_permissions);
+    }
+
+    #[test]
+    fn saving_without_the_settings_row_is_an_error() {
+        let path = temp_db("settings-no-row");
+        let db = Db::open(path.clone()).unwrap();
+        connect_existing(&path).unwrap().execute("DELETE FROM settings", []).unwrap();
+        let err = db.save_settings(Settings { skip_permissions: true }).unwrap_err();
+        assert!(err.contains("settings row is missing"), "{err}");
+    }
+
+    #[test]
     fn layout_round_trips() {
         let db = Db::open(temp_db("roundtrip")).unwrap();
         assert_eq!(db.load_layout().unwrap(), Layout::default());
@@ -561,6 +625,27 @@ pub(crate) mod tests {
         let smaller = Layout { active: 0, tabs: vec![terminal_tab("b")] };
         db.save_layout(smaller.clone()).unwrap();
         assert_eq!(db.load_layout().unwrap(), smaller);
+    }
+
+    #[test]
+    fn settings_round_trip_and_start_as_the_defaults() {
+        let path = temp_db("settings");
+        let db = Db::open(path.clone()).unwrap();
+        assert_eq!(db.load_settings().unwrap(), Settings::default());
+        let saved = db.save_settings(Settings { skip_permissions: true }).unwrap();
+        assert!(saved.skip_permissions);
+        drop(db);
+        assert_eq!(Db::open(path).unwrap().load_settings().unwrap(), saved);
+    }
+
+    #[test]
+    fn the_schema_refuses_settings_values_it_does_not_know() {
+        let path = temp_db("settings-check");
+        let db = Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        assert!(conn.execute("UPDATE settings SET skip_permissions = 2", []).is_err());
+        assert!(conn.execute("INSERT INTO settings (id) VALUES (2)", []).is_err(), "one row only");
+        assert_eq!(db.load_settings().unwrap(), Settings::default());
     }
 
     #[test]

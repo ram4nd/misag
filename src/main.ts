@@ -44,6 +44,8 @@ interface Session {
   el: HTMLDivElement;
   exited: boolean;
   closing: boolean;
+  /** The running process is Claude started with `--dangerously-skip-permissions`. */
+  skipsPermissions: boolean;
 }
 
 interface SpawnOptions {
@@ -73,6 +75,7 @@ interface Spawned {
   tracked: boolean;
   /** Unix seconds, for `claude_reported`. */
   startedAt: number;
+  skipsPermissions: boolean;
 }
 
 /** Mirrors `db::StoreStatus` in src-tauri/src/db.rs. */
@@ -105,6 +108,13 @@ interface Layout {
   active: number;
 }
 
+/** Mirrors `settings::Settings` in src-tauri/src/settings.rs. */
+interface Settings {
+  /** Start Claude tabs with `--dangerously-skip-permissions`. */
+  skipPermissions: boolean;
+}
+
+
 /** How long after a Claude tab starts its session hook should have reported in. */
 const HOOK_REPORT_DELAY_MS = 60_000;
 /** Polling interval for the backend's saving and hook status, and for re-checking a hook report. */
@@ -120,6 +130,14 @@ const CLAUDE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden
   <g stroke="#d97757" stroke-width="2.6" stroke-linecap="round">
     <path d="M12 2.5v6M12 15.5v6M2.5 12h6M15.5 12h6" />
     <path d="M5.6 5.6l3.6 3.6M14.8 14.8l3.6 3.6M18.4 5.6l-3.6 3.6M9.2 14.8l-3.6 3.6" />
+  </g>
+</svg>`;
+
+// Constant markup, like CLAUDE_ICON.
+const SETTINGS_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
+  <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+    <circle cx="12" cy="12" r="3.2" />
+    <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1" />
   </g>
 </svg>`;
 
@@ -145,9 +163,18 @@ const tabsEl = $<HTMLDivElement>("#tabs");
 const termsEl = $<HTMLElement>("#terminals");
 const spawnDialog = $<HTMLDialogElement>("#spawn-dialog");
 const noticeEl = $<HTMLDivElement>("#notice");
+const settingsEl = $<HTMLElement>("#settings");
+const settingsForm = settingsEl.querySelector("form")!;
 
 const sessions: Session[] = [];
+/** The last terminal tab selected; while the settings tab is shown, it stays selected underneath. */
 let active: Session | null = null;
+/** The settings tab: not in the tab bar, open behind a terminal, or shown. It is not saved with the tabs. */
+let settingsTab: "closed" | "open" | "shown" = "closed";
+/** The stored settings, as last loaded or saved by the settings tab. */
+let settings: Settings = { skipPermissions: false };
+/** The settings tab, while it is in the tab bar. */
+let settingsTabEl: HTMLElement | null = null;
 let counter = 0;
 const encoder = new TextEncoder();
 
@@ -194,7 +221,7 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, fit, el, exited: false, closing: false,
+    id: null, starts: 0, term, fit, el, exited: false, closing: false, skipsPermissions: false,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
     name: opts.name || defaultName,
@@ -226,7 +253,7 @@ async function spawn(opts: SpawnOptions) {
     const tab = tabsEl.children[sessions.indexOf(s)];
     const label = tab?.querySelector(".name");
     if (tab instanceof HTMLElement && label) {
-      tab.title = title;
+      tab.title = tabTitle(s);
       label.textContent = title;
     }
     scheduleSave();
@@ -268,6 +295,10 @@ async function start(s: Session, fallbackToHome: boolean) {
       s.cwd = undefined;
     }
     if (started.tracked) watchHookReport(s, started.startedAt, startNo);
+    if (started.skipsPermissions !== s.skipsPermissions) {
+      s.skipsPermissions = started.skipsPermissions;
+      renderSessions();
+    }
   } catch (err) {
     markExited(s, `could not start: ${errorText(err)}`, true);
   }
@@ -343,16 +374,27 @@ function markExited(s: Session, message: string, error = false) {
 function activate(s: Session) {
   if (active !== s) scheduleSave();
   active = s;
-  // Toggle classes in place rather than re-rendering, so a click followed by a
-  // double-click (rename) lands on the same tab element.
-  sessions.forEach((o, i) => {
-    o.el.classList.toggle("active", o === s);
-    tabsEl.children[i]?.classList.toggle("active", o === s);
-  });
+  if (settingsTab === "shown") settingsTab = "open";
+  showActive();
   requestAnimationFrame(() => {
     s.fit.fit();
     s.term.focus();
   });
+}
+
+/**
+ * Marks the visible tab and pane: the settings tab if shown, else the active terminal.
+ * Classes are toggled in place rather than re-rendering, so a click followed by a
+ * double-click (rename) lands on the same tab element.
+ */
+function showActive() {
+  const shown = settingsTab === "shown";
+  sessions.forEach((o, i) => {
+    o.el.classList.toggle("active", !shown && o === active);
+    tabsEl.children[i]?.classList.toggle("active", !shown && o === active);
+  });
+  settingsEl.classList.toggle("active", shown);
+  settingsTabEl?.classList.toggle("active", shown);
 }
 
 function close(s: Session) {
@@ -370,8 +412,11 @@ function close(s: Session) {
 
   renderSessions();
   if (active === s) {
+    const next = sessions[Math.min(i, sessions.length - 1)] ?? null;
     active = null;
-    if (sessions.length) activate(sessions[Math.min(i, sessions.length - 1)]);
+    // Behind a shown settings tab, the neighbour is only selected.
+    if (next && settingsTab !== "shown") activate(next);
+    else active = next;
   }
   scheduleSave();
 }
@@ -409,9 +454,10 @@ function renderSessions() {
     ...sessions.map((s) => {
       const tab = document.createElement("div");
       tab.className = "tab";
-      tab.title = s.name;
-      tab.classList.toggle("active", s === active);
+      tab.title = tabTitle(s);
+      tab.classList.toggle("active", s === active && settingsTab !== "shown");
       tab.classList.toggle("exited", s.exited);
+      tab.classList.toggle("skips-permissions", s.skipsPermissions);
 
       const name = document.createElement("span");
       name.className = "name";
@@ -432,6 +478,12 @@ function renderSessions() {
         icon.innerHTML = CLAUDE_ICON;
         tab.append(icon);
       }
+      if (s.skipsPermissions) {
+        const badge = document.createElement("span");
+        badge.className = "badge";
+        badge.textContent = "!";
+        tab.append(badge);
+      }
       tab.append(name, x);
       tab.onclick = () => activate(s);
       tab.ondblclick = () => rename(s, tab);
@@ -442,6 +494,119 @@ function renderSessions() {
       return tab;
     }),
   );
+  settingsTabEl = settingsTab === "closed" ? null : renderSettingsTab();
+  if (settingsTabEl) tabsEl.append(settingsTabEl);
+}
+
+/** The tab's tooltip: its name, and a warning while Claude runs tools without asking. */
+function tabTitle(s: Session): string {
+  return s.skipsPermissions ? `${s.name} (Claude runs tools without asking: --dangerously-skip-permissions)` : s.name;
+}
+
+function renderSettingsTab(): HTMLElement {
+  const tab = document.createElement("div");
+  tab.className = "tab settings";
+  tab.title = "Settings";
+  tab.classList.toggle("active", settingsTab === "shown");
+  const icon = document.createElement("span");
+  icon.className = "icon";
+  icon.innerHTML = SETTINGS_ICON;
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = "Settings";
+  const x = document.createElement("button");
+  x.className = "x";
+  x.textContent = "✕";
+  x.title = "Close tab";
+  x.onclick = (e) => {
+    e.stopPropagation();
+    closeSettings();
+  };
+  tab.append(icon, name, x);
+  tab.onclick = () => openSettings();
+  tab.onauxclick = (e) => {
+    if (e.button === 1) closeSettings();
+  };
+  return tab;
+}
+
+// ---------- settings ----------
+
+function settingsField(name: string) {
+  return settingsForm.elements.namedItem(name) as HTMLInputElement;
+}
+
+function fillSettingsForm() {
+  settingsField("skipPermissions").checked = settings.skipPermissions;
+}
+
+function readSettingsForm(): Settings {
+  return { skipPermissions: settingsField("skipPermissions").checked };
+}
+
+function showSettingsError(message: string | null) {
+  const el = settingsForm.querySelector<HTMLElement>(".error")!;
+  el.hidden = !message;
+  el.textContent = message ?? "";
+}
+
+/**
+ * Fills the form from the stored settings, which every launch reads too, so the page
+ * shows what new Claude tabs will use. The form is disabled until they are read,
+ * and stays disabled if they cannot be, so nothing is saved over them.
+ */
+async function loadSettingsForm() {
+  const fieldset = settingsForm.querySelector("fieldset")!;
+  fieldset.disabled = true;
+  try {
+    settings = await invoke<Settings>("settings_load");
+    fillSettingsForm();
+    showSettingsError(null);
+    fieldset.disabled = false;
+  } catch (err) {
+    console.error("raterm: could not load settings", err);
+    showSettingsError(
+      `Settings could not be read (${errorText(err)}), so Claude tabs start with the defaults and settings cannot be changed.`,
+    );
+  }
+}
+
+/** Saves the form; if that fails, the form goes back to the stored settings. */
+async function saveSettingsForm() {
+  try {
+    settings = await invoke<Settings>("settings_save", { settings: readSettingsForm() });
+    showSettingsError(null);
+  } catch (err) {
+    console.error("raterm: could not save settings", err);
+    showSettingsError(`Settings not saved: ${errorText(err)}`);
+  }
+  fillSettingsForm();
+}
+
+// Loads and saves run one after another, so an earlier one cannot finish last and win.
+let settingsQueue = Promise.resolve();
+const queueSettings = (task: () => Promise<void>) => {
+  settingsQueue = settingsQueue.then(task);
+};
+settingsForm.onchange = () => queueSettings(saveSettingsForm);
+settingsForm.onsubmit = (e) => e.preventDefault();
+
+function openSettings() {
+  if (settingsTab === "closed") queueSettings(loadSettingsForm);
+  settingsTab = "shown";
+  renderSessions();
+  showActive();
+  // The page, not the checkbox: a key typed while switching must not change a setting.
+  settingsEl.focus();
+}
+
+function closeSettings() {
+  if (settingsTab === "closed") return;
+  const wasShown = settingsTab === "shown";
+  settingsTab = "closed";
+  renderSessions();
+  if (wasShown && active) activate(active);
+  else showActive();
 }
 
 // ---------- notices ----------
@@ -563,6 +728,7 @@ async function showStoreStatus() {
   if (store.state === "recovered") setNotice("store", store.notice);
   else if (store.state === "notSaving") setNotice("store", `Tabs are not being saved: ${store.reason}.`, false);
   else setNotice("store", null);
+  settingsForm.querySelector<HTMLElement>(".not-saving")!.hidden = store.state !== "notSaving";
   setNotice(
     "hook",
     hookProblem && `Claude session tracking failed (${hookProblem.message}); see ${hookProblem.log}.`,
@@ -659,7 +825,13 @@ newClaudeButton.onclick = (e) => {
   if (e.shiftKey) return askClaudeTab();
   openClaudeTab();
 };
-new ResizeObserver(() => active?.fit.fit()).observe(termsEl);
+const settingsButton = $<HTMLButtonElement>("#open-settings");
+settingsButton.querySelector(".icon")!.innerHTML = SETTINGS_ICON;
+settingsButton.onclick = () => openSettings();
+// A hidden terminal has no size to fit to; it is fitted when shown again.
+new ResizeObserver(() => {
+  if (settingsTab !== "shown") active?.fit.fit();
+}).observe(termsEl);
 
 const SIDEBAR_KEY = "raterm.sidebarCollapsed";
 function setSidebar(collapsed: boolean) {

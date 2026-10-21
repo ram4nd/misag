@@ -3,6 +3,7 @@ mod commands;
 pub mod db;
 pub mod layout;
 pub mod session;
+pub mod settings;
 
 use std::path::PathBuf;
 use tauri::{Manager, RunEvent};
@@ -103,6 +104,8 @@ pub fn run() {
             commands::layout_save,
             commands::store_status,
             commands::claude_reported,
+            commands::settings_load,
+            commands::settings_save,
         ])
         .build(tauri::generate_context!())
         .expect("error while building raterm")

@@ -67,6 +67,11 @@ body { display: flex; flex-direction: column; }
 #tab-actions button { display: grid; place-items: center; }
 .tab .icon { flex: none; display: grid; place-items: center; }
 .tab.exited .icon { opacity: .5; }
+/* Claude in this tab runs tools without asking (--dangerously-skip-permissions). */
+.tab .badge {
+  flex: none; width: 16px; height: 16px; border-radius: 50%; background: #b3261e; color: #ffffff;
+  font-size: 11px; font-weight: 700; line-height: 16px; text-align: center;
+}
 
 /* ---------- notice ---------- */
 #notice {
@@ -85,6 +90,13 @@ body { display: flex; flex-direction: column; }
   border-right: 1px solid var(--press); transition: width .15s ease;
 }
 body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
+#sidebar { display: flex; flex-direction: column; }
+#open-settings {
+  margin-top: auto; display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  border-radius: 0; background: none; color: var(--muted); white-space: nowrap; text-align: left;
+}
+#open-settings:hover { background: var(--press); color: var(--fg); }
+#open-settings .icon { display: grid; place-items: center; }
 
 /* ---------- terminals ---------- */
 #terminals { min-width: 0; flex: 1; position: relative; min-height: 0; background: var(--term-bg); }
@@ -95,6 +107,23 @@ body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
   color: #9aa0a6; font-size: 14px;
 }
 body.no-tabs #empty-state { display: grid; }
+
+/* ---------- settings page ---------- */
+.page {
+  position: absolute; inset: 0; z-index: 1; display: none; overflow: auto;
+  padding: 24px; background: var(--surface);
+}
+.page.active { display: block; }
+.page form { max-width: 520px; }
+.page fieldset { display: flex; flex-direction: column; gap: 12px; margin: 0; padding: 0; border: 0; }
+.page h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.page label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+.page label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--fg); }
+.page label.check input { width: auto; margin: 0; }
+.page .hint { margin: 0; color: var(--muted); }
+.page .error { margin: 12px 0 0; color: #b3261e; }
+.page .error[hidden], .page .hint[hidden] { display: none; }
+.page { outline: none; }
 
 /* ---------- dialog ---------- */
 button {
@@ -117,3 +146,4 @@ dialog h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
 menu { display: flex; gap: 8px; margin: 0; padding: 0; }
 menu .primary { order: 1; }
 .spacer { flex: 1; }
+.page .not-saving { margin-top: 12px; }
