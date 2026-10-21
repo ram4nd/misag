@@ -56,13 +56,26 @@ body { display: flex; flex-direction: column; }
 }
 .tab .x:hover { background: var(--press); }
 .tab input { height: 22px; padding: 2px 6px; }
-#toggle-sidebar, #new-session {
+#toggle-sidebar, #tab-actions button {
   flex: none; width: 28px; height: 28px; margin-bottom: 3px; padding: 0;
   border-radius: 50%; font-size: 18px; line-height: 28px; background: none; color: var(--muted);
 }
-#toggle-sidebar:hover, #new-session:hover { background: var(--press); color: var(--fg); }
+#toggle-sidebar:hover, #tab-actions button:hover { background: var(--press); color: var(--fg); }
 
 #toggle-sidebar { display: grid; place-items: center; margin-right: 4px; }
+#tab-actions { flex: none; display: flex; gap: 2px; margin-left: auto; padding-left: 8px; }
+#tab-actions button { display: grid; place-items: center; }
+.tab .icon { flex: none; display: grid; place-items: center; }
+.tab.exited .icon { opacity: .5; }
+
+/* ---------- notice ---------- */
+#notice {
+  flex: none; display: flex; align-items: center; gap: 8px; padding: 6px 12px;
+  background: #fef7e0; color: #3c2a00; border-bottom: 1px solid #f2d27a;
+}
+#notice[hidden], #notice button[hidden] { display: none; }
+#notice span { flex: 1; }
+#notice button { background: none; padding: 0 4px; color: inherit; }
 
 /* ---------- sidebar ---------- */
 /* Band under the tabs (same colour as the active tab) framing the terminal. */
@@ -77,6 +90,11 @@ body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
 #terminals { min-width: 0; flex: 1; position: relative; min-height: 0; background: var(--term-bg); }
 .term { position: absolute; inset: 0; padding: 6px; display: none; }
 .term.active { display: block; }
+#empty-state {
+  position: absolute; inset: 0; display: none; place-items: center; margin: 0;
+  color: #9aa0a6; font-size: 14px;
+}
+body.no-tabs #empty-state { display: grid; }
 
 /* ---------- dialog ---------- */
 button {
@@ -95,6 +113,7 @@ dialog {
 }
 dialog::backdrop { background: rgb(0 0 0 / .5); }
 dialog form { display: flex; flex-direction: column; gap: 10px; }
+dialog h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
 menu { display: flex; gap: 8px; margin: 0; padding: 0; }
 menu .primary { order: 1; }
 .spacer { flex: 1; }

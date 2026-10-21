@@ -4,19 +4,35 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// How long a closed session gets to exit on SIGHUP before it is sent SIGKILL.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// What a session runs, always through the user's login shell so PATH and the
+/// rest of their environment are set up.
+#[derive(Debug, PartialEq, Default)]
+pub enum Launch {
+    #[default]
+    LoginShell,
+    /// A command line, interpreted by the shell.
+    Command(String),
+    /// A program with arguments, passed through without shell interpretation.
+    Program { program: String, args: Vec<String> },
+}
+
+#[derive(Default)]
 pub struct SpawnRequest {
     pub cols: u16,
     pub rows: u16,
+    /// None (or blank) for `$HOME`; a leading `~` is expanded.
     pub cwd: Option<String>,
-    pub command: Option<String>,
+    pub launch: Launch,
+    /// Extra environment, set before the terminal variables so it cannot override them.
+    pub env: Vec<(String, String)>,
 }
 
 struct Session {
@@ -27,23 +43,43 @@ struct Session {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
     /// Set once the child has been reaped, so SIGKILL never hits a reused pid.
-    exited: Arc<AtomicBool>,
+    exited: Arc<ExitFlag>,
+}
+
+/// Set by the thread that reaps a session's child; others can wait for it.
+#[derive(Default)]
+struct ExitFlag {
+    done: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl ExitFlag {
+    fn set(&self) {
+        *lock(&self.done) = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits up to `timeout` for the flag; returns whether it is set.
+    fn wait(&self, timeout: Duration) -> bool {
+        let guard = lock(&self.done);
+        let (done, _) = self.changed.wait_timeout_while(guard, timeout, |done| !*done).unwrap_or_else(|e| e.into_inner());
+        *done
+    }
 }
 
 impl Session {
     /// Sends SIGHUP, then SIGKILL to the child's process groups if it is still
-    /// alive after `grace`.
-    fn kill(&self, grace: Duration) {
+    /// alive after `grace`. The returned thread ends as soon as the child is reaped.
+    fn kill(&self, grace: Duration) -> Option<std::thread::JoinHandle<()>> {
         if let Err(e) = lock(&self.killer).kill() {
             eprintln!("raterm: SIGHUP to pid {:?} failed: {e}", self.pid);
         }
-        let Some(pid) = self.pid else { return };
+        let pid = self.pid?;
         // The foreground job may sit in its own process group under job control.
         let foreground = lock(&self.master).process_group_leader();
         let exited = self.exited.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(grace);
-            if exited.load(Ordering::Acquire) {
+        Some(std::thread::spawn(move || {
+            if exited.wait(grace) {
                 return;
             }
             // SAFETY: plain syscalls. The child is not reaped yet (`exited` is false),
@@ -54,12 +90,56 @@ impl Session {
                     libc::kill(-fg, libc::SIGKILL);
                 }
             }
-        });
+        }))
     }
+}
+
+/// Why a session could not start. `CwdMissing` (the directory no longer exists)
+/// lets a restore fall back to `$HOME` for that reason only.
+#[derive(Debug, PartialEq)]
+pub enum SpawnError {
+    CwdMissing(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::CwdMissing(dir) => write!(f, "directory does not exist: {dir}"),
+            SpawnError::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<String> for SpawnError {
+    fn from(e: String) -> Self {
+        SpawnError::Failed(e)
+    }
+}
+
+/// Shells (matched by file name) whose `-c` takes `"$0" "$@"` the POSIX way. Any
+/// other shell is treated as non-POSIX and goes through the trampoline.
+const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"];
+
+fn is_posix_shell(shell: &str) -> bool {
+    let name = Path::new(shell).file_name().and_then(|n| n.to_str()).unwrap_or(shell);
+    POSIX_SHELLS.contains(&name)
+}
+
+/// Environment variable carrying the program and arguments for `raterm --exec`.
+pub const EXEC_ENV: &str = "RATERM_EXEC";
+pub const EXEC_FLAG: &str = "--exec";
+
+/// Whether `path` can be single-quoted the same way in every common shell (POSIX
+/// shells, fish and csh): it contains none of `'`, `\`, `!` or a newline.
+fn quotable_everywhere(path: &str) -> bool {
+    !path.contains(['\'', '\\', '!', '\n'])
 }
 
 pub struct Sessions {
     shell: String,
+    /// raterm's own binary, which runs `Launch::Program` under non-POSIX shells.
+    trampoline: Option<String>,
     kill_grace: Duration,
     next_id: AtomicU32,
     map: Arc<Mutex<HashMap<u32, Arc<Session>>>>,
@@ -79,10 +159,17 @@ impl Sessions {
     pub fn new(shell: impl Into<String>, kill_grace: Duration) -> Self {
         Self {
             shell: shell.into(),
+            trampoline: None,
             kill_grace,
             next_id: AtomicU32::new(0),
             map: Arc::default(),
         }
+    }
+
+    /// Lets `Launch::Program` work under non-POSIX shells by running `exe --exec`.
+    pub fn with_trampoline(mut self, exe: String) -> Self {
+        self.trampoline = Some(exe);
+        self
     }
 
     /// Starts a session. `on_data` receives output and returns false once nobody
@@ -92,21 +179,49 @@ impl Sessions {
         req: SpawnRequest,
         mut on_data: impl FnMut(&[u8]) -> bool + Send + 'static,
         on_exit: impl FnOnce(i32) + Send + 'static,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, SpawnError> {
         let dir = resolve_cwd(req.cwd)?;
         let shell = &self.shell;
 
         let pair = native_pty_system()
-            .openpty(PtySize { rows: req.rows, cols: req.cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize { rows: req.rows.max(1), cols: req.cols.max(1), pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("could not open a PTY: {e:#}"))?;
         // Take both ends before spawning so a failure here cannot orphan a child.
         let mut reader = pair.master.try_clone_reader().map_err(|e| format!("PTY reader: {e:#}"))?;
         let mut writer = pair.master.take_writer().map_err(|e| format!("PTY writer: {e:#}"))?;
 
         let mut cmd = CommandBuilder::new(shell);
-        match req.command.filter(|c| !c.trim().is_empty()) {
-            Some(c) => cmd.args(["-lc", &c]),
-            None => cmd.arg("-l"),
+        // Caller variables first, so they cannot override the terminal type.
+        for (key, value) in &req.env {
+            cmd.env(key, value);
+        }
+        match &req.launch {
+            Launch::LoginShell => cmd.arg("-l"),
+            Launch::Command(c) if c.trim().is_empty() => cmd.arg("-l"),
+            Launch::Command(c) => cmd.args(["-lc", c]),
+            // `exec "$0" "$@"` runs the program with its arguments exactly as given.
+            Launch::Program { program, args } if is_posix_shell(shell) => {
+                cmd.args(["-lc", r#"exec "$0" "$@""#, program]);
+                cmd.args(args);
+            }
+            // Other shells (fish, csh, ...) spell that differently, so the login shell
+            // runs raterm itself, which execs the program from an environment variable.
+            Launch::Program { program, args } => {
+                let exe = self.trampoline.as_deref().ok_or_else(|| {
+                    format!("cannot launch {program} under {shell}: no raterm binary to run it through")
+                })?;
+                if !quotable_everywhere(exe) {
+                    return Err(format!(
+                        "cannot launch {program} under {shell}: raterm's path {exe:?} contains a quote, \
+                         backslash, ! or newline, which {shell} cannot be given safely; install raterm elsewhere"
+                    )
+                    .into());
+                }
+                let argv: Vec<&str> = std::iter::once(program.as_str()).chain(args.iter().map(String::as_str)).collect();
+                let argv = serde_json::to_string(&argv).map_err(|e| e.to_string())?;
+                cmd.env(EXEC_ENV, argv);
+                cmd.args(["-l", "-c", &format!("'{exe}' {EXEC_FLAG}")]);
+            }
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -121,7 +236,7 @@ impl Sessions {
         drop(pair.slave);
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let exited = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(ExitFlag::default());
         let (input, input_rx) = mpsc::channel::<Vec<u8>>();
         lock(&self.map).insert(
             id,
@@ -178,7 +293,7 @@ impl Sessions {
                     -1
                 }
             };
-            exited.store(true, Ordering::Release);
+            exited.set();
             lock(&map).remove(&id);
             if !detached {
                 on_exit(code);
@@ -207,11 +322,41 @@ impl Sessions {
         }
     }
 
-    /// Hangs up every session; called when the app exits.
-    pub fn kill_all(&self) {
+    /// The session process's current directory (read from `/proc`, so Linux only).
+    /// For a Claude tab under a POSIX login shell that is Claude's directory, since
+    /// the shell `exec`s into it; under fish or csh it is the shell's, which stays in
+    /// the directory the tab started in.
+    /// A directory deleted while in use reads as `<path> (deleted)`; that suffix is
+    /// dropped, so a restore finds the path missing and falls back to `$HOME`.
+    pub fn cwd(&self, id: u32) -> Option<String> {
+        let pid = self.get(id).ok()?.pid?;
+        let link = format!("/proc/{pid}/cwd");
+        let path = match std::fs::read_link(&link) {
+            Ok(path) => path,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("raterm: cannot read {link}: {e}");
+                }
+                return None;
+            }
+        };
+        let path = live_path(path);
+        path.into_os_string().into_string().map_err(|p| eprintln!("raterm: non-UTF-8 directory {p:?}")).ok()
+    }
+
+    /// Hangs up every session, force-killing survivors after the grace period in
+    /// the background. Returns the threads doing that.
+    pub fn kill_all(&self) -> Vec<std::thread::JoinHandle<()>> {
         let all: Vec<_> = lock(&self.map).drain().map(|(_, s)| s).collect();
-        for s in all {
-            s.kill(self.kill_grace);
+        all.iter().filter_map(|s| s.kill(self.kill_grace)).collect()
+    }
+
+    /// For app exit: like `kill_all`, but waits until every session has exited or
+    /// been force-killed, since background threads die with the process. Returns
+    /// at once when every child exits on SIGHUP; waits the grace period at most.
+    pub fn kill_all_and_wait(&self) {
+        for handle in self.kill_all() {
+            let _ = handle.join();
         }
     }
 
@@ -221,21 +366,46 @@ impl Sessions {
     }
 }
 
-/// Locks a mutex, recovering the data if a previous holder panicked.
-fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+/// Locks a mutex, recovering the data if a previous holder panicked (possible
+/// only in debug builds; release builds abort on panic).
+pub(crate) fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A `/proc` link target without the ` (deleted)` Linux appends when the target was
+/// removed or replaced while in use, unless a path really is named that way.
+pub(crate) fn live_path(target: std::path::PathBuf) -> std::path::PathBuf {
+    match target.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        Some(stripped) if !target.exists() => stripped.into(),
+        _ => target,
+    }
+}
+
+/// The requested directory, or `$HOME` when it no longer exists; the flag says
+/// whether that fallback happened. Other problems are still errors.
+pub fn cwd_or_home(cwd: Option<String>) -> Result<(Option<String>, bool), SpawnError> {
+    match resolve_cwd(cwd.clone()) {
+        Ok(_) => Ok((cwd, false)),
+        Err(SpawnError::CwdMissing(_)) => Ok((None, true)),
+        Err(e) => Err(e),
+    }
+}
+
 /// Resolves the requested working directory, expanding a leading `~`.
-fn resolve_cwd(cwd: Option<String>) -> Result<Option<String>, String> {
+fn resolve_cwd(cwd: Option<String>) -> Result<Option<String>, SpawnError> {
     let home = std::env::var("HOME").ok();
     let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) else { return Ok(home) };
     let dir = match (dir.strip_prefix('~'), &home) {
         (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
         _ => dir,
     };
-    if !Path::new(&dir).is_dir() {
-        return Err(format!("not a directory: {dir}"));
+    // Only "not found" means missing: a permission error or a dead mount must not
+    // look like a vanished directory, or a restore would replace it with $HOME.
+    match std::fs::metadata(&dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(SpawnError::Failed(format!("not a directory: {dir}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SpawnError::CwdMissing(dir)),
+        Err(e) => return Err(SpawnError::Failed(format!("cannot use directory {dir}: {e}"))),
     }
     Ok(Some(dir))
 }
@@ -272,6 +442,11 @@ mod tests {
         }
     }
 
+    /// A request with test defaults; override fields with `..req()`.
+    fn req() -> SpawnRequest {
+        SpawnRequest { cols: 80, rows: 24, ..Default::default() }
+    }
+
     fn sessions() -> Sessions {
         Sessions::new("/bin/sh", Duration::from_millis(300))
     }
@@ -281,15 +456,14 @@ mod tests {
     }
 
     fn spawn_in(s: &Sessions, command: &str, cwd: Option<&str>) -> Probe {
+        spawn_with(s, Launch::Command(command.into()), cwd, vec![])
+    }
+
+    fn spawn_with(s: &Sessions, launch: Launch, cwd: Option<&str>, env: Vec<(String, String)>) -> Probe {
         let output = Arc::new(Mutex::new(Vec::new()));
         let sink = output.clone();
         let (tx, exit) = mpsc::channel();
-        let req = SpawnRequest {
-            cols: 80,
-            rows: 24,
-            cwd: cwd.map(Into::into),
-            command: Some(command.into()),
-        };
+        let req = SpawnRequest { cwd: cwd.map(Into::into), launch, env, ..req() };
         let id = s
             .spawn(
                 req,
@@ -400,6 +574,143 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_directory_is_reported_without_the_deleted_suffix() {
+        let s = sessions();
+        let dir = crate::test_support::temp_dir("gone");
+        let p = spawn_in(&s, "echo ready; sleep 60", Some(dir.to_str().unwrap()));
+        p.wait_for("ready");
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(s.cwd(p.id).as_deref(), Some(dir.to_str().unwrap()));
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn reports_the_shell_cwd() {
+        let s = sessions();
+        let p = spawn(&s, "cd /tmp && echo ready && sleep 60");
+        p.wait_for("ready");
+        assert_eq!(s.cwd(p.id).as_deref(), Some("/tmp"));
+        assert_eq!(s.cwd(999), None);
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn passes_program_arguments_verbatim() {
+        let s = sessions();
+        let args = ["%s|", "a b", "it's", "$HOME", "\"q\""].map(String::from).to_vec();
+        let p = spawn_with(&s, Launch::Program { program: "printf".into(), args }, None, vec![]);
+        p.exit_code();
+        assert!(p.text().contains(r#"a b|it's|$HOME|"q"|"#), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn sets_extra_environment() {
+        let s = sessions();
+        let env = vec![("RATERM_TAB".to_string(), "tab-7".to_string())];
+        let p = spawn_with(&s, Launch::Command("echo tab=$RATERM_TAB".into()), None, env);
+        p.exit_code();
+        assert!(p.text().contains("tab=tab-7"), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn resize_reaches_the_process() {
+        let s = sessions();
+        let p = spawn(&s, "read _; stty size");
+        s.resize(p.id, 100, 30).unwrap();
+        s.write(p.id, b"\n".to_vec()).unwrap();
+        p.exit_code();
+        assert!(p.text().contains("30 100"), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn kill_all_ends_every_session() {
+        let s = sessions();
+        let a = spawn(&s, "echo ready; sleep 60");
+        let b = spawn(&s, "echo ready; sleep 60");
+        a.wait_for("ready");
+        b.wait_for("ready");
+        s.kill_all();
+        a.exit_code();
+        b.exit_code();
+        assert!(s.write(a.id, b"x".to_vec()).is_err());
+        assert!(s.write(b.id, b"x".to_vec()).is_err());
+    }
+
+    #[test]
+    fn on_app_exit_survivors_are_force_killed_before_returning() {
+        let s = sessions();
+        let stubborn = spawn(&s, "trap '' HUP; echo ready; sleep 60");
+        stubborn.wait_for("ready");
+        let start = Instant::now();
+        s.kill_all_and_wait();
+        assert!(start.elapsed() >= Duration::from_millis(300), "waited for the grace period");
+        // Already SIGKILLed: a background kill would only fire 300 ms from now.
+        assert!(stubborn.exit.recv_timeout(Duration::from_millis(200)).is_ok(), "killed before returning");
+    }
+
+    #[test]
+    fn on_app_exit_a_normal_session_does_not_delay_quitting() {
+        let s = sessions();
+        let p = spawn(&s, "echo ready; sleep 60");
+        p.wait_for("ready");
+        let start = Instant::now();
+        s.kill_all_and_wait();
+        assert!(start.elapsed() < Duration::from_millis(250), "took {:?}", start.elapsed());
+        p.exit_code();
+    }
+
+    #[test]
+    fn a_session_whose_frontend_is_gone_is_killed() {
+        let s = sessions();
+        let (tx, exited) = mpsc::channel();
+        let req = SpawnRequest { launch: Launch::Command("echo first; sleep 60".into()), ..req() };
+        // The receiver refuses the first output, as a closed webview would.
+        let id = s.spawn(req, |_| false, move |code| tx.send(code).unwrap()).unwrap();
+        let start = Instant::now();
+        while s.write(id, vec![]).is_ok() {
+            assert!(start.elapsed() < TIMEOUT, "session was not cleaned up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(start.elapsed() < Duration::from_secs(5), "sleep 60 should have been killed");
+        assert!(exited.try_recv().is_err(), "nobody is listening, so no exit is reported");
+    }
+
+    #[test]
+    fn tells_posix_shells_apart() {
+        assert!(is_posix_shell("/bin/bash"));
+        assert!(is_posix_shell("/usr/bin/zsh"));
+        assert!(is_posix_shell("sh"));
+        assert!(!is_posix_shell("/usr/bin/fish"));
+        assert!(!is_posix_shell("/bin/busybox"), "busybox needs an applet name");
+        assert!(!is_posix_shell("/bin/tcsh"));
+    }
+
+    #[test]
+    fn programs_under_other_shells_need_the_trampoline() {
+        let claude = || SpawnRequest { launch: Launch::Program { program: "claude".into(), args: vec![] }, ..req() };
+        let s = Sessions::new("/usr/bin/fish", Duration::from_millis(300));
+        let err = s.spawn(claude(), |_| true, |_| {}).unwrap_err();
+        assert!(matches!(&err, SpawnError::Failed(m) if m.contains("no raterm binary")), "{err}");
+        assert!(!quotable_everywhere("/opt/it's/raterm"));
+        assert!(quotable_everywhere("/opt/my apps/raterm"));
+
+        let unquotable = Sessions::new("/usr/bin/fish", Duration::from_millis(300)).with_trampoline("/opt/it's/raterm".into());
+        let err = unquotable.spawn(claude(), |_| true, |_| {}).unwrap_err();
+        assert!(matches!(&err, SpawnError::Failed(m) if m.contains("install raterm elsewhere")), "{err}");
+    }
+
+    #[test]
+    fn extra_environment_cannot_override_the_terminal_type() {
+        let s = sessions();
+        let env = vec![("TERM".to_string(), "dumb".to_string())];
+        let p = spawn_with(&s, Launch::Command("echo term=$TERM".into()), None, env);
+        p.exit_code();
+        assert!(p.text().contains("term=xterm-256color"), "output: {:?}", p.text());
+    }
+
+    #[test]
     fn runs_in_requested_directory() {
         let s = sessions();
         let p = spawn_in(&s, "pwd", Some("/tmp"));
@@ -410,14 +721,51 @@ mod tests {
     #[test]
     fn rejects_missing_directory() {
         let s = sessions();
-        let req = SpawnRequest {
-            cols: 80,
-            rows: 24,
-            cwd: Some("/definitely/not/here".into()),
-            command: None,
-        };
+        let req = SpawnRequest { cwd: Some("/definitely/not/here".into()), ..req() };
         let err = s.spawn(req, |_| true, |_| {}).unwrap_err();
-        assert!(err.contains("not a directory"), "{err}");
+        assert_eq!(err, SpawnError::CwdMissing("/definitely/not/here".into()));
+        assert!(matches!(resolve_cwd(Some("/etc/hostname".into())), Err(SpawnError::Failed(_))), "a file is not missing");
+    }
+
+    #[test]
+    fn an_inaccessible_directory_is_not_treated_as_missing() {
+        if crate::test_support::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("locked");
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(locked.join("project")).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = cwd_or_home(Some(locked.join("project").to_string_lossy().into_owned()));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(result, Err(SpawnError::Failed(m)) if m.contains("cannot use directory")));
+    }
+
+    #[test]
+    fn a_blank_command_runs_a_login_shell() {
+        let s = sessions();
+        let p = spawn_with(&s, Launch::Command("   ".into()), None, vec![]);
+        s.write(p.id, b"echo shell-ok; exit\n".to_vec()).unwrap();
+        p.exit_code();
+        assert!(p.text().contains("shell-ok"), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn falls_back_to_home_only_for_a_missing_directory() {
+        assert_eq!(cwd_or_home(Some("/definitely/not/here".into())), Ok((None, true)));
+        assert_eq!(cwd_or_home(Some("/tmp".into())), Ok((Some("/tmp".into()), false)));
+        assert_eq!(cwd_or_home(None), Ok((None, false)));
+        assert!(cwd_or_home(Some("/etc/hostname".into())).is_err(), "a file is not a missing directory");
+    }
+
+    #[test]
+    fn live_paths_lose_the_deleted_suffix_only_when_it_is_not_real() {
+        let dir = crate::test_support::temp_dir("live-path");
+        let gone = dir.join("project (deleted)");
+        assert_eq!(live_path(gone.clone()), dir.join("project"));
+        std::fs::create_dir(&gone).unwrap();
+        assert_eq!(live_path(gone.clone()), gone, "a directory really named that way is kept");
     }
 
     #[test]

@@ -13,18 +13,24 @@
         </svg>
       </button>
       <div id="tabs"></div>
-      <button id="new-session" title="New tab (Shift+click: custom)">+</button>
+      <!-- Buttons for opening new tabs, one per tab kind. -->
+      <div id="tab-actions">
+        <button id="new-claude" title="New Claude session (Shift+click: choose name and directory)"></button>
+      </div>
     </nav>
+    <div id="notice" role="status" hidden><span></span><button title="Dismiss">✕</button></div>
     <div id="content">
       <aside id="sidebar"></aside>
-      <main id="terminals"></main>
+      <main id="terminals">
+        <p id="empty-state">No tabs open. Start a Claude session with the button at the top right.</p>
+      </main>
     </div>
 
     <dialog id="spawn-dialog">
       <form method="dialog">
+        <h2>New Claude session</h2>
         <input name="name" placeholder="Name (optional)" />
-        <input name="cwd" placeholder="Working directory (default: $HOME)" />
-        <input name="command" placeholder="Command (default: login shell), e.g. claude" />
+        <input name="cwd" placeholder="Working directory (default: current tab's, or $HOME)" />
         <menu>
           <span class="spacer"></span>
           <!-- Start comes first so Enter submits it; CSS moves it to the end. -->

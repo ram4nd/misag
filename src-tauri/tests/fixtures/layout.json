@@ -1,0 +1,21 @@
+{
+  "active": 1,
+  "tabs": [
+    {
+      "tabId": "t1",
+      "kind": "claude",
+      "claudeSession": "0f8fad5b-d9cb-469f-a165-70867728950e",
+      "name": "agent",
+      "renamed": true,
+      "cwd": "/home/me/src"
+    },
+    {
+      "tabId": "t2",
+      "kind": "terminal",
+      "command": "tail -f syslog",
+      "name": "logs",
+      "renamed": false,
+      "cwd": null
+    }
+  ]
+}
