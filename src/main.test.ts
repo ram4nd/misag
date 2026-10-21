@@ -81,6 +81,20 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+// The folder picker answers with `picker.picked` (null: cancelled), or fails if `picker.fails`.
+const picker = vi.hoisted(() => ({
+  picked: null as string | null,
+  fails: false,
+  calls: [] as { defaultPath?: string }[],
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  open: async (options: { defaultPath?: string }) => {
+    picker.calls.push(options);
+    if (picker.fails) throw new Error("no portal");
+    return picker.picked;
+  },
+}));
+
 vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
 vi.mock("@xterm/xterm", () => ({ Terminal: fakes.FakeTerminal }));
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
@@ -126,9 +140,15 @@ let reported: Set<string>;
 let missingDirs: Set<string>;
 type Settings = Record<string, unknown>;
 let storedSettings: Settings;
+/** fs_list for a directory waits for its promise here, so a test can hold it back. */
+let fsGates: Record<string, Promise<void>>;
+/** How many hidden entries fs_list reports per directory. */
+let fsHidden: Record<string, number>;
+/** What fs_list returns per directory; any other directory fails. */
+let fsTree: Record<string, { name: string; dir: boolean }[]>;
 /** settings_load waits for this, so a test can hold the load back. */
 let settingsLoadGate: Promise<void>;
-const DEFAULTS: Settings = { skipPermissions: false };
+const DEFAULTS: Settings = { skipPermissions: false, workspace: null };
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -197,6 +217,12 @@ beforeEach(() => {
   missingDirs = new Set();
   storedSettings = { ...DEFAULTS };
   settingsLoadGate = Promise.resolve();
+  fsTree = {};
+  picker.picked = null;
+  picker.fails = false;
+  picker.calls = [];
+  fsGates = {};
+  fsHidden = {};
   win.closeRequested = undefined;
   win.prevented = false;
   try {
@@ -223,10 +249,23 @@ beforeEach(() => {
     if (cmd === "store_status") return storeReport;
     if (cmd === "claude_reported") return reported.has((args as { tabId: string }).tabId);
     if (cmd === "layout_load") return savedLayout;
+    if (cmd === "fs_list") {
+      const dir = (args as { dir: string }).dir;
+      return (fsGates[dir] ?? Promise.resolve()).then(() => {
+        if (!(dir in fsTree)) throw { code: "failed", message: `cannot read ${dir}: No such file or directory` };
+        const listed = dir === "~" ? "/home/me" : dir;
+        return { dir: listed, entries: fsTree[dir], truncated: false, skipped: fsHidden[dir] ?? 0 };
+      });
+    }
     if (cmd === "settings_load") return settingsLoadGate.then(() => storedSettings);
     if (cmd === "settings_save") {
-      // Like the backend: stores and returns what it stored.
-      storedSettings = (args as { settings: Settings }).settings;
+      // Like the backend (without its trimming): a changed workspace folder must exist.
+      const next = (args as { settings: Settings }).settings;
+      const changed = next.workspace !== storedSettings.workspace;
+      if (changed && typeof next.workspace === "string" && !(next.workspace in fsTree)) {
+        throw { code: "failed", message: `${next.workspace} is not a folder` };
+      }
+      storedSettings = next;
       return storedSettings;
     }
     if (cmd === "pty_cwds") {
@@ -679,17 +718,17 @@ describe("settings", () => {
     await openSettings();
     expect(setting("skipPermissions").checked).toBe(false);
     await change("skipPermissions", true);
-    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ skipPermissions: true });
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ skipPermissions: true, workspace: null });
     expect(pageError().hidden).toBe(true);
     settingsTabX().click();
     // Changed outside the page (another window, or a tab writing the database).
-    storedSettings = { skipPermissions: false };
+    storedSettings = { ...DEFAULTS };
     await openSettings();
     expect(setting("skipPermissions").checked).toBe(false);
   });
 
   test("the form stays disabled until the stored settings are read", async () => {
-    storedSettings = { skipPermissions: true };
+    storedSettings = { ...DEFAULTS, skipPermissions: true };
     let release!: () => void;
     settingsLoadGate = new Promise((r) => (release = r));
     await boot();
@@ -734,12 +773,12 @@ describe("settings", () => {
   });
 
   test("Claude tabs started with skipped permissions are marked", async () => {
-    storedSettings = { skipPermissions: true };
+    storedSettings = { ...DEFAULTS, skipPermissions: true };
     await boot();
     await openClaudeTabs(1);
     expect(tabs()[0].querySelector(".badge")).not.toBeNull();
     expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
-    storedSettings = { skipPermissions: false };
+    storedSettings = { ...DEFAULTS };
     terms()[0].handlers.title?.("busy");
     expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
     // The restart picks up the current setting.
@@ -754,6 +793,312 @@ describe("settings", () => {
     await boot();
     await openSettings();
     expect(page().querySelector<HTMLElement>(".not-saving")!.hidden).toBe(false);
+  });
+});
+
+describe("file tree", () => {
+  const rows = () =>
+    [...document.querySelectorAll<HTMLElement>("#workspace-box .tree .row")].map((r) => r.textContent);
+  const row = (name: string) =>
+    [...document.querySelectorAll<HTMLButtonElement>("#workspace-box .tree button.row")].find((r) =>
+      r.textContent!.endsWith(name),
+    )!;
+  const treeText = () => document.querySelector("#workspace-box .tree")!.textContent;
+  const button = (sel: string) => document.querySelector<HTMLButtonElement>(`#workspace-box ${sel}`)!;
+  const pageButton = (sel: string) => document.querySelector<HTMLButtonElement>(`#workspace-settings ${sel}`)!;
+  const pageError = () => document.querySelector<HTMLElement>("#workspace-settings .error")!;
+  const folderField = () => document.querySelector<HTMLInputElement>("#workspace-settings input[name=workspace]")!;
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) await flush();
+  };
+  const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+
+  beforeEach(() => {
+    fsTree = {
+      "~": [{ name: "notes", dir: true }],
+      "/p": [
+        { name: "src", dir: true },
+        { name: "my notes.txt", dir: false },
+      ],
+      "/p/src": [{ name: "main.ts", dir: false }],
+    };
+  });
+
+  test("shows the home directory by default, one level at a time", async () => {
+    await boot();
+    await settle();
+    expect(rows()).toEqual(["~", "notes"]);
+  });
+
+  test("shows the stored folder and does not follow the tabs", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    await settle();
+    expect(rows()).toEqual(["p", "src", "my notes.txt"]);
+    liveCwds = { 1: "/q", 2: "/r" };
+    await openClaudeTabs(2);
+    tabs()[0].click();
+    await settle();
+    expect(rows()).toEqual(["p", "src", "my notes.txt"]);
+    expect(callsOf("fs_list").map((c) => c.args.dir)).toEqual(["/p"]);
+  });
+
+  test("folders are listed when opened, and clicking a file types its quoted path", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    row("src").click();
+    await settle();
+    expect(rows()).toEqual(["p", "src", "main.ts", "my notes.txt"]);
+    row("main.ts").click();
+    row("my notes.txt").click();
+    expect(typed()).toEqual(["/p/src/main.ts ", "'/p/my notes.txt' "]);
+    row("src").click();
+    expect(row("main.ts").closest("ul")!.hidden).toBe(true);
+  });
+
+  test("the refresh button reloads and keeps open folders open", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    await settle();
+    row("src").click();
+    await settle();
+    fsTree["/p/src"].push({ name: "new.ts", dir: false });
+    button(".refresh").click();
+    await settle();
+    expect(rows()).toEqual(["p", "src", "main.ts", "new.ts", "my notes.txt"]);
+  });
+
+  test("the gear opens a workspace settings tab, where the folder is chosen", async () => {
+    await boot();
+    await settle();
+    button(".configure").click();
+    await settle();
+    expect(tabNames()).toEqual(["Workspace settings"]);
+    expect(document.querySelector("#workspace-settings")!.classList.contains("active")).toBe(true);
+    expect(document.querySelector("#settings")!.classList.contains("active")).toBe(false);
+    expect(folderField().value).toBe("");
+    expect(folderField().placeholder).toBe("~ (your home directory)");
+
+    picker.picked = null;
+    folderField().click();
+    await settle();
+    expect(callsOf("settings_save")).toHaveLength(0);
+
+    picker.picked = "/p";
+    key(folderField(), "Enter");
+    await settle();
+    expect(storedSettings.workspace).toBe("/p");
+    expect(folderField().value).toBe("/p");
+    expect(rows()).toEqual(["p", "src", "my notes.txt"]);
+
+    pageButton(".home-workspace").click();
+    await settle();
+    expect(storedSettings.workspace).toBeNull();
+    expect(rows()).toEqual(["~", "notes"]);
+  });
+
+  test("a folder that is refused or cannot be read is shown", async () => {
+    await boot();
+    button(".configure").click();
+    await settle();
+    picker.picked = "/gone";
+    folderField().click();
+    await settle();
+    expect(pageError().textContent).toContain("/gone is not a folder");
+    expect(rows()).toEqual(["~", "notes"]);
+
+    vi.resetModules();
+    storedSettings = { ...DEFAULTS, workspace: "/vanished" };
+    await boot();
+    await settle();
+    expect(treeText()).toContain("cannot read /vanished");
+  });
+
+  test("with unreadable settings the tree shows home and the folder cannot be changed", async () => {
+    failing.add("settings_load");
+    await boot();
+    await settle();
+    expect(rows()).toEqual(["~", "notes"]);
+    button(".configure").click();
+    await settle();
+    expect(document.querySelector<HTMLFieldSetElement>("#workspace-settings fieldset")!.disabled).toBe(true);
+  });
+
+  test("both pages can be open as their own tabs next to the terminals", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    button(".configure").click();
+    await settle();
+    expect(tabNames()).toEqual(["Claude 1", "Settings", "Workspace settings"]);
+    const shown = () => [...document.querySelectorAll(".page.active")].map((p) => p.id);
+    expect(shown()).toEqual(["workspace-settings"]);
+    tabs()[1].click();
+    expect(shown()).toEqual(["settings"]);
+    tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
+    expect(tabNames()).toEqual(["Claude 1", "Workspace settings"]);
+    expect(shown()).toEqual([]);
+    expect(document.querySelectorAll(".term")[0].classList.contains("active")).toBe(true);
+    tabs()[1].click();
+    expect(shown()).toEqual(["workspace-settings"]);
+  });
+
+  test("file names that could act as keys are not typed, and say why", async () => {
+    fsTree["/p"].push({ name: "notes\x15curl x|sh\r.txt", dir: false }, { name: "a\\b", dir: false });
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    row("sh\r.txt").click();
+    expect(noticeText()).toContain("control characters");
+    row("a\\b").click();
+    expect(noticeText()).toContain("backslash");
+    expect(callsOf("pty_write")).toHaveLength(0);
+    row("my notes.txt").click();
+    await settle();
+    expect(typed()).toEqual(["'/p/my notes.txt' "]);
+    expect(noticeVisible()).toBe(false);
+  });
+
+  test("without a running tab, or when typing fails, a notice says so", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    await settle();
+    row("my notes.txt").click();
+    expect(noticeText()).toContain("no tab is running");
+    await openClaudeTabs(1);
+    failing.add("pty_write");
+    row("my notes.txt").click();
+    await settle();
+    expect(noticeText()).toContain("could not be typed");
+  });
+
+  test("clicking a file while a page is shown types it into the tab and shows the tab", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    await openClaudeTabs(1);
+    button(".configure").click();
+    await settle();
+    row("my notes.txt").click();
+    await settle();
+    expect(typed()).toEqual(["'/p/my notes.txt' "]);
+    expect(document.querySelector("#workspace-settings")!.classList.contains("active")).toBe(false);
+    expect(document.querySelectorAll(".term")[0].classList.contains("active")).toBe(true);
+  });
+
+  test("a folder shows Loading until listed, and says when only hidden entries exist", async () => {
+    fsTree["/p/empty"] = [];
+    fsTree["/p"].unshift({ name: "empty", dir: true });
+    fsHidden["/p/empty"] = 2;
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    let release!: () => void;
+    fsGates["/p/src"] = new Promise((r) => (release = r));
+    await boot();
+    await settle();
+    row("src").click();
+    await settle();
+    expect(treeText()).toContain("Loading…");
+    release();
+    await settle();
+    expect(rows()).toContain("main.ts");
+    row("empty").click();
+    await settle();
+    expect(treeText()).toContain("No visible entries (2 hidden)");
+  });
+
+  test("a new workspace starts with its folders closed", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    button(".configure").click();
+    await settle();
+    row("src").click();
+    await settle();
+    expect(rows()).toContain("main.ts");
+    pageButton(".home-workspace").click();
+    await settle();
+    picker.picked = "/p";
+    folderField().click();
+    await settle();
+    expect(rows()).toEqual(["p", "src", "my notes.txt"]);
+  });
+
+  test("the picker starts in the listed folder, opens on Space, and a failure is shown", async () => {
+    await boot();
+    button(".configure").click();
+    await settle();
+    key(folderField(), " ");
+    await settle();
+    expect(picker.calls.at(-1)!.defaultPath).toBe("/home/me");
+    picker.fails = true;
+    folderField().click();
+    await settle();
+    expect(pageError().textContent).toContain("folder picker could not be opened");
+  });
+
+  test("saving one setting keeps the other", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/p" };
+    await boot();
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    await settle();
+    const skip = document.querySelector<HTMLInputElement>("#settings input[name=skipPermissions]")!;
+    skip.checked = true;
+    skip.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(storedSettings).toEqual({ skipPermissions: true, workspace: "/p" });
+    button(".configure").click();
+    await settle();
+    pageButton(".home-workspace").click();
+    await settle();
+    expect(storedSettings).toEqual({ skipPermissions: true, workspace: null });
+  });
+
+  test("a workspace folder that has gone does not block other settings", async () => {
+    storedSettings = { ...DEFAULTS, workspace: "/vanished" };
+    await boot();
+    await settle();
+    expect(treeText()).toContain("cannot read /vanished");
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    await settle();
+    const skip = document.querySelector<HTMLInputElement>("#settings input[name=skipPermissions]")!;
+    skip.checked = true;
+    skip.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(storedSettings.skipPermissions).toBe(true);
+    expect(document.querySelector<HTMLElement>("#settings .error")!.hidden).toBe(true);
+  });
+
+  test("unreadable settings at startup are shown, with what that means for each page", async () => {
+    failing.add("settings_load");
+    await boot();
+    await settle();
+    expect(noticeText()).toContain("the Workspace box shows your home directory");
+    button(".configure").click();
+    await settle();
+    expect(pageError().textContent).toContain("its folder cannot be changed");
+  });
+
+  test("every icon in the page is drawn", async () => {
+    await boot();
+    const icons = [...document.querySelectorAll("[data-icon]")];
+    expect(icons.length).toBeGreaterThan(5);
+    for (const el of icons) expect(el.querySelector("svg"), (el as HTMLElement).dataset.icon).not.toBeNull();
+  });
+
+  test("the toolbox collapses and remembers it", async () => {
+    await boot();
+    const box = () => document.querySelector("#workspace-box")!;
+    button(".toggle").click();
+    expect(box().classList.contains("collapsed")).toBe(true);
+    // A fresh app instance on a fresh page.
+    vi.resetModules();
+    await boot();
+    expect(box().classList.contains("collapsed")).toBe(true);
+    vi.resetModules();
+    localStorage.clear();
+    await boot();
+    expect(box().classList.contains("collapsed")).toBe(false);
   });
 });
 
@@ -774,6 +1119,9 @@ describe("switching and layout", () => {
     document.querySelector<HTMLButtonElement>("#toggle-sidebar")!.click();
     expect(collapsed()).toBe(true);
 
+    // A fresh app instance on a fresh page.
+    vi.resetModules();
+    document.body.className = "";
     await boot();
     expect(collapsed()).toBe(true);
   });

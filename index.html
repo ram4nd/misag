@@ -7,21 +7,26 @@
   </head>
   <body>
     <nav id="tabbar">
-      <button id="toggle-sidebar" title="Toggle sidebar">
-        <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-          <path d="M2 4h14M2 9h14M2 14h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
-        </svg>
-      </button>
+      <button id="toggle-sidebar" title="Toggle sidebar"><span data-icon="menu" data-size="18"></span></button>
       <div id="tabs"></div>
       <!-- Buttons for opening new tabs, one per tab kind. -->
       <div id="tab-actions">
         <button id="new-claude" title="New Claude session (Shift+click: choose name and directory)"></button>
       </div>
     </nav>
-    <div id="notice" role="status" hidden><span></span><button title="Dismiss">✕</button></div>
+    <div id="notice" role="status" hidden><span></span><button title="Dismiss"><span data-icon="x" data-size="14"></span></button></div>
     <div id="content">
       <aside id="sidebar">
-        <button id="open-settings" title="Settings"><span class="icon"></span>Settings</button>
+        <!-- A toolbox: a header (a toggle that collapses it, plus its own buttons) and a body; see setupToolbox in main.ts. -->
+        <section class="toolbox" id="workspace-box">
+          <header>
+            <button class="toggle" title="Collapse or expand"><span class="chevron" data-icon="chevron-down" data-size="14"></span>Workspace</button>
+            <button class="refresh" title="Reload the tree"><span data-icon="refresh-cw" data-size="14"></span></button>
+            <button class="configure" title="Workspace settings"><span data-icon="settings" data-size="14"></span></button>
+          </header>
+          <div class="body"><ul class="tree" role="tree"></ul></div>
+        </section>
+        <button id="open-settings" title="Settings"><span data-icon="settings"></span>Settings</button>
       </aside>
       <main id="terminals">
         <p id="empty-state">No tabs open. Start a Claude session with the button at the top right.</p>
@@ -29,9 +34,25 @@
         <section id="settings" class="page" aria-label="Settings" tabindex="-1">
           <form novalidate>
             <fieldset>
-              <h2>Claude</h2>
+              <h2><span class="claude-icon"></span>Claude</h2>
               <label class="check"><input name="skipPermissions" type="checkbox" /> Skip permission prompts (<code>--dangerously-skip-permissions</code>)</label>
               <p class="hint">Claude then runs every tool without asking. Applies to Claude tabs started or restarted from now on, which show a red <b>!</b>.</p>
+            </fieldset>
+            <p class="hint not-saving" hidden>raterm is running without its database, so settings last only until it quits.</p>
+            <p class="error" role="alert" hidden></p>
+          </form>
+        </section>
+        <!-- The workspace settings page, opened from the Workspace box's gear button. -->
+        <section id="workspace-settings" class="page" aria-label="Workspace settings" tabindex="-1">
+          <form novalidate>
+            <fieldset>
+              <h2><span data-icon="folder-cog"></span>Workspace folder</h2>
+              <div class="path-input">
+                <span data-icon="folder-open"></span>
+                <input name="workspace" readonly placeholder="~ (your home directory)" title="Click to choose a folder" aria-label="Workspace folder" />
+                <button type="button" class="home-workspace" title="Use your home directory"><span data-icon="house"></span></button>
+              </div>
+              <p class="hint">The folder the Workspace box in the sidebar shows, such as your projects folder.</p>
             </fieldset>
             <p class="hint not-saving" hidden>raterm is running without its database, so settings last only until it quits.</p>
             <p class="error" role="alert" hidden></p>

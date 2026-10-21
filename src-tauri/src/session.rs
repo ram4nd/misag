@@ -437,14 +437,19 @@ pub fn cwd_or_home(cwd: Option<String>) -> Result<(Option<String>, bool), SpawnE
     }
 }
 
+/// `dir` with a leading `~` (alone or before `/`) replaced by `$HOME`; unchanged if
+/// `$HOME` is unset, and `~user` is left alone.
+pub fn expand_tilde(dir: &str) -> String {
+    match (dir.strip_prefix('~'), std::env::var("HOME")) {
+        (Some(rest), Ok(h)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
+        _ => dir.to_owned(),
+    }
+}
+
 /// Resolves the requested working directory, expanding a leading `~`.
 fn resolve_cwd(cwd: Option<String>) -> Result<Option<String>, SpawnError> {
-    let home = std::env::var("HOME").ok();
-    let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) else { return Ok(home) };
-    let dir = match (dir.strip_prefix('~'), &home) {
-        (Some(rest), Some(h)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
-        _ => dir,
-    };
+    let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) else { return Ok(std::env::var("HOME").ok()) };
+    let dir = expand_tilde(&dir);
     // Only "not found" means missing: a permission error or a dead mount must not
     // look like a vanished directory, or a restore would replace it with $HOME.
     match std::fs::metadata(&dir) {
@@ -828,5 +833,15 @@ mod tests {
         assert_eq!(resolve_cwd(None).unwrap(), Some(home.clone()));
         assert_eq!(resolve_cwd(Some("  ".into())).unwrap(), Some(home));
         assert!(resolve_cwd(Some("~nobody-xyz".into())).is_err());
+    }
+
+    #[test]
+    fn expand_tilde_only_touches_the_home_prefix() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/src"), format!("{home}/src"));
+        for kept in ["~user", "~x/y", "/a/~", "rel"] {
+            assert_eq!(expand_tilde(kept), kept);
+        }
     }
 }

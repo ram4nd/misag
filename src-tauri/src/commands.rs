@@ -261,10 +261,17 @@ pub fn settings_load(db: State<'_, Db>) -> Result<Settings, CommandError> {
     Ok(db.load_settings()?)
 }
 
-/// Stores the settings and returns them as stored.
+/// Checks the settings against the stored ones, stores them and returns them as stored.
 #[tauri::command(async)]
 pub fn settings_save(db: State<'_, Db>, settings: Settings) -> Result<Settings, CommandError> {
-    Ok(db.save_settings(settings)?)
+    let stored = db.load_settings()?;
+    Ok(db.save_settings(settings.validated(&stored)?)?)
+}
+
+/// One level of the sidebar's file tree.
+#[tauri::command(async)]
+pub fn fs_list(dir: String) -> Result<crate::files::Listing, CommandError> {
+    Ok(crate::files::list(&dir)?)
 }
 
 #[tauri::command(async)]
@@ -391,7 +398,7 @@ mod tests {
         let exe = exe();
         assert!(!plan_spawn(&request, &exe, &db).unwrap().skips_permissions);
 
-        db.save_settings(Settings { skip_permissions: true }).unwrap();
+        db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap();
         let plan = launch_plan(&request, &exe, &db).unwrap();
         let (Launch::Program { args, .. }, _) = launch_for(&plan) else { panic!("expected a program") };
         let mut expected = vec!["--dangerously-skip-permissions".to_string()];
@@ -405,7 +412,7 @@ mod tests {
     fn unreadable_settings_start_claude_with_the_defaults() {
         let path = temp_db("plan-bad-settings");
         let db = Db::open(path.clone()).unwrap();
-        db.save_settings(Settings { skip_permissions: true }).unwrap();
+        db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap();
         connect_existing(&path).unwrap().execute("DELETE FROM settings", []).unwrap();
         let request = claude_tab();
         let LaunchPlan::Claude { settings, .. } = launch_plan(&request, &exe(), &db).unwrap() else { panic!() };

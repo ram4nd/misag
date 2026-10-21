@@ -54,6 +54,8 @@ const MIGRATIONS: &[&str] = &[r#"
         skip_permissions INTEGER NOT NULL DEFAULT 0 CHECK (skip_permissions IN (0, 1))
     );
     INSERT INTO settings (id) VALUES (1);
+"#, r#"
+    ALTER TABLE settings ADD COLUMN workspace TEXT;
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -372,17 +374,21 @@ impl Db {
     /// The stored settings (the migration created their row with the defaults).
     pub fn load_settings(&self) -> Result<Settings, String> {
         self.conn()
-            .query_row("SELECT skip_permissions FROM settings WHERE id = 1", [], |r| {
-                Ok(Settings { skip_permissions: r.get(0)? })
+            .query_row("SELECT skip_permissions, workspace FROM settings WHERE id = 1", [], |r| {
+                Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)? })
             })
             .map_err(sql)
     }
 
-    /// Stores the settings, returning them as stored.
+    /// Stores the settings (checked by the caller, see `Settings::validated`),
+    /// returning them as stored.
     pub fn save_settings(&self, settings: Settings) -> Result<Settings, String> {
         let changed = self
             .conn()
-            .execute("UPDATE settings SET skip_permissions = ?1 WHERE id = 1", [settings.skip_permissions])
+            .execute(
+                "UPDATE settings SET skip_permissions = ?1, workspace = ?2 WHERE id = 1",
+                params![settings.skip_permissions, settings.workspace],
+            )
             .map_err(sql)?;
         if changed != 1 {
             return Err("the settings row is missing, so nothing was saved".into());
@@ -600,9 +606,21 @@ pub(crate) mod tests {
         assert_eq!(db.load_layout().unwrap().tabs, vec![Tab { cwd: None, ..claude_tab("a", Some(S1)) }]);
         assert_eq!(db.load_settings().unwrap(), Settings::default());
         drop(db);
-        // Opening again does not run the migration twice (a second settings row would fail).
+        // Opening again does not re-run migrations (a second settings row, or a duplicate column, would fail).
         let db = Db::open(path).unwrap();
-        assert!(db.save_settings(Settings { skip_permissions: true }).unwrap().skip_permissions);
+        assert!(db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap().skip_permissions);
+    }
+
+    #[test]
+    fn upgrading_from_schema_2_keeps_the_settings_and_adds_the_workspace() {
+        let path = temp_db("upgrade-v2");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&MIGRATIONS[..2].concat()).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute("UPDATE settings SET skip_permissions = 1", []).unwrap();
+        drop(conn);
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.load_settings().unwrap(), Settings { skip_permissions: true, workspace: None });
     }
 
     #[test]
@@ -610,7 +628,7 @@ pub(crate) mod tests {
         let path = temp_db("settings-no-row");
         let db = Db::open(path.clone()).unwrap();
         connect_existing(&path).unwrap().execute("DELETE FROM settings", []).unwrap();
-        let err = db.save_settings(Settings { skip_permissions: true }).unwrap_err();
+        let err = db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap_err();
         assert!(err.contains("settings row is missing"), "{err}");
     }
 
@@ -632,8 +650,8 @@ pub(crate) mod tests {
         let path = temp_db("settings");
         let db = Db::open(path.clone()).unwrap();
         assert_eq!(db.load_settings().unwrap(), Settings::default());
-        let saved = db.save_settings(Settings { skip_permissions: true }).unwrap();
-        assert!(saved.skip_permissions);
+        let saved = db.save_settings(Settings { skip_permissions: true, workspace: Some("~".into()) }).unwrap();
+        assert_eq!(saved, Settings { skip_permissions: true, workspace: Some("~".into()) }, "returned as stored");
         drop(db);
         assert_eq!(Db::open(path).unwrap().load_settings().unwrap(), saved);
     }

@@ -1,6 +1,7 @@
 pub mod claude;
 mod commands;
 pub mod db;
+pub mod files;
 pub mod layout;
 pub mod session;
 pub mod settings;
@@ -83,6 +84,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(sessions)
         .manage(exe)
         .setup(|app| {
@@ -106,6 +108,7 @@ pub fn run() {
             commands::claude_reported,
             commands::settings_load,
             commands::settings_save,
+            commands::fs_list,
         ])
         .build(tauri::generate_context!())
         .expect("error while building raterm")

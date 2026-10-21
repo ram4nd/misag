@@ -8,12 +8,38 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// Start Claude tabs with `--dangerously-skip-permissions`.
     pub skip_permissions: bool,
+    /// The workspace folder the sidebar shows; None for the home directory.
+    pub workspace: Option<String>,
 }
 
 impl Settings {
+    /// Checks settings before they replace `stored`. A changed workspace folder must be
+    /// an existing directory (a leading `~` is kept, and expanded when used); blank
+    /// means home. An unchanged one is not checked again: it may have gone since it
+    /// was chosen, which must not block saving the other settings.
+    pub fn validated(mut self, stored: &Settings) -> Result<Self, String> {
+        self.workspace = self.workspace.map(|d| d.trim().to_owned()).filter(|d| !d.is_empty());
+        if let Some(dir) = &self.workspace
+            && self.workspace != stored.workspace
+        {
+            check_folder(dir)?;
+        }
+        Ok(self)
+    }
+
     /// The arguments these settings add to every Claude tab.
     pub fn claude_args(&self) -> Vec<String> {
         if self.skip_permissions { vec!["--dangerously-skip-permissions".into()] } else { vec![] }
+    }
+}
+
+/// Fails unless `dir` is a directory raterm can use, saying why.
+fn check_folder(dir: &str) -> Result<(), String> {
+    match std::fs::metadata(crate::session::expand_tilde(dir)) {
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{dir} is not a folder")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!("{dir} does not exist")),
+        Err(e) => Err(format!("{dir} cannot be used: {e}")),
     }
 }
 
@@ -23,14 +49,49 @@ mod tests {
 
     #[test]
     fn the_frontend_sees_camel_case_fields() {
-        let s = Settings { skip_permissions: true };
-        assert_eq!(serde_json::to_value(&s).unwrap(), serde_json::json!({ "skipPermissions": true }));
-        assert_eq!(serde_json::from_str::<Settings>(r#"{"skipPermissions":true}"#).unwrap(), s);
+        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()) };
+        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src" });
+        assert_eq!(serde_json::to_value(&s).unwrap(), json);
+        assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), s);
     }
 
     #[test]
     fn skipping_permissions_adds_the_flag() {
         assert!(Settings::default().claude_args().is_empty());
-        assert_eq!(Settings { skip_permissions: true }.claude_args(), ["--dangerously-skip-permissions"]);
+        let s = Settings { skip_permissions: true, ..Settings::default() };
+        assert_eq!(s.claude_args(), ["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn a_new_workspace_folder_must_exist_and_blank_means_home() {
+        let with = |dir: &str| Settings { workspace: Some(dir.into()), ..Settings::default() }.validated(&Settings::default());
+        assert_eq!(with("  ").unwrap().workspace, None);
+        assert_eq!(with(" ~ ").unwrap().workspace.as_deref(), Some("~"));
+        assert_eq!(with("/no/such/dir").unwrap_err(), "/no/such/dir does not exist");
+        let file = crate::test_support::temp_dir("settings-file").join("f");
+        std::fs::write(&file, "").unwrap();
+        assert!(with(file.to_str().unwrap()).unwrap_err().ends_with("is not a folder"));
+    }
+
+    #[test]
+    fn an_unchanged_workspace_folder_is_not_checked_again() {
+        // Chosen when it existed; since deleted or unmounted.
+        let stored = Settings { skip_permissions: false, workspace: Some("/no/such/dir".into()) };
+        let toggled = Settings { skip_permissions: true, ..stored.clone() };
+        assert_eq!(toggled.clone().validated(&stored), Ok(toggled));
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_says_why() {
+        if crate::test_support::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_support::temp_dir("settings-locked");
+        std::fs::create_dir(dir.join("in")).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = check_folder(dir.join("in").to_str().unwrap()).unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(err.contains("cannot be used"), "{err}");
     }
 }

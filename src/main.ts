@@ -2,9 +2,13 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
+import { fillIcons, icon, type IconName } from "./icons";
+import { shellQuote, untypeable } from "./paths";
+import { createTree, type Listing } from "./tree";
 
 /**
  * What a tab runs, tagged by `kind`; each kind has only its own fields.
@@ -112,6 +116,8 @@ interface Layout {
 interface Settings {
   /** Start Claude tabs with `--dangerously-skip-permissions`. */
   skipPermissions: boolean;
+  /** The workspace folder the sidebar shows; null for the home directory. */
+  workspace: string | null;
 }
 
 
@@ -133,13 +139,6 @@ const CLAUDE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden
   </g>
 </svg>`;
 
-// Constant markup, like CLAUDE_ICON.
-const SETTINGS_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
-  <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
-    <circle cx="12" cy="12" r="3.2" />
-    <path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1" />
-  </g>
-</svg>`;
 
 // xfce4-terminal defaults.
 const THEME = {
@@ -163,18 +162,44 @@ const tabsEl = $<HTMLDivElement>("#tabs");
 const termsEl = $<HTMLElement>("#terminals");
 const spawnDialog = $<HTMLDialogElement>("#spawn-dialog");
 const noticeEl = $<HTMLDivElement>("#notice");
-const settingsEl = $<HTMLElement>("#settings");
-const settingsForm = settingsEl.querySelector("form")!;
+
+/** A tab that shows a page of the app instead of a terminal. Pages are not saved with the tabs. */
+interface Page {
+  title: string;
+  icon: IconName;
+  /** Shown when the stored settings cannot be read, after "Settings could not be read (why), ". */
+  unreadable: string;
+  el: HTMLElement;
+  form: HTMLFormElement;
+  /** Its tab in the tab bar while it is open. */
+  tabEl: HTMLElement | null;
+}
+type PageId = "settings" | "workspace";
+function page(title: string, icon: IconName, unreadable: string, sel: string): Page {
+  const el = $<HTMLElement>(sel);
+  return { title, icon, unreadable, el, form: el.querySelector("form")!, tabEl: null };
+}
+const pages: Record<PageId, Page> = {
+  settings: page("Settings", "settings", "so Claude tabs start with the defaults and settings cannot be changed.", "#settings"),
+  workspace: page(
+    "Workspace settings",
+    "folder-cog",
+    "so the Workspace box shows your home directory and its folder cannot be changed.",
+    "#workspace-settings",
+  ),
+};
+const pageIds = Object.keys(pages) as PageId[];
+const settingsForm = pages.settings.form;
 
 const sessions: Session[] = [];
-/** The last terminal tab selected; while the settings tab is shown, it stays selected underneath. */
+/** The last terminal tab selected; while a page (such as Settings) is shown, it stays selected underneath. */
 let active: Session | null = null;
-/** The settings tab: not in the tab bar, open behind a terminal, or shown. It is not saved with the tabs. */
-let settingsTab: "closed" | "open" | "shown" = "closed";
-/** The stored settings, as last loaded or saved by the settings tab. */
-let settings: Settings = { skipPermissions: false };
-/** The settings tab, while it is in the tab bar. */
-let settingsTabEl: HTMLElement | null = null;
+/** Pages in the tab bar, in the order opened; their tabs come after the terminal tabs. */
+const openPages: PageId[] = [];
+/** The page shown instead of a terminal; null when a terminal (or nothing) is shown. */
+let shownPage: PageId | null = null;
+/** The stored settings, as last loaded or saved; the defaults until the first load. */
+let settings: Settings = { skipPermissions: false, workspace: null };
 let counter = 0;
 const encoder = new TextEncoder();
 
@@ -374,7 +399,7 @@ function markExited(s: Session, message: string, error = false) {
 function activate(s: Session) {
   if (active !== s) scheduleSave();
   active = s;
-  if (settingsTab === "shown") settingsTab = "open";
+  shownPage = null;
   showActive();
   requestAnimationFrame(() => {
     s.fit.fit();
@@ -383,18 +408,20 @@ function activate(s: Session) {
 }
 
 /**
- * Marks the visible tab and pane: the settings tab if shown, else the active terminal.
+ * Marks the visible tab and pane: the shown page if any, else the active terminal.
  * Classes are toggled in place rather than re-rendering, so a click followed by a
  * double-click (rename) lands on the same tab element.
  */
 function showActive() {
-  const shown = settingsTab === "shown";
+  const shown = shownPage !== null;
   sessions.forEach((o, i) => {
     o.el.classList.toggle("active", !shown && o === active);
     tabsEl.children[i]?.classList.toggle("active", !shown && o === active);
   });
-  settingsEl.classList.toggle("active", shown);
-  settingsTabEl?.classList.toggle("active", shown);
+  for (const id of pageIds) {
+    pages[id].el.classList.toggle("active", id === shownPage);
+    pages[id].tabEl?.classList.toggle("active", id === shownPage);
+  }
 }
 
 function close(s: Session) {
@@ -414,8 +441,8 @@ function close(s: Session) {
   if (active === s) {
     const next = sessions[Math.min(i, sessions.length - 1)] ?? null;
     active = null;
-    // Behind a shown settings tab, the neighbour is only selected.
-    if (next && settingsTab !== "shown") activate(next);
+    // Behind a shown page, the neighbour is only selected.
+    if (next && shownPage === null) activate(next);
     else active = next;
   }
   scheduleSave();
@@ -455,7 +482,7 @@ function renderSessions() {
       const tab = document.createElement("div");
       tab.className = "tab";
       tab.title = tabTitle(s);
-      tab.classList.toggle("active", s === active && settingsTab !== "shown");
+      tab.classList.toggle("active", s === active && shownPage === null);
       tab.classList.toggle("exited", s.exited);
       tab.classList.toggle("skips-permissions", s.skipsPermissions);
 
@@ -465,7 +492,7 @@ function renderSessions() {
 
       const x = document.createElement("button");
       x.className = "x";
-      x.textContent = "✕";
+      x.append(icon("x", 12));
       x.title = "Close tab";
       x.onclick = (e) => {
         e.stopPropagation();
@@ -473,10 +500,10 @@ function renderSessions() {
       };
 
       if (s.run.kind === "claude") {
-        const icon = document.createElement("span");
-        icon.className = "icon";
-        icon.innerHTML = CLAUDE_ICON;
-        tab.append(icon);
+        const mark = document.createElement("span");
+        mark.className = "icon";
+        mark.innerHTML = CLAUDE_ICON;
+        tab.append(mark);
       }
       if (s.skipsPermissions) {
         const badge = document.createElement("span");
@@ -494,8 +521,10 @@ function renderSessions() {
       return tab;
     }),
   );
-  settingsTabEl = settingsTab === "closed" ? null : renderSettingsTab();
-  if (settingsTabEl) tabsEl.append(settingsTabEl);
+  for (const id of openPages) {
+    pages[id].tabEl = renderPageTab(id);
+    tabsEl.append(pages[id].tabEl!);
+  }
 }
 
 /** The tab's tooltip: its name, and a warning while Claude runs tools without asking. */
@@ -503,29 +532,29 @@ function tabTitle(s: Session): string {
   return s.skipsPermissions ? `${s.name} (Claude runs tools without asking: --dangerously-skip-permissions)` : s.name;
 }
 
-function renderSettingsTab(): HTMLElement {
+function renderPageTab(id: PageId): HTMLElement {
   const tab = document.createElement("div");
-  tab.className = "tab settings";
-  tab.title = "Settings";
-  tab.classList.toggle("active", settingsTab === "shown");
-  const icon = document.createElement("span");
-  icon.className = "icon";
-  icon.innerHTML = SETTINGS_ICON;
+  tab.className = "tab page-tab";
+  tab.title = pages[id].title;
+  tab.classList.toggle("active", shownPage === id);
+  const mark = document.createElement("span");
+  mark.className = "icon";
+  mark.append(icon(pages[id].icon));
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = "Settings";
+  name.textContent = pages[id].title;
   const x = document.createElement("button");
   x.className = "x";
-  x.textContent = "✕";
+  x.append(icon("x", 12));
   x.title = "Close tab";
   x.onclick = (e) => {
     e.stopPropagation();
-    closeSettings();
+    closePage(id);
   };
-  tab.append(icon, name, x);
-  tab.onclick = () => openSettings();
+  tab.append(mark, name, x);
+  tab.onclick = () => openPage(id);
   tab.onauxclick = (e) => {
-    if (e.button === 1) closeSettings();
+    if (e.button === 1) closePage(id);
   };
   return tab;
 }
@@ -536,74 +565,88 @@ function settingsField(name: string) {
   return settingsForm.elements.namedItem(name) as HTMLInputElement;
 }
 
-function fillSettingsForm() {
+/** Shows the stored settings on every page. */
+function fillSettingsForms() {
   settingsField("skipPermissions").checked = settings.skipPermissions;
+  (pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement).value = settings.workspace ?? "";
 }
 
 function readSettingsForm(): Settings {
-  return { skipPermissions: settingsField("skipPermissions").checked };
+  return { ...settings, skipPermissions: settingsField("skipPermissions").checked };
 }
 
-function showSettingsError(message: string | null) {
-  const el = settingsForm.querySelector<HTMLElement>(".error")!;
+function showPageError(p: Page, message: string | null) {
+  const el = p.form.querySelector<HTMLElement>(".error")!;
   el.hidden = !message;
   el.textContent = message ?? "";
 }
 
 /**
- * Fills the form from the stored settings, which every launch reads too, so the page
- * shows what new Claude tabs will use. The form is disabled until they are read,
- * and stays disabled if they cannot be, so nothing is saved over them.
+ * Fills the page from the stored settings, which every launch reads too, so it shows
+ * what new tabs will use. Its form (disabled by `openPage`) is enabled once they are
+ * read, and stays disabled if they cannot be, so nothing is saved over them.
  */
-async function loadSettingsForm() {
-  const fieldset = settingsForm.querySelector("fieldset")!;
-  fieldset.disabled = true;
+async function loadPage(p: Page) {
   try {
-    settings = await invoke<Settings>("settings_load");
-    fillSettingsForm();
-    showSettingsError(null);
-    fieldset.disabled = false;
+    await loadSettings();
+    fillSettingsForms();
+    showWorkspace();
+    showPageError(p, null);
+    p.form.querySelector("fieldset")!.disabled = false;
   } catch (err) {
     console.error("raterm: could not load settings", err);
-    showSettingsError(
-      `Settings could not be read (${errorText(err)}), so Claude tabs start with the defaults and settings cannot be changed.`,
-    );
+    showPageError(p, `Settings could not be read (${errorText(err)}), ${p.unreadable}`);
   }
 }
 
-/** Saves the form; if that fails, the form goes back to the stored settings. */
+async function loadSettings() {
+  settings = await invoke<Settings>("settings_load");
+}
+
+/** Saves the settings page; if that fails, the form goes back to the stored settings. */
 async function saveSettingsForm() {
   try {
     settings = await invoke<Settings>("settings_save", { settings: readSettingsForm() });
-    showSettingsError(null);
+    showPageError(pages.settings, null);
   } catch (err) {
     console.error("raterm: could not save settings", err);
-    showSettingsError(`Settings not saved: ${errorText(err)}`);
+    showPageError(pages.settings, `Settings not saved: ${errorText(err)}`);
   }
-  fillSettingsForm();
+  fillSettingsForms();
 }
 
 // Loads and saves run one after another, so an earlier one cannot finish last and win.
 let settingsQueue = Promise.resolve();
 const queueSettings = (task: () => Promise<void>) => {
-  settingsQueue = settingsQueue.then(task);
+  // A task that throws is logged, so it cannot stop the ones queued after it.
+  settingsQueue = settingsQueue.then(task).catch((err) => console.error("raterm: settings task failed", err));
 };
 settingsForm.onchange = () => queueSettings(saveSettingsForm);
-settingsForm.onsubmit = (e) => e.preventDefault();
+for (const id of pageIds) pages[id].form.onsubmit = (e) => e.preventDefault();
 
-function openSettings() {
-  if (settingsTab === "closed") queueSettings(loadSettingsForm);
-  settingsTab = "shown";
+/** Opens the page's tab (loading the stored settings into it) and shows it. */
+function openPage(id: PageId) {
+  const p = pages[id];
+  if (!openPages.includes(id)) {
+    openPages.push(id);
+    // Disabled now, not when the queued load starts, so nothing can change before it.
+    p.form.querySelector("fieldset")!.disabled = true;
+    queueSettings(() => loadPage(p));
+  }
+  shownPage = id;
   renderSessions();
   showActive();
-  // The page, not the checkbox: a key typed while switching must not change a setting.
-  settingsEl.focus();
+  // The page, not a control: a key typed while switching must not change a setting.
+  p.el.focus();
 }
 
-function closeSettings() {
-  if (settingsTab === "closed") return;
-  const wasShown = settingsTab === "shown";
-  settingsTab = "closed";
+function closePage(id: PageId) {
+  const i = openPages.indexOf(id);
+  if (i < 0) return;
+  openPages.splice(i, 1);
+  pages[id].tabEl = null;
+  const wasShown = shownPage === id;
+  if (wasShown) shownPage = null;
   renderSessions();
   if (wasShown && active) activate(active);
   else showActive();
@@ -728,7 +771,7 @@ async function showStoreStatus() {
   if (store.state === "recovered") setNotice("store", store.notice);
   else if (store.state === "notSaving") setNotice("store", `Tabs are not being saved: ${store.reason}.`, false);
   else setNotice("store", null);
-  settingsForm.querySelector<HTMLElement>(".not-saving")!.hidden = store.state !== "notSaving";
+  for (const id of pageIds) pages[id].form.querySelector<HTMLElement>(".not-saving")!.hidden = store.state !== "notSaving";
   setNotice(
     "hook",
     hookProblem && `Claude session tracking failed (${hookProblem.message}); see ${hookProblem.log}.`,
@@ -786,6 +829,63 @@ async function restore() {
   if (sessions.length) activate(sessions[Math.min(saved.active, sessions.length - 1)]);
 }
 
+// ---------- workspace ----------
+
+const workspaceBox = $<HTMLElement>("#workspace-box");
+const tree = createTree(workspaceBox.querySelector<HTMLUListElement>(".tree")!, {
+  list: (dir) => invoke<Listing>("fs_list", { dir }),
+  errorText,
+  onPickFile: insertPath,
+});
+
+/** Roots the tree at the workspace folder from the settings (home by default). */
+function showWorkspace() {
+  tree.setRoot(settings.workspace ?? "~");
+}
+
+/** Stores the workspace folder (null for home); a refused folder is shown on the workspace page. */
+function setWorkspace(workspace: string | null) {
+  queueSettings(async () => {
+    try {
+      settings = await invoke<Settings>("settings_save", { settings: { ...settings, workspace } });
+      showPageError(pages.workspace, null);
+      fillSettingsForms();
+      showWorkspace();
+    } catch (err) {
+      console.error("raterm: could not save the workspace folder", err);
+      showPageError(pages.workspace, `Workspace folder not saved: ${errorText(err)}`);
+    }
+  });
+}
+
+async function chooseWorkspace() {
+  // The listed root has `~` expanded, which the picker needs.
+  const picked = await openDialog({ directory: true, multiple: false, defaultPath: tree.listedRoot() });
+  if (typeof picked === "string") setWorkspace(picked);
+}
+
+/**
+ * Types the shell-quoted `path` and a space into the active tab, as if the user had,
+ * and shows the tab. Says why in a notice when there is no running tab or the path
+ * cannot be typed safely.
+ */
+function insertPath(path: string) {
+  const s = active;
+  const shown = JSON.stringify(path);
+  if (!s || s.exited || s.id === null) return setNotice("path", `${shown} was not typed: no tab is running.`);
+  const why = untypeable(path);
+  if (why) return setNotice("path", `${shown} was not typed: ${why}.`);
+  invoke("pty_write", { id: s.id, data: Array.from(encoder.encode(`${shellQuote(path)} `)) })
+    .then(() => {
+      setNotice("path", null);
+      if (sessions.includes(s)) activate(s);
+    })
+    .catch((err) => {
+      console.error("raterm: could not type the path", err);
+      setNotice("path", `${shown} could not be typed: ${errorText(err)}.`);
+    });
+}
+
 // ---------- spawn dialog, wiring ----------
 
 /** The active tab's current directory, so a new tab opens next to it. */
@@ -825,33 +925,70 @@ newClaudeButton.onclick = (e) => {
   if (e.shiftKey) return askClaudeTab();
   openClaudeTab();
 };
-const settingsButton = $<HTMLButtonElement>("#open-settings");
-settingsButton.querySelector(".icon")!.innerHTML = SETTINGS_ICON;
-settingsButton.onclick = () => openSettings();
+fillIcons();
+for (const el of document.querySelectorAll(".claude-icon")) el.innerHTML = CLAUDE_ICON;
+$<HTMLButtonElement>("#open-settings").onclick = () => openPage("settings");
 // A hidden terminal has no size to fit to; it is fitted when shown again.
 new ResizeObserver(() => {
-  if (settingsTab !== "shown") active?.fit.fit();
+  if (shownPage === null) active?.fit.fit();
 }).observe(termsEl);
+
+/** Remembers an on/off UI choice. Storage can be unavailable; these are only conveniences. */
+function remember(key: string, on: boolean) {
+  try {
+    localStorage.setItem(key, on ? "1" : "0");
+  } catch (err) {
+    console.debug("raterm: could not remember", key, err);
+  }
+}
+
+function remembered(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === "1";
+  } catch (err) {
+    console.debug("raterm: could not recall", key, err);
+    return false;
+  }
+}
 
 const SIDEBAR_KEY = "raterm.sidebarCollapsed";
 function setSidebar(collapsed: boolean) {
   document.body.classList.toggle("sidebar-collapsed", collapsed);
-  try {
-    localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0");
-  } catch (err) {
-    // Storage can be unavailable; the remembered state is only a convenience.
-    console.debug("raterm: sidebar state not saved", err);
-  }
+  remember(SIDEBAR_KEY, collapsed);
 }
-try {
-  setSidebar(localStorage.getItem(SIDEBAR_KEY) === "1");
-} catch (err) {
-  console.debug("raterm: sidebar state not restored", err);
-}
+setSidebar(remembered(SIDEBAR_KEY));
 $("#toggle-sidebar").onclick = () => {
   setSidebar(!document.body.classList.contains("sidebar-collapsed"));
   active?.term.focus();
 };
+
+/** Wires a sidebar toolbox's header button to collapse it, remembering the choice under `name`. */
+function setupToolbox(box: HTMLElement, name: string) {
+  const key = `raterm.toolbox.${name}.collapsed`;
+  box.classList.toggle("collapsed", remembered(key));
+  box.querySelector<HTMLButtonElement>(".toggle")!.onclick = () => {
+    const collapsed = !box.classList.contains("collapsed");
+    box.classList.toggle("collapsed", collapsed);
+    remember(key, collapsed);
+  };
+}
+setupToolbox(workspaceBox, "workspace");
+workspaceBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => tree.reload();
+workspaceBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("workspace");
+// The path field is read-only: clicking it (or Enter or Space on it) opens the folder picker.
+const workspaceInput = pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement;
+const pickWorkspace = () =>
+  chooseWorkspace().catch((err) => {
+    console.error("raterm: could not open the folder picker", err);
+    showPageError(pages.workspace, `The folder picker could not be opened: ${errorText(err)}`);
+  });
+workspaceInput.onclick = pickWorkspace;
+workspaceInput.onkeydown = (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  e.preventDefault();
+  pickWorkspace();
+};
+pages.workspace.el.querySelector<HTMLButtonElement>(".home-workspace")!.onclick = () => setWorkspace(null);
 
 /**
  * Saves on window close; the handler finishes before the window is destroyed. If
@@ -875,6 +1012,16 @@ async function watchWindowClose() {
 
 renderSessions();
 renderNotices();
+// The tree waits for the stored folder; if the settings cannot be read it shows home, and says so.
+queueSettings(async () => {
+  try {
+    await loadSettings();
+  } catch (err) {
+    console.error("raterm: could not load settings", err);
+    setNotice("settings", `Settings could not be read (${errorText(err)}), ${pages.workspace.unreadable}`);
+  }
+  showWorkspace();
+});
 // Async so a failure (e.g. outside Tauri) is logged instead of aborting the UI setup.
 watchWindowClose().catch((err) => {
   console.error("raterm: could not watch window close", err);

@@ -91,12 +91,38 @@ body { display: flex; flex-direction: column; }
 }
 body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
 #sidebar { display: flex; flex-direction: column; }
+
+/* ---------- toolboxes ---------- */
+.toolbox { display: flex; flex-direction: column; min-height: 0; flex: 0 1 auto; }
+.toolbox:not(.collapsed) { flex: 1 1 auto; }
+.toolbox header { flex: none; display: flex; align-items: center; padding: 4px 6px 4px 4px; }
+.toolbox header button { background: none; color: var(--muted); padding: 4px 6px; white-space: nowrap; }
+.toolbox header button:hover { background: var(--press); color: var(--fg); }
+.toolbox .toggle { flex: 1; display: flex; align-items: center; gap: 4px; text-align: left; font-weight: 600; }
+.toolbox .chevron { width: 14px; transition: transform .1s; }
+.toolbox.collapsed .chevron { transform: rotate(-90deg); }
+.toolbox .body { flex: 1; min-height: 0; overflow: auto; }
+.toolbox.collapsed .body { display: none; }
+
+/* ---------- file tree ---------- */
+.tree, .tree ul { list-style: none; margin: 0; padding: 0; }
+.tree .row {
+  display: flex; align-items: center; gap: 4px; width: 100%; padding: 2px 8px;
+  border-radius: 0; background: none; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tree .row:hover { background: var(--press); }
+.tree .row .chevron { flex: none; width: 14px; height: 14px; color: var(--muted); }
+.tree .row .kind { flex: none; display: grid; color: var(--muted); }
+.tree .row .name { overflow: hidden; text-overflow: ellipsis; }
+.tree .row.root { font-weight: 600; cursor: default; }
+.tree .row.root:hover { background: none; }
+.tree .note { padding: 2px 8px; color: var(--muted); white-space: nowrap; }
+.tree .note.error { color: #b3261e; white-space: normal; }
 #open-settings {
   margin-top: auto; display: flex; align-items: center; gap: 8px; padding: 10px 14px;
   border-radius: 0; background: none; color: var(--muted); white-space: nowrap; text-align: left;
 }
 #open-settings:hover { background: var(--press); color: var(--fg); }
-#open-settings .icon { display: grid; place-items: center; }
 
 /* ---------- terminals ---------- */
 #terminals { min-width: 0; flex: 1; position: relative; min-height: 0; background: var(--term-bg); }
@@ -121,6 +147,7 @@ body.no-tabs #empty-state { display: grid; }
 .page label.check { flex-direction: row; align-items: center; gap: 8px; color: var(--fg); }
 .page label.check input { width: auto; margin: 0; }
 .page .hint { margin: 0; color: var(--muted); }
+.page fieldset h2:not(:first-child) { margin-top: 12px; }
 .page .error { margin: 12px 0 0; color: #b3261e; }
 .page .error[hidden], .page .hint[hidden] { display: none; }
 .page { outline: none; }
@@ -147,3 +174,23 @@ menu { display: flex; gap: 8px; margin: 0; padding: 0; }
 menu .primary { order: 1; }
 .spacer { flex: 1; }
 .page .not-saving { margin-top: 12px; }
+
+/* ---------- icons (Lucide, see src/icons.ts) ---------- */
+svg.lucide { display: block; flex: none; }
+[data-icon] { display: inline-grid; place-items: center; flex: none; }
+#open-settings [data-icon], .page button [data-icon] { color: var(--muted); }
+.page button { display: inline-flex; align-items: center; gap: 6px; }
+.page h2 { display: flex; align-items: center; gap: 8px; }
+.page .path-input {
+  display: flex; align-items: center; gap: 6px; padding: 0 4px 0 8px;
+  border: 1px solid var(--press); border-radius: 6px; background: var(--surface);
+}
+.page .path-input:focus-within { border-color: var(--accent); }
+.page .path-input [data-icon] { color: var(--muted); }
+.page .path-input input { flex: 1; border: 0; padding: 6px 0; cursor: pointer; background: none; }
+.page .path-input button { padding: 4px; background: none; }
+.page .path-input button:hover { background: var(--press); }
+.toolbox header button { display: inline-flex; align-items: center; }
+.toolbox .toggle { gap: 2px; }
+.tab .x { display: inline-grid; place-items: center; }
+#notice button { display: inline-grid; place-items: center; }
