@@ -60,6 +60,10 @@ const MIGRATIONS: &[&str] = &[r#"
     -- The Claude process that reported, so `session_run_by` can tell whether a
     -- terminal tab still has that session open.
     ALTER TABLE claude_sessions ADD COLUMN claude_pid INTEGER;
+"#, r#"
+    -- Whether Claude tabs get `autoMemoryEnabled: false`; 0 leaves it to the user's config.
+    ALTER TABLE settings ADD COLUMN disable_auto_memory INTEGER NOT NULL DEFAULT 0
+        CHECK (disable_auto_memory IN (0, 1));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -386,8 +390,8 @@ impl Db {
     /// The stored settings (the migration created their row with the defaults).
     pub fn load_settings(&self) -> Result<Settings, String> {
         self.conn()
-            .query_row("SELECT skip_permissions, workspace FROM settings WHERE id = 1", [], |r| {
-                Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)? })
+            .query_row("SELECT skip_permissions, workspace, disable_auto_memory FROM settings WHERE id = 1", [], |r| {
+                Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)? })
             })
             .map_err(sql)
     }
@@ -398,8 +402,8 @@ impl Db {
         let changed = self
             .conn()
             .execute(
-                "UPDATE settings SET skip_permissions = ?1, workspace = ?2 WHERE id = 1",
-                params![settings.skip_permissions, settings.workspace],
+                "UPDATE settings SET skip_permissions = ?1, workspace = ?2, disable_auto_memory = ?3 WHERE id = 1",
+                params![settings.skip_permissions, settings.workspace, settings.disable_auto_memory],
             )
             .map_err(sql)?;
         if changed != 1 {
@@ -662,7 +666,22 @@ pub(crate) mod tests {
         conn.execute("UPDATE settings SET skip_permissions = 1", []).unwrap();
         drop(conn);
         let db = Db::open(path).unwrap();
-        assert_eq!(db.load_settings().unwrap(), Settings { skip_permissions: true, workspace: None });
+        assert_eq!(db.load_settings().unwrap(), Settings { skip_permissions: true, ..Settings::default() });
+    }
+
+    #[test]
+    fn upgrading_from_schema_4_keeps_the_settings_and_adds_auto_memory() {
+        let path = temp_db("upgrade-v4");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&MIGRATIONS[..4].concat()).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute("UPDATE settings SET skip_permissions = 1, workspace = '~/src'", []).unwrap();
+        drop(conn);
+        let db = Db::open(path).unwrap();
+        let upgraded = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: false };
+        assert_eq!(db.load_settings().unwrap(), upgraded);
+        let saved = db.save_settings(Settings { disable_auto_memory: true, ..upgraded }).unwrap();
+        assert!(saved.disable_auto_memory);
     }
 
     #[test]
@@ -692,8 +711,9 @@ pub(crate) mod tests {
         let path = temp_db("settings");
         let db = Db::open(path.clone()).unwrap();
         assert_eq!(db.load_settings().unwrap(), Settings::default());
-        let saved = db.save_settings(Settings { skip_permissions: true, workspace: Some("~".into()) }).unwrap();
-        assert_eq!(saved, Settings { skip_permissions: true, workspace: Some("~".into()) }, "returned as stored");
+        let all = Settings { skip_permissions: true, workspace: Some("~".into()), disable_auto_memory: true };
+        let saved = db.save_settings(all.clone()).unwrap();
+        assert_eq!(saved, all, "returned as stored");
         drop(db);
         assert_eq!(Db::open(path).unwrap().load_settings().unwrap(), saved);
     }
@@ -704,6 +724,7 @@ pub(crate) mod tests {
         let db = Db::open(path.clone()).unwrap();
         let conn = connect_existing(&path).unwrap();
         assert!(conn.execute("UPDATE settings SET skip_permissions = 2", []).is_err());
+        assert!(conn.execute("UPDATE settings SET disable_auto_memory = 2", []).is_err());
         assert!(conn.execute("INSERT INTO settings (id) VALUES (2)", []).is_err(), "one row only");
         assert_eq!(db.load_settings().unwrap(), Settings::default());
     }

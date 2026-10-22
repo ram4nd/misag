@@ -14,6 +14,7 @@
 use crate::db::{self, unix_secs, Db, SessionReport};
 use crate::layout::TabId;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
@@ -161,11 +162,21 @@ pub fn hook_command(exe: &Path) -> String {
 
 /// The `--settings` JSON that installs raterm's SessionStart hook.
 fn hook_settings(exe: &Path) -> String {
-    let command = hook_command(exe);
-    serde_json::json!({
-        "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": command }] }] }
-    })
-    .to_string()
+    settings_json(Some(exe), Map::new()).expect("the hook is a setting")
+}
+
+/// The `--settings` JSON: `keys` (from raterm's own settings) plus, with `hook_exe`,
+/// the SessionStart hook. None when that is empty, so no `--settings` is passed.
+fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
+    if let Some(exe) = hook_exe {
+        debug_assert!(!keys.contains_key("hooks"), "a setting would replace raterm's hook");
+        let command = hook_command(exe);
+        keys.insert(
+            "hooks".into(),
+            serde_json::json!({ "SessionStart": [{ "hooks": [{ "type": "command", "command": command }] }] }),
+        );
+    }
+    (!keys.is_empty()).then(|| Value::Object(keys).to_string())
 }
 
 /// The directory of the `claude` wrapper for the database at `db`.
@@ -223,12 +234,13 @@ pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
 
 /// Arguments for `claude`: resume `session`, or start it under that id. With
 /// `hook_exe`, also the hook that reports session starts and changes; without one
-/// (nowhere to record them) the session is simply not tracked.
-pub fn args(session: &SessionId, resume: bool, hook_exe: Option<&Path>) -> Vec<String> {
+/// (nowhere to record them) the session is simply not tracked. `settings` (see
+/// `Settings::claude_settings`) share that one `--settings` argument.
+pub fn args(session: &SessionId, resume: bool, hook_exe: Option<&Path>, settings: Map<String, Value>) -> Vec<String> {
     let flag = if resume { "--resume" } else { "--session-id" };
     let mut args = vec![flag.to_string(), session.to_string()];
-    if let Some(exe) = hook_exe {
-        args.extend(["--settings".to_string(), hook_settings(exe)]);
+    if let Some(json) = settings_json(hook_exe, settings) {
+        args.extend(["--settings".to_string(), json]);
     }
     args
 }
@@ -428,22 +440,43 @@ mod tests {
 
     #[test]
     fn starts_a_new_session_with_the_hook() {
-        let args = args(&id(), false, Some(Path::new(EXE)));
+        let args = args(&id(), false, Some(Path::new(EXE)), Map::new());
         assert_eq!(args[..3], ["--session-id", ID, "--settings"]);
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["command"], "'/opt/my apps/raterm' --claude-hook");
+        assert_eq!(settings.as_object().unwrap().len(), 1, "only the hook");
     }
 
     #[test]
     fn resumes_with_the_resume_flag() {
-        assert_eq!(args(&id(), true, Some(Path::new(EXE)))[..2], ["--resume", ID]);
+        assert_eq!(args(&id(), true, Some(Path::new(EXE)), Map::new())[..2], ["--resume", ID]);
     }
 
     #[test]
     fn without_a_hook_binary_there_is_no_hook() {
-        assert_eq!(args(&id(), false, None), ["--session-id", ID]);
+        assert_eq!(args(&id(), false, None, Map::new()), ["--session-id", ID]);
+    }
+
+    fn no_auto_memory() -> Map<String, Value> {
+        crate::settings::Settings { disable_auto_memory: true, ..Default::default() }.claude_settings()
+    }
+
+    #[test]
+    fn settings_keys_share_the_hooks_settings_json() {
+        let args = args(&id(), false, Some(Path::new(EXE)), no_auto_memory());
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
+        let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
+        assert_eq!(settings["autoMemoryEnabled"], false);
+        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "'/opt/my apps/raterm' --claude-hook");
+    }
+
+    #[test]
+    fn without_a_hook_the_settings_keys_are_passed_alone() {
+        let args = args(&id(), false, None, no_auto_memory());
+        assert_eq!(args[..3], ["--session-id", ID, "--settings"]);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&args[3]).unwrap(), serde_json::json!({ "autoMemoryEnabled": false }));
     }
 
     /// Runs the installed wrapper with a stand-in `claude` that prints its

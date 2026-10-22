@@ -207,11 +207,11 @@ pub fn launch_plan<'a>(tab: &'a TabLaunch, exe: &'a AppExe, db: &'a Db) -> Resul
     let resume = claude::should_resume(&session, reported.as_deref(), projects.as_deref())
         .map_err(|e| format!("cannot tell whether Claude session {session} has a conversation to resume: {e}"))?;
     let hook = db.hook_path().map(|db| HookTarget { exe, db });
-    // The defaults are the cautious choice (Claude asks before running tools), so an
-    // unreadable setting never blocks a tab; the Settings tab shows the error.
+    // An unreadable setting never blocks a tab; it starts with the cautious settings,
+    // and the startup notice and the Settings tab show the error.
     let settings = db.load_settings().unwrap_or_else(|e| {
-        eprintln!("raterm: {e}; starting Claude with the default settings");
-        Settings::default()
+        eprintln!("raterm: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
+        Settings::cautious()
     });
     Ok(LaunchPlan::Claude { tab_id: &tab.tab_id, session, hook, resume, settings })
 }
@@ -240,7 +240,7 @@ pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
         }
         LaunchPlan::Claude { tab_id, session, hook, resume, settings } => {
             let mut args = settings.claude_args();
-            args.extend(claude::args(session, *resume, hook.map(|h| h.exe)));
+            args.extend(claude::args(session, *resume, hook.map(|h| h.exe), settings.claude_settings()));
             let env = hook.map_or_else(Vec::new, |h| hook_env(tab_id, h.db));
             (Launch::Program { program: "claude".into(), args }, env)
         }
@@ -675,7 +675,7 @@ mod tests {
         let (launch, env) = launch_for(&plan);
         let Launch::Program { program, args } = launch else { panic!("expected a program") };
         assert_eq!(program, "claude");
-        assert_eq!(args, claude::args(&session(), false, Some(Path::new(EXE))));
+        assert_eq!(args, claude::args(&session(), false, Some(Path::new(EXE)), Default::default()));
         assert_eq!(
             env,
             [("RATERM_TAB".into(), "tab-1".into()), ("RATERM_DB".into(), "/data/raterm.db".into())]
@@ -721,21 +721,44 @@ mod tests {
         let plan = launch_plan(&request, &exe, &db).unwrap();
         let (Launch::Program { args, .. }, _) = launch_for(&plan) else { panic!("expected a program") };
         let mut expected = vec!["--dangerously-skip-permissions".to_string()];
-        expected.extend(claude::args(&session(), false, db.hook_path().map(|_| Path::new(EXE))));
+        expected.extend(claude::args(&session(), false, db.hook_path().map(|_| Path::new(EXE)), Default::default()));
         assert_eq!(args, expected);
         assert!(plan_spawn(&request, &exe, &db, None).unwrap().skips_permissions);
         assert!(!plan_spawn(&terminal_tab(), &exe, &db, None).unwrap().skips_permissions, "only Claude tabs");
     }
 
     #[test]
-    fn unreadable_settings_start_claude_with_the_defaults() {
+    fn disabling_auto_memory_reaches_the_settings_json_next_to_the_hook() {
+        let db = Db::open(temp_db("plan-auto-memory")).unwrap();
+        let request = claude_tab();
+        let exe = exe();
+        let settings_json = |db: &Db| {
+            let (Launch::Program { args, .. }, _) = launch_for(&launch_plan(&request, &exe, db).unwrap()) else {
+                panic!("expected a program")
+            };
+            let i = args.iter().position(|a| a == "--settings").expect("the hook's --settings");
+            serde_json::from_str::<serde_json::Value>(&args[i + 1]).unwrap()
+        };
+        let auto = settings_json(&db);
+        assert!(auto.get("autoMemoryEnabled").is_none(), "auto leaves it to the user's config");
+        assert!(auto.get("hooks").is_some());
+
+        db.save_settings(Settings { disable_auto_memory: true, ..Settings::default() }).unwrap();
+        let disabled = settings_json(&db);
+        assert_eq!(disabled["autoMemoryEnabled"], false);
+        assert_eq!(disabled["hooks"], auto["hooks"]);
+    }
+
+    #[test]
+    fn unreadable_settings_start_claude_cautiously() {
         let path = temp_db("plan-bad-settings");
         let db = Db::open(path.clone()).unwrap();
         db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap();
         connect_existing(&path).unwrap().execute("DELETE FROM settings", []).unwrap();
         let request = claude_tab();
         let LaunchPlan::Claude { settings, .. } = launch_plan(&request, &exe(), &db).unwrap() else { panic!() };
-        assert_eq!(settings, Settings::default());
+        assert_eq!(settings, Settings::cautious());
+        assert!(!settings.skip_permissions && settings.disable_auto_memory);
     }
 
     #[test]

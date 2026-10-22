@@ -142,6 +142,8 @@ interface Settings {
   skipPermissions: boolean;
   /** The workspace folder the sidebar shows; null for the home directory. */
   workspace: string | null;
+  /** When true, Claude tabs get `autoMemoryEnabled: false`; when false, nothing is passed and the user's Claude config decides. */
+  disableAutoMemory: boolean;
 }
 
 
@@ -201,7 +203,7 @@ function page(title: string, icon: IconName, unreadable: string, sel: string): P
   return { title, icon, unreadable, el, form: el.querySelector("form")!, tabEl: null };
 }
 const pages: Record<PageId, Page> = {
-  settings: page("Settings", "settings", "so Claude tabs start with the defaults and settings cannot be changed.", "#settings"),
+  settings: page("Settings", "settings", "so Claude tabs start with permission prompts and auto memory off, and settings cannot be changed.", "#settings"),
   workspace: page(
     "Workspace settings",
     "folder-cog",
@@ -220,7 +222,7 @@ const openPages: PageId[] = [];
 /** The page shown instead of a terminal; null when a terminal (or nothing) is shown. */
 let shownPage: PageId | null = null;
 /** The stored settings, as last loaded or saved; the defaults until the first load. */
-let settings: Settings = { skipPermissions: false, workspace: null };
+let settings: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
 let counter = 0;
 const encoder = new TextEncoder();
 
@@ -603,18 +605,23 @@ function renderPageTab(id: PageId): HTMLElement {
 
 // ---------- settings ----------
 
-function settingsField(name: string) {
-  return settingsForm.elements.namedItem(name) as HTMLInputElement;
+function settingsField<T extends HTMLInputElement | HTMLSelectElement = HTMLInputElement>(name: string) {
+  return settingsForm.elements.namedItem(name) as T;
 }
 
 /** Shows the stored settings on every page. */
 function fillSettingsForms() {
   settingsField("skipPermissions").checked = settings.skipPermissions;
+  settingsField<HTMLSelectElement>("disableAutoMemory").value = String(settings.disableAutoMemory ?? false);
   (pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement).value = settings.workspace ?? "";
 }
 
 function readSettingsForm(): Settings {
-  return { ...settings, skipPermissions: settingsField("skipPermissions").checked };
+  return {
+    ...settings,
+    skipPermissions: settingsField("skipPermissions").checked,
+    disableAutoMemory: settingsField<HTMLSelectElement>("disableAutoMemory").value === "true",
+  };
 }
 
 function showPageError(p: Page, message: string | null) {
@@ -1119,7 +1126,10 @@ queueSettings(async () => {
     await loadSettings();
   } catch (err) {
     console.error("raterm: could not load settings", err);
-    setNotice("settings", `Settings could not be read (${errorText(err)}), ${pages.workspace.unreadable}`);
+    setNotice(
+      "settings",
+      `Settings could not be read (${errorText(err)}), ${pages.workspace.unreadable} Claude tabs start with permission prompts and auto memory off.`,
+    );
   }
   showWorkspace();
 });

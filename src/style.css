@@ -173,6 +173,11 @@ input {
   border: 1px solid var(--press); border-radius: 6px; padding: 6px 8px; outline: none;
 }
 input:focus { border-color: var(--accent); }
+.page select {
+  font: inherit; color: var(--fg); background: var(--surface); align-self: flex-start;
+  border: 1px solid var(--press); border-radius: 6px; padding: 4px 8px; outline: none;
+}
+.page select:focus { border-color: var(--accent); }
 dialog {
   width: 480px; background: var(--surface); color: var(--fg);
   border: 1px solid var(--press); border-radius: 10px; padding: 16px;

@@ -29,7 +29,7 @@ impl LiveTab {
         let dir = std::env::var("RATERM_LIVE_DIR").expect("set RATERM_LIVE_DIR to a folder Claude trusts");
         let data = common::temp_dir(name);
         drop(db::Db::open(data.join(db::FILE)).unwrap());
-        let args = claude::args(&session, resume, Some(Path::new(env!("CARGO_BIN_EXE_raterm"))));
+        let args = claude::args(&session, resume, Some(Path::new(env!("CARGO_BIN_EXE_raterm"))), Default::default());
         let sessions = Sessions::default();
         let req = SpawnRequest {
             cols: 120,

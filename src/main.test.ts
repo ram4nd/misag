@@ -155,7 +155,7 @@ let fsHidden: Record<string, number>;
 let fsTree: Record<string, { name: string; dir: boolean }[]>;
 /** settings_load waits for this, so a test can hold the load back. */
 let settingsLoadGate: Promise<void>;
-const DEFAULTS: Settings = { skipPermissions: false, workspace: null };
+const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -917,13 +917,56 @@ describe("settings", () => {
     await openSettings();
     expect(setting("skipPermissions").checked).toBe(false);
     await change("skipPermissions", true);
-    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ skipPermissions: true, workspace: null });
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ ...DEFAULTS, skipPermissions: true });
     expect(pageError().hidden).toBe(true);
     settingsTabX().click();
     // Changed outside the page (another window, or a tab writing the database).
     storedSettings = { ...DEFAULTS };
     await openSettings();
     expect(setting("skipPermissions").checked).toBe(false);
+  });
+
+  test("the auto memory select shows the stored value and saves changes either way", async () => {
+    const select = () => page().querySelector<HTMLSelectElement>("select[name=disableAutoMemory]")!;
+    async function choose(value: "true" | "false") {
+      select().value = value;
+      select().dispatchEvent(new Event("change", { bubbles: true }));
+      for (let i = 0; i < 3; i++) await flush();
+    }
+    await boot();
+    await openSettings();
+    expect(select().value).toBe("false");
+    expect(select().selectedOptions[0].textContent).toBe("Auto");
+    await choose("true");
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ ...DEFAULTS, disableAutoMemory: true });
+    await choose("false");
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual(DEFAULTS);
+    settingsTabX().click();
+    // Changed outside the page.
+    storedSettings = { ...DEFAULTS, disableAutoMemory: true };
+    await openSettings();
+    expect(select().value).toBe("true");
+    expect(select().selectedOptions[0].textContent).toBe("Disable");
+  });
+
+  test("changing one Claude setting keeps the other", async () => {
+    storedSettings = { ...DEFAULTS, skipPermissions: true };
+    await boot();
+    await openSettings();
+    const select = page().querySelector<HTMLSelectElement>("select[name=disableAutoMemory]")!;
+    select.value = "true";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    for (let i = 0; i < 3; i++) await flush();
+    expect(storedSettings).toEqual({ ...DEFAULTS, skipPermissions: true, disableAutoMemory: true });
+    await change("skipPermissions", false);
+    expect(storedSettings).toEqual({ ...DEFAULTS, disableAutoMemory: true });
+  });
+
+  test("a missing auto memory value shows as Auto", async () => {
+    storedSettings = { skipPermissions: false, workspace: null };
+    await boot();
+    await openSettings();
+    expect(page().querySelector<HTMLSelectElement>("select[name=disableAutoMemory]")!.value).toBe("false");
   });
 
   test("the form stays disabled until the stored settings are read", async () => {
@@ -968,7 +1011,7 @@ describe("settings", () => {
     await boot();
     await openSettings();
     expect(disabled()).toBe(true);
-    expect(pageError().textContent).toContain("Claude tabs start with the defaults");
+    expect(pageError().textContent).toContain("Claude tabs start with permission prompts and auto memory off");
   });
 
   test("Claude tabs started with skipped permissions are marked", async () => {
@@ -1245,12 +1288,12 @@ describe("file tree", () => {
     skip.checked = true;
     skip.dispatchEvent(new Event("change", { bubbles: true }));
     await settle();
-    expect(storedSettings).toEqual({ skipPermissions: true, workspace: "/p" });
+    expect(storedSettings).toEqual({ ...DEFAULTS, skipPermissions: true, workspace: "/p" });
     button(".configure").click();
     await settle();
     pageButton(".home-workspace").click();
     await settle();
-    expect(storedSettings).toEqual({ skipPermissions: true, workspace: null });
+    expect(storedSettings).toEqual({ ...DEFAULTS, skipPermissions: true });
   });
 
   test("a workspace folder that has gone does not block other settings", async () => {
@@ -1273,6 +1316,7 @@ describe("file tree", () => {
     await boot();
     await settle();
     expect(noticeText()).toContain("the Workspace box shows your home directory");
+    expect(noticeText()).toContain("Claude tabs start with permission prompts and auto memory off");
     button(".configure").click();
     await settle();
     expect(pageError().textContent).toContain("its folder cannot be changed");

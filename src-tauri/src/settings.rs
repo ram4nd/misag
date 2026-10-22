@@ -2,6 +2,7 @@
 //! table. Mirrored by `Settings` in src/main.ts.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -10,9 +11,19 @@ pub struct Settings {
     pub skip_permissions: bool,
     /// The workspace folder the sidebar shows; None for the home directory.
     pub workspace: Option<String>,
+    /// When true, Claude tabs get `autoMemoryEnabled: false`; when false, nothing is
+    /// passed and the user's own Claude configuration decides.
+    pub disable_auto_memory: bool,
 }
 
 impl Settings {
+    /// What Claude tabs start with when the stored settings cannot be read: the
+    /// defaults (Claude asks before running tools), but with auto memory off, so a
+    /// read error never turns memory back on for someone who disabled it.
+    pub fn cautious() -> Self {
+        Settings { disable_auto_memory: true, ..Settings::default() }
+    }
+
     /// Checks settings before they replace `stored`. A changed workspace folder must be
     /// an existing directory (a leading `~` is kept, and expanded when used); blank
     /// means home. An unchanged one is not checked again: it may have gone since it
@@ -30,6 +41,17 @@ impl Settings {
     /// The arguments these settings add to every Claude tab.
     pub fn claude_args(&self) -> Vec<String> {
         if self.skip_permissions { vec!["--dangerously-skip-permissions".into()] } else { vec![] }
+    }
+
+    /// The Claude settings keys these settings add to every Claude tab's `--settings`
+    /// JSON. A setting left at its default adds nothing, so the user's own Claude
+    /// configuration decides.
+    pub fn claude_settings(&self) -> Map<String, Value> {
+        let mut keys = Map::new();
+        if self.disable_auto_memory {
+            keys.insert("autoMemoryEnabled".into(), Value::Bool(false));
+        }
+        keys
     }
 }
 
@@ -49,8 +71,8 @@ mod tests {
 
     #[test]
     fn the_frontend_sees_camel_case_fields() {
-        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()) };
-        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src" });
+        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: true };
+        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src", "disableAutoMemory": true });
         assert_eq!(serde_json::to_value(&s).unwrap(), json);
         assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), s);
     }
@@ -60,6 +82,13 @@ mod tests {
         assert!(Settings::default().claude_args().is_empty());
         let s = Settings { skip_permissions: true, ..Settings::default() };
         assert_eq!(s.claude_args(), ["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn disabling_auto_memory_adds_its_claude_setting() {
+        assert!(Settings::default().claude_settings().is_empty(), "auto leaves it to the user's config");
+        let s = Settings { disable_auto_memory: true, ..Settings::default() };
+        assert_eq!(Value::Object(s.claude_settings()), serde_json::json!({ "autoMemoryEnabled": false }));
     }
 
     #[test]
@@ -76,7 +105,7 @@ mod tests {
     #[test]
     fn an_unchanged_workspace_folder_is_not_checked_again() {
         // Chosen when it existed; since deleted or unmounted.
-        let stored = Settings { skip_permissions: false, workspace: Some("/no/such/dir".into()) };
+        let stored = Settings { workspace: Some("/no/such/dir".into()), ..Settings::default() };
         let toggled = Settings { skip_permissions: true, ..stored.clone() };
         assert_eq!(toggled.clone().validated(&stored), Ok(toggled));
     }
