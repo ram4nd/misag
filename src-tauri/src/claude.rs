@@ -6,6 +6,10 @@
 //! session starts (launch, `--resume`, `/resume`, `/clear`, compaction) and pipes
 //! the session details to it; the hook is raterm's own binary in `--claude-hook`
 //! mode, which records them in the database for the tab named by `RATERM_TAB`.
+//!
+//! Terminal tabs find a `claude` wrapper first on their `PATH` (see
+//! `install_wrapper`), which starts the real `claude` with the same hook, so a
+//! Claude session started in a terminal tab is recorded for that tab too.
 
 use crate::db::{self, unix_secs, Db, SessionReport};
 use crate::layout::TabId;
@@ -16,10 +20,18 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Set on Claude tabs: the tab the hook reports for.
+/// Set on Claude and terminal tabs: the tab the hook reports for.
 pub const TAB_ENV: &str = "RATERM_TAB";
-/// Set on Claude tabs: the database the hook reports to.
+/// Set on Claude and terminal tabs: the database the hook reports to.
 pub const DB_ENV: &str = "RATERM_DB";
+/// Set on terminal tabs: the wrapper directory raterm put first on their PATH, so
+/// a raterm started from such a tab can take it off again.
+pub const WRAPPER_ENV: &str = "RATERM_WRAPPER";
+/// Claude Code sets this for the commands and hooks it runs (seen in 2.1): its
+/// own process, recorded with the session.
+pub const PID_ENV: &str = "CLAUDE_PID";
+/// The subdirectory of the database's directory that holds the `claude` wrapper.
+pub const WRAPPER_DIR: &str = "bin";
 /// Command-line flag that runs the binary as the hook.
 pub const HOOK_FLAG: &str = "--claude-hook";
 /// Hook failures are appended here, next to the database, since Claude does not
@@ -156,6 +168,59 @@ fn hook_settings(exe: &Path) -> String {
     .to_string()
 }
 
+/// The directory of the `claude` wrapper for the database at `db`.
+pub fn wrapper_dir(db: &Path) -> Option<PathBuf> {
+    Some(db.parent()?.join(WRAPPER_DIR))
+}
+
+/// The `claude` wrapper: takes its own directory off `PATH` and runs the real
+/// `claude` with the hook. Inside a Claude session (`CLAUDECODE`, which terminal
+/// tabs never inherit) it adds no hook, so a `claude` that Claude itself runs
+/// cannot replace the session recorded for the tab.
+fn wrapper_script(dir: &str, exe: &Path) -> String {
+    let (dir, settings) = (shell_quote(dir), shell_quote(&hook_settings(exe)));
+    format!(
+        r#"#!/bin/sh
+# Written by raterm at every start; changes are lost. Terminal tabs have this
+# directory first on PATH, so `claude` there reports its session to raterm.
+self={dir}
+rest=
+set -f
+IFS=:
+for d in $PATH; do
+  [ "$d" = "$self" ] || [ "$d" = "$self/" ] || rest=${{rest:+$rest:}}$d
+done
+unset IFS
+set +f
+PATH=$rest
+export PATH
+if [ -n "$CLAUDECODE" ]; then exec claude "$@"; fi
+exec claude --settings {settings} "$@"
+"#
+    )
+}
+
+/// Writes the `claude` wrapper (see `wrapper_script`) into `wrapper_dir(db)`,
+/// replacing any earlier one, so it always runs this raterm's hook. Returns the
+/// directory.
+pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = wrapper_dir(db).ok_or_else(|| format!("{} has no directory", db.display()))?;
+    let failed = |e: std::io::Error| format!("cannot write the claude wrapper in {}: {e}", dir.display());
+    let text = dir.to_str().ok_or_else(|| format!("{} is not valid UTF-8", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(failed)?;
+    // Renamed into place, so a tab starting `claude` meanwhile never runs half a script.
+    let partial = dir.join(".claude.partial");
+    let written = std::fs::write(&partial, wrapper_script(text, exe))
+        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::rename(&partial, dir.join("claude")));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&partial);
+        return Err(failed(e));
+    }
+    Ok(dir)
+}
+
 /// Arguments for `claude`: resume `session`, or start it under that id. With
 /// `hook_exe`, also the hook that reports session starts and changes; without one
 /// (nowhere to record them) the session is simply not tracked.
@@ -177,7 +242,7 @@ struct SessionStart {
     transcript_path: Option<String>,
 }
 
-fn record(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
+fn record(input: &str, tab_id: &TabId, db_path: &Path, claude_pid: Option<u32>) -> Result<(), String> {
     let event: SessionStart = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
     let conn = db::connect_existing(db_path)?;
     db::record_claude_session(
@@ -188,18 +253,20 @@ fn record(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
             source: event.source.as_deref(),
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
+            claude_pid,
         },
     )
 }
 
-/// Reads one SessionStart payload from `input` and records it for `tab_id`.
-fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>) -> Result<(), String> {
+/// Reads one SessionStart payload from `input` and records it for `tab_id`, with
+/// the Claude process that sent it.
+fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<(), String> {
     let (Some(tab_id), Some(db_path)) = (tab_id, db_path) else {
         return Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}"));
     };
     let mut payload = String::new();
     input.read_to_string(&mut payload).map_err(|e| format!("could not read the payload: {e}"))?;
-    record(&payload, tab_id, db_path).map_err(|e| format!("could not record the Claude session: {e}"))
+    record(&payload, tab_id, db_path, claude_pid).map_err(|e| format!("could not record the Claude session: {e}"))
 }
 
 /// Appends a failure to the hook log next to the database, starting the log over
@@ -312,8 +379,16 @@ pub fn run_hook() -> i32 {
     if cfg!(debug_assertions) && std::env::var_os(PANIC_TEST_ENV).is_some() {
         panic!("panic requested through {PANIC_TEST_ENV}");
     }
-    if let Err(message) = hook(std::io::stdin(), tab_id.as_ref(), db_path.as_deref()) {
-        log_failure(db_path.as_deref(), tab_id.as_ref(), &message);
+    let claude_pid = std::env::var(PID_ENV).ok().and_then(|pid| pid.parse().ok());
+    match hook(std::io::stdin(), tab_id.as_ref(), db_path.as_deref(), claude_pid) {
+        Err(message) => log_failure(db_path.as_deref(), tab_id.as_ref(), &message),
+        // Recorded, but a terminal tab cannot tell whether this session is still open.
+        Ok(()) if claude_pid.is_none() => log_failure(
+            db_path.as_deref(),
+            tab_id.as_ref(),
+            &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
+        ),
+        Ok(()) => {}
     }
     0
 }
@@ -369,6 +444,74 @@ mod tests {
     #[test]
     fn without_a_hook_binary_there_is_no_hook() {
         assert_eq!(args(&id(), false, None), ["--session-id", ID]);
+    }
+
+    /// Runs the installed wrapper with a stand-in `claude` that prints its
+    /// arguments and `PATH`, one per line.
+    fn run_wrapper(base: &Path, extra_env: &[(&str, &str)]) -> Vec<String> {
+        let wrapper = install_wrapper(&base.join("data/raterm.db"), Path::new(EXE)).unwrap();
+        let real = base.join("real");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("claude"), "#!/bin/sh\nprintf '%s\\n' \"$@\" \"PATH=$PATH\"\n").unwrap();
+        fs::set_permissions(real.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:{}/:{}:/usr/bin:/bin", wrapper.display(), wrapper.display(), real.display());
+        let out = std::process::Command::new("claude")
+            .args(["--resume", "it's"])
+            .env("PATH", &path)
+            .env_remove("CLAUDECODE")
+            .envs(extra_env.iter().copied())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_wrapper_runs_the_real_claude_with_the_hook() {
+        let base = crate::test_support::temp_dir("wrapper");
+        let lines = run_wrapper(&base, &[]);
+        assert_eq!(lines[0], "--settings");
+        assert_eq!(lines[1], hook_settings(Path::new(EXE)));
+        assert_eq!(lines[2..4], ["--resume", "it's"]);
+        assert_eq!(lines[4], format!("PATH={}:/usr/bin:/bin", base.join("real").display()), "its own directory is gone");
+        // Installing again replaces it.
+        assert_eq!(run_wrapper(&base, &[]), lines);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn without_a_real_claude_the_wrapper_fails_instead_of_calling_itself() {
+        let base = crate::test_support::temp_dir("wrapper-missing");
+        let wrapper = install_wrapper(&base.join("data/raterm.db"), Path::new(EXE)).unwrap();
+        // Listed twice and with a trailing slash: every spelling must be taken off.
+        let path = format!("{w}:{w}/:{w}:{empty}", w = wrapper.display(), empty = base.display());
+        let out = std::process::Command::new(wrapper.join("claude")).env("PATH", path).env_remove("CLAUDECODE").output().unwrap();
+        assert_eq!(out.status.code(), Some(127), "{}", String::from_utf8_lossy(&out.stderr));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_failed_install_leaves_no_partial_wrapper() {
+        if crate::test_support::running_as_root() {
+            return;
+        }
+        let base = crate::test_support::temp_dir("wrapper-readonly");
+        let dir = wrapper_dir(&base.join("raterm.db")).unwrap();
+        fs::create_dir(&dir).unwrap();
+        // The rename fails: `claude` is a directory that is not empty.
+        fs::create_dir_all(dir.join("claude/x")).unwrap();
+        let err = install_wrapper(&base.join("raterm.db"), Path::new(EXE)).unwrap_err();
+        assert!(err.contains("cannot write the claude wrapper"), "{err}");
+        assert!(!dir.join(".claude.partial").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn inside_a_claude_session_the_wrapper_adds_no_hook() {
+        let base = crate::test_support::temp_dir("wrapper-nested");
+        let lines = run_wrapper(&base, &[("CLAUDECODE", "1")]);
+        assert_eq!(lines[..2], ["--resume", "it's"]);
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
@@ -567,7 +710,7 @@ mod tests {
             r#"{{"session_id":"{ID}","transcript_path":"/x/{ID}.jsonl","cwd":"/home/me",
                  "hook_event_name":"SessionStart","source":"clear"}}"#
         );
-        record(&payload, &tid("tab-1"), &path).unwrap();
+        record(&payload, &tid("tab-1"), &path, None).unwrap();
         let layout = db.load_layout().unwrap();
         assert_eq!(layout.tabs[0].kind, TabKind::Claude { claude_session: Some(id()) });
     }
@@ -577,27 +720,29 @@ mod tests {
         let path = temp_db("hook-input");
         drop(Db::open(path.clone()).unwrap());
         let payload = format!(r#"{{"session_id":"{ID}","source":"startup"}}"#);
-        hook(payload.as_bytes(), Some(&tid("tab-2")), Some(&path)).unwrap();
+        hook(payload.as_bytes(), Some(&tid("tab-2")), Some(&path), Some(42)).unwrap();
         let conn = db::connect_existing(&path).unwrap();
-        let stored: String = conn
-            .query_row("SELECT session_id FROM claude_sessions WHERE tab_id = 'tab-2'", [], |r| r.get(0))
+        let stored: (String, u32) = conn
+            .query_row("SELECT session_id, claude_pid FROM claude_sessions WHERE tab_id = 'tab-2'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
-        assert_eq!(stored, ID);
+        assert_eq!(stored, (ID.to_string(), 42));
     }
 
     #[test]
     fn the_hook_needs_its_environment() {
         let path = temp_db("hook-env");
-        let err = hook("{}".as_bytes(), None, Some(&path)).unwrap_err();
+        let err = hook("{}".as_bytes(), None, Some(&path), None).unwrap_err();
         assert!(err.contains("RATERM_TAB"), "{err}");
-        assert!(hook("{}".as_bytes(), Some(&tid("t")), None).is_err());
+        assert!(hook("{}".as_bytes(), Some(&tid("t")), None, None).is_err());
         assert!(!path.exists(), "nothing should be written without a tab");
     }
 
     #[test]
     fn ignores_malformed_payloads() {
         let path = temp_db("hook-bad");
-        assert!(record("not json", &tid("tab-1"), &path).is_err());
-        assert!(record(r#"{"session_id":"; rm -rf ~"}"#, &tid("tab-1"), &path).is_err());
+        assert!(record("not json", &tid("tab-1"), &path, None).is_err());
+        assert!(record(r#"{"session_id":"; rm -rf ~"}"#, &tid("tab-1"), &path, None).is_err());
     }
 }

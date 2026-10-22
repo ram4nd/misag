@@ -56,8 +56,13 @@ pub struct Layout {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase", rename_all_fields = "camelCase")]
 pub enum TabKind {
-    /// A login shell, or `command` through it.
-    Terminal { command: Option<String> },
+    /// A login shell, or `command` through it. `claude_session` is the Claude
+    /// session open in the shell when the tab was saved, resumed in it on restore.
+    Terminal {
+        command: Option<String>,
+        #[serde(default)]
+        claude_session: Option<SessionId>,
+    },
     /// Claude Code, pinned to `claude_session` (None until one is assigned).
     Claude { claude_session: Option<SessionId> },
 }
@@ -103,7 +108,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_duplicate_tab_ids() {
-        let terminal = TabKind::Terminal { command: None };
+        let terminal = TabKind::Terminal { command: None, claude_session: None };
         let dupes = Layout { active: 0, tabs: vec![tab("a", terminal.clone()), tab("a", terminal)] };
         assert!(dupes.validated().is_err());
     }
@@ -120,7 +125,7 @@ mod tests {
 
     #[test]
     fn validation_clamps_the_active_tab() {
-        let layout = Layout { active: 7, tabs: vec![tab("a", TabKind::Terminal { command: None })] };
+        let layout = Layout { active: 7, tabs: vec![tab("a", TabKind::Terminal { command: None, claude_session: None })] };
         assert_eq!(layout.validated().unwrap().active, 0);
         assert_eq!(Layout::default().validated().unwrap().active, 0);
     }
@@ -132,10 +137,16 @@ mod tests {
         let Tab { tab_id, kind, name, renamed, .. } = &layout.tabs[0];
         assert_eq!((tab_id.as_str(), name.as_str(), *renamed), ("t1", "agent", true));
         assert_eq!(kind, &TabKind::Claude { claude_session: Some(SessionId::parse(SESSION).unwrap()) });
-        assert_eq!(layout.tabs[1].kind, TabKind::Terminal { command: Some("tail -f syslog".into()) });
+        assert_eq!(layout.tabs[1].kind, TabKind::Terminal { command: Some("tail -f syslog".into()), claude_session: None });
+        let session = Some(SessionId::parse(SESSION).unwrap());
+        assert_eq!(layout.tabs[2].kind, TabKind::Terminal { command: None, claude_session: session });
         let back = serde_json::to_value(&layout).unwrap();
         assert_eq!(back["tabs"][0]["claudeSession"], SESSION);
         assert_eq!(back["tabs"][0]["kind"], "claude");
+        assert_eq!(back["tabs"][2]["claudeSession"], SESSION);
+        // Saved by a raterm from before terminal tabs could hold a session.
+        let older = r#"{"tabId":"a","kind":"terminal","command":null,"name":"x","renamed":false,"cwd":null}"#;
+        assert_eq!(serde_json::from_str::<Tab>(older).unwrap().kind, TabKind::Terminal { command: None, claude_session: None });
     }
 
     #[test]

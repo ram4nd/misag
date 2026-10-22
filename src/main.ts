@@ -6,7 +6,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
-import { fillIcons, icon, type IconName } from "./icons";
+import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
 
@@ -15,15 +15,17 @@ import { createTree, type Listing } from "./tree";
  * Mirrors `layout::TabKind` in src-tauri/src/layout.rs.
  */
 type TabKind =
-  | { kind: "terminal"; command: string | null }
+  | { kind: "terminal"; command: string | null; claudeSession?: string | null }
   | { kind: "claude"; claudeSession: string | null };
 
 /**
- * A tab kind once a session has been assigned: a Claude tab always has one.
+ * A tab kind once a session has been assigned: a Claude tab always has one. A
+ * terminal tab's `claudeSession` is the Claude session to resume at its prompt
+ * when it starts (a restored tab that had one open), and null once handed over.
  * Mirrors `commands::RunningKind` in src-tauri/src/commands.rs.
  */
 type RunningKind =
-  | { kind: "terminal"; command: string | null }
+  | { kind: "terminal"; command: string | null; claudeSession: string | null }
   | { kind: "claude"; claudeSession: string };
 
 interface Session {
@@ -50,6 +52,15 @@ interface Session {
   closing: boolean;
   /** The running process is Claude started with `--dangerously-skip-permissions`. */
   skipsPermissions: boolean;
+  /**
+   * For terminal tabs: the Claude session last known to be open in the shell,
+   * saved with the tab so a restore reopens it. A check that cannot tell keeps it.
+   */
+  claudeOpen: string | null;
+  /** Until when (ms) a resumed Claude may still be starting, so a shell without it does not mean it quit. */
+  resumingUntil: number;
+  /** A `claude` seen in the foreground that never reported, and since when (ms). */
+  untracked?: { pid: number; since: number };
 }
 
 interface SpawnOptions {
@@ -80,7 +91,18 @@ interface Spawned {
   /** Unix seconds, for `claude_reported`. */
   startedAt: number;
   skipsPermissions: boolean;
+  resume: ResumeReport | null;
 }
+
+/** Mirrors `commands::ResumeReport` in src-tauri/src/commands.rs. */
+type ResumeReport = { state: "typed" } | { state: "noConversation" } | { state: "failed"; message: string };
+
+/** Mirrors `commands::ClaudeState` in src-tauri/src/commands.rs. */
+type ClaudeState =
+  | { state: "open"; session: string }
+  | { state: "closed" }
+  | { state: "untracked"; pid: number }
+  | { state: "unknown" };
 
 /** Mirrors `db::StoreStatus` in src-tauri/src/db.rs. */
 type StoreStatus =
@@ -101,6 +123,8 @@ interface HookProblem {
 interface StoreReport {
   store: StoreStatus;
   hookProblem: HookProblem | null;
+  /** Why the `claude` wrapper for terminal tabs could not be installed. */
+  wrapperProblem: string | null;
 }
 
 /** Mirrors `layout::Tab` in src-tauri/src/layout.rs. */
@@ -125,19 +149,16 @@ interface Settings {
 const HOOK_REPORT_DELAY_MS = 60_000;
 /** Polling interval for the backend's saving and hook status, and for re-checking a hook report. */
 const STORE_POLL_MS = 30_000;
+/** How often tabs are saved while terminal tabs run, so Claude starting or quitting in one is saved. */
+const CLAUDE_POLL_MS = 5_000;
+/** How long a `claude` must run without reporting before it is taken to bypass the wrapper. */
+const UNTRACKED_GRACE_MS = 10_000;
 
 /** Tab changes are saved this long after the last one, so a burst is one save. */
 const SAVE_DELAY_MS = 300;
 /** A failed save is tried again this long after it failed. */
 const SAVE_RETRY_MS = 5_000;
 
-// Constant markup (an eight-ray spark in Claude's orange), so setting it with innerHTML is safe.
-const CLAUDE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
-  <g stroke="#d97757" stroke-width="2.6" stroke-linecap="round">
-    <path d="M12 2.5v6M12 15.5v6M2.5 12h6M15.5 12h6" />
-    <path d="M5.6 5.6l3.6 3.6M14.8 14.8l3.6 3.6M18.4 5.6l-3.6 3.6M9.2 14.8l-3.6 3.6" />
-  </g>
-</svg>`;
 
 
 // xfce4-terminal defaults.
@@ -241,12 +262,13 @@ async function spawn(opts: SpawnOptions) {
   const run: RunningKind =
     opts.run.kind === "claude"
       ? { kind: "claude", claudeSession: opts.run.claudeSession ?? crypto.randomUUID() }
-      : { kind: "terminal", command: opts.run.command || null };
+      : { kind: "terminal", command: opts.run.command || null, claudeSession: opts.run.claudeSession ?? null };
   const defaultName =
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
     id: null, starts: 0, term, fit, el, exited: false, closing: false, skipsPermissions: false,
+    claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
     name: opts.name || defaultName,
@@ -320,6 +342,11 @@ async function start(s: Session, fallbackToHome: boolean) {
       s.cwd = undefined;
     }
     if (started.tracked) watchHookReport(s, started.startedAt, startNo);
+    if (s.run.kind === "terminal") {
+      // Handed over once; from now on saves follow whatever Claude session is open in the tab.
+      s.run = { ...s.run, claudeSession: null };
+      if (started.resume) showResume(s, started.resume);
+    }
     if (started.skipsPermissions !== s.skipsPermissions) {
       s.skipsPermissions = started.skipsPermissions;
       renderSessions();
@@ -328,6 +355,21 @@ async function start(s: Session, fallbackToHome: boolean) {
     markExited(s, `could not start: ${errorText(err)}`, true);
   }
   scheduleSave();
+}
+
+/** Follows up a terminal tab's saved Claude session, which its start tried to reopen. */
+function showResume(s: Session, resume: ResumeReport) {
+  const topic = tabTopic(s, "resume");
+  if (resume.state === "typed") {
+    s.resumingUntil = Date.now() + HOOK_REPORT_DELAY_MS;
+    setNotice(topic, null);
+  } else if (resume.state === "noConversation") {
+    s.claudeOpen = null;
+    setNotice(topic, `Claude was open in “${s.name}”, but it saved no conversation there, so it was not reopened.`);
+  } else {
+    // Kept, so the next start tries again.
+    setNotice(topic, `Claude could not be reopened in “${s.name}” (${resume.message}); the next start tries again.`);
+  }
 }
 
 /** Starts an exited tab again, in the same tab with the same ids (a Claude tab in its current session). */
@@ -733,12 +775,19 @@ function scheduleSave() {
 async function saveLayout() {
   clearTimeout(saveTimer);
   if (savingPaused()) return;
+  const running = sessions.filter((s) => s.id !== null && !s.exited);
   // Without live directories, each tab keeps the one it was opened in.
-  const cwds = await liveCwds(sessions.flatMap((s) => (s.id === null || s.exited ? [] : [s.id])));
+  const [cwds, claudes] = await Promise.all([
+    liveCwds(running.map((s) => s.id!)),
+    claudeStates(running.filter((s) => s.run.kind === "terminal")),
+  ]);
+  for (const s of sessions) if (s.run.kind === "terminal") followClaude(s, s.id === null ? undefined : claudes[s.id]);
   const layout: Layout = {
     active: Math.max(0, active ? sessions.indexOf(active) : 0),
     tabs: sessions.map((s) => ({
       ...s.run,
+      // A terminal tab is saved with the Claude session open in it, resumed on restore.
+      ...(s.run.kind === "terminal" && { claudeSession: s.claudeOpen }),
       tabId: s.tabId,
       name: s.name,
       renamed: s.renamed,
@@ -765,9 +814,48 @@ async function liveCwds(ids: number[]): Promise<Record<number, string>> {
   });
 }
 
+/** Whether each of the given tabs has a Claude session open, by PTY id; empty (nothing known) if that cannot be checked. */
+async function claudeStates(tabs: Session[]): Promise<Record<number, ClaudeState>> {
+  if (!tabs.length) return {};
+  const query = tabs.map((s) => ({ id: s.id, tabId: s.tabId }));
+  return invoke<Record<number, ClaudeState>>("claude_open_sessions", { tabs: query }).catch((err) => {
+    console.error("raterm: could not check for Claude sessions in terminal tabs", err);
+    return {};
+  });
+}
+
+/**
+ * Updates the Claude session a terminal tab is known to have open from its latest
+ * check (`state`, undefined when it was not checked). Only a clear answer changes
+ * it: a tab that could not be checked, or never started, keeps what it had.
+ */
+function followClaude(s: Session, state: ClaudeState | undefined) {
+  // Its shell has exited, so nothing can still run in it.
+  if (s.id !== null && s.exited) s.claudeOpen = null;
+  if (!state || state.state === "unknown") return;
+  if (state.state === "open") {
+    s.claudeOpen = state.session;
+    s.resumingUntil = 0;
+  } else if (Date.now() >= s.resumingUntil) {
+    // Not while a resumed Claude may still be starting.
+    s.claudeOpen = null;
+  }
+  if (state.state !== "untracked") return void (s.untracked = undefined);
+  if (s.untracked?.pid !== state.pid) s.untracked = { pid: state.pid, since: Date.now() };
+  else if (Date.now() - s.untracked.since >= UNTRACKED_GRACE_MS) {
+    setNotice(
+      tabTopic(s, "untracked"),
+      `Claude in “${s.name}” did not start through raterm's claude wrapper (a claude alias, or a PATH that lists another claude first), so it will not be reopened.`,
+      true,
+      String(state.pid),
+    );
+  }
+}
+
 /** Shows what the backend knows about saving and about the Claude session hook. */
 async function showStoreStatus() {
-  const { store, hookProblem } = await invoke<StoreReport>("store_status");
+  const report = await invoke<StoreReport>("store_status");
+  const { store, hookProblem } = report;
   if (store.state === "recovered") setNotice("store", store.notice);
   else if (store.state === "notSaving") setNotice("store", `Tabs are not being saved: ${store.reason}.`, false);
   else setNotice("store", null);
@@ -777,6 +865,10 @@ async function showStoreStatus() {
     hookProblem && `Claude session tracking failed (${hookProblem.message}); see ${hookProblem.log}.`,
     true,
     hookProblem ? String(hookProblem.at) : undefined,
+  );
+  setNotice(
+    "wrapper",
+    report.wrapperProblem && `Claude sessions started in terminal tabs will not be reopened: ${report.wrapperProblem}.`,
   );
 }
 
@@ -836,6 +928,7 @@ const tree = createTree(workspaceBox.querySelector<HTMLUListElement>(".tree")!, 
   list: (dir) => invoke<Listing>("fs_list", { dir }),
   errorText,
   onPickFile: insertPath,
+  onOpenClaude: (dir) => openClaudeTab(undefined, dir),
 });
 
 /** Roots the tree at the workspace folder from the settings (home by default). */
@@ -896,17 +989,26 @@ async function activeCwd(): Promise<string | undefined> {
 }
 
 /**
- * Opens a Claude tab in `typedCwd`, or else next to the active tab. Only a directory
- * taken from the active tab falls back to $HOME if it has gone; a typed one fails visibly.
+ * Opens a tab of `run` in `chosenCwd`, or else next to the active tab. Only a directory
+ * taken from the active tab falls back to $HOME if it has gone; a chosen one fails visibly.
  */
-function openClaudeTab(name?: string, typedCwd?: string) {
+function openTab(run: TabKind, name?: string, chosenCwd?: string) {
   (async () => {
-    const cwd = typedCwd || (await activeCwd());
-    await spawn({ run: { kind: "claude", claudeSession: null }, name, cwd, fallbackToHome: !typedCwd });
-  })().catch((err) => console.error("raterm: could not open Claude tab", err));
+    const cwd = chosenCwd || (await activeCwd());
+    await spawn({ run, name, cwd, fallbackToHome: !chosenCwd });
+  })().catch((err) => console.error(`raterm: could not open ${run.kind} tab`, err));
 }
 
-function askClaudeTab() {
+function openTerminalTab(name?: string, chosenCwd?: string) {
+  openTab({ kind: "terminal", command: null }, name, chosenCwd);
+}
+
+function openClaudeTab(name?: string, chosenCwd?: string) {
+  openTab({ kind: "claude", claudeSession: null }, name, chosenCwd);
+}
+
+/** Asks for the new tab's kind, name and directory. */
+function askTab() {
   const form = spawnDialog.querySelector("form")!;
   form.reset();
   // returnValue survives between openings; Escape would otherwise reuse the last "ok".
@@ -914,16 +1016,15 @@ function askClaudeTab() {
   spawnDialog.onclose = () => {
     if (spawnDialog.returnValue !== "ok") return active?.term.focus();
     const fd = new FormData(form);
-    openClaudeTab(String(fd.get("name")).trim(), String(fd.get("cwd")).trim());
+    const open = fd.get("kind") === "claude" ? openClaudeTab : openTerminalTab;
+    open(String(fd.get("name")).trim(), String(fd.get("cwd")).trim());
   };
   spawnDialog.showModal();
 }
 
-const newClaudeButton = $<HTMLButtonElement>("#new-claude");
-newClaudeButton.innerHTML = CLAUDE_ICON;
-newClaudeButton.onclick = (e) => {
-  if (e.shiftKey) return askClaudeTab();
-  openClaudeTab();
+$<HTMLButtonElement>("#new-terminal").onclick = (e) => {
+  if (e.shiftKey) return askTab();
+  openTerminalTab();
 };
 fillIcons();
 for (const el of document.querySelectorAll(".claude-icon")) el.innerHTML = CLAUDE_ICON;
@@ -1035,6 +1136,10 @@ const checkStore = () =>
 checkStore();
 // Session-hook failures can happen at any time, so they are checked on a timer.
 setInterval(checkStore, STORE_POLL_MS);
+// A Claude starting or quitting in a terminal tab changes nothing else, so it is caught by saving every few seconds (unchanged layouts are not written).
+setInterval(() => {
+  if (sessions.some((s) => s.run.kind === "terminal" && s.id !== null && !s.exited)) scheduleSave();
+}, CLAUDE_POLL_MS);
 restore().catch((err) => {
   console.error("raterm: restore failed", err);
   canSave = false;

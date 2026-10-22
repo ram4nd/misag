@@ -131,10 +131,17 @@ let calls: Call[];
 let spawnBehaviour: (args: SpawnCall, id: number) => number | Promise<number>;
 let savedLayout: Layout;
 let liveCwds: Record<number, string>;
+/** The Claude session claude_open_sessions finds open, by PTY id; other tabs are closed unless in `claudeStates`. */
+let openClaudes: Record<number, string>;
+/** Other answers of claude_open_sessions, by PTY id. */
+let claudeStates: Record<number, { state: "unknown" } | { state: "untracked"; pid: number }>;
+/** What pty_spawn reports about a terminal tab's saved Claude session. */
+let resumeReport: { state: "typed" } | { state: "noConversation" } | { state: "failed"; message: string };
 let failing: Set<string>;
 let storeReport: {
   store: { state: "saving" } | { state: "recovered"; notice: string } | { state: "notSaving"; reason: string };
   hookProblem: { at: number; message: string; log: string } | null;
+  wrapperProblem?: string | null;
 };
 let reported: Set<string>;
 let missingDirs: Set<string>;
@@ -176,9 +183,18 @@ async function boot() {
   for (let i = 0; i < 5; i++) await flush();
 }
 
-async function clickClaude(shiftKey = false) {
-  const button = document.querySelector<HTMLButtonElement>("#new-claude")!;
+/** Clicks the new-terminal button at the top right; Shift opens the dialog. */
+async function clickTerminal(shiftKey = false) {
+  const button = document.querySelector<HTMLButtonElement>("#new-terminal")!;
   button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey }));
+  for (let i = 0; i < 3; i++) await flush();
+}
+
+/** Opens a Claude tab from the Claude button of the workspace's first folder (by default ~/work). */
+async function clickClaude() {
+  const button = document.querySelector<HTMLButtonElement>("#workspace-box .tree > ul .open-claude");
+  if (!button) throw new Error("no folder with a Claude button in the workspace tree");
+  button.click();
   for (let i = 0; i < 3; i++) await flush();
 }
 
@@ -211,13 +227,16 @@ beforeEach(() => {
   spawnBehaviour = (_args, id) => id;
   savedLayout = { tabs: [], active: 0 };
   liveCwds = {};
+  openClaudes = {};
+  claudeStates = {};
+  resumeReport = { state: "typed" };
   failing = new Set();
   storeReport = { store: { state: "saving" }, hookProblem: null };
   reported = new Set();
   missingDirs = new Set();
   storedSettings = { ...DEFAULTS };
   settingsLoadGate = Promise.resolve();
-  fsTree = {};
+  fsTree = { "~": [{ name: "work", dir: true }] };
   picker.picked = null;
   picker.fails = false;
   picker.calls = [];
@@ -244,7 +263,8 @@ beforeEach(() => {
       // Like the backend: only Claude tabs with a database are tracked.
       const tracked = call.kind === "claude" && storeReport.store.state !== "notSaving";
       const skipsPermissions = call.kind === "claude" && storedSettings.skipPermissions === true;
-      return Promise.resolve(id).then((id) => ({ id, fellBackToHome: missing, tracked, skipsPermissions, startedAt: 1000 }));
+      const resume = call.kind === "terminal" && call.claudeSession ? resumeReport : null;
+      return Promise.resolve(id).then((id) => ({ id, fellBackToHome: missing, tracked, skipsPermissions, startedAt: 1000, resume }));
     }
     if (cmd === "store_status") return storeReport;
     if (cmd === "claude_reported") return reported.has((args as { tabId: string }).tabId);
@@ -267,6 +287,15 @@ beforeEach(() => {
       }
       storedSettings = next;
       return storedSettings;
+    }
+    if (cmd === "claude_open_sessions") {
+      const ids = (args as { tabs: { id: number }[] }).tabs.map((t) => t.id);
+      return Object.fromEntries(
+        ids.map((id) => [
+          id,
+          id in openClaudes ? { state: "open", session: openClaudes[id] } : (claudeStates[id] ?? { state: "closed" }),
+        ]),
+      );
     }
     if (cmd === "pty_cwds") {
       // Like the backend, only the requested sessions are answered.
@@ -305,18 +334,41 @@ describe("tabs", () => {
     expect(callsOf("pty_spawn")).toHaveLength(0);
   });
 
-  test("the Claude button sits after the tabs and opens a Claude tab", async () => {
+  test("the terminal button sits after the tabs and opens a terminal tab", async () => {
     await boot();
     const bar = document.querySelector("#tabbar")!;
     expect(bar.lastElementChild?.id).toBe("tab-actions");
+    expect(document.querySelector("#new-terminal svg")).not.toBeNull();
+    await clickTerminal();
+    expect(tabNames()).toEqual(["shell 1"]);
+    expect(tabs()[0].querySelector(".icon")).toBeNull();
+    expect(noTabs()).toBe(false);
+    expect(spawns()[0]).toMatchObject({ kind: "terminal", command: null, claudeSession: null, cwd: null });
+    expect(spawns()[0].tabId).toMatch(UUID);
+  });
+
+  test("a folder's Claude button opens a Claude tab in that folder", async () => {
+    await boot();
+    const button = document.querySelector<HTMLButtonElement>("#workspace-box .tree > ul .open-claude")!;
+    expect(button.title).toBe("Open Claude in /home/me/work");
+    expect(button.closest(".line")!.querySelector("button.row")!.textContent).toBe("work");
     await clickClaude();
     expect(tabNames()).toEqual(["Claude 1"]);
     expect(tabs()[0].querySelector(".icon svg")).not.toBeNull();
-    expect(noTabs()).toBe(false);
-    expect(spawns()[0].kind).toBe("claude");
+    expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "/home/me/work", fallbackToHome: false });
     expect(spawns()[0]).not.toHaveProperty("command");
-    expect(spawns()[0].tabId).toMatch(UUID);
     expect(spawns()[0].claudeSession).toMatch(UUID);
+    // The folder itself stays closed.
+    expect(callsOf("fs_list").map((c) => c.args.dir)).toEqual(["~"]);
+  });
+
+  test("the workspace folder itself has a Claude button too", async () => {
+    await boot();
+    const root = document.querySelector<HTMLButtonElement>("#workspace-box .tree .row.root + .open-claude")!;
+    expect(root.title).toBe("Open Claude in ~");
+    root.click();
+    for (let i = 0; i < 3; i++) await flush();
+    expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "~" });
   });
 
   test("each Claude tab gets its own session", async () => {
@@ -326,12 +378,12 @@ describe("tabs", () => {
     expect(a).not.toBe(b);
   });
 
-  test("a new Claude tab opens in the active tab's current directory", async () => {
+  test("a new terminal tab opens in the active tab's current directory", async () => {
     await boot();
     await clickClaude();
     liveCwds = { 1: "/home/me/src" };
-    await clickClaude();
-    expect(spawns().map((s) => s.cwd)).toEqual([null, "/home/me/src"]);
+    await clickTerminal();
+    expect(spawns().map((s) => s.cwd)).toEqual(["/home/me/work", "/home/me/src"]);
   });
 
   test("closing the same tab twice kills it once and keeps the others", async () => {
@@ -481,7 +533,7 @@ describe("input", () => {
   });
 });
 
-describe("new Claude session dialog", () => {
+describe("new terminal dialog", () => {
   test("asks only for a name and directory, with Start as the default button", async () => {
     await boot();
     expect(field("name")).not.toBeNull();
@@ -490,24 +542,39 @@ describe("new Claude session dialog", () => {
     expect(dialog().querySelector("button")?.value).toBe("ok");
   });
 
-  test("Shift+click opens it and Start creates the Claude tab", async () => {
+  test("Shift+click opens it and Start creates the terminal tab", async () => {
     await boot();
-    await clickClaude(true);
+    await clickTerminal(true);
     expect(dialog().open).toBe(true);
     field("name")!.value = "agent";
     field("cwd")!.value = "~/src/raterm";
     dialog().close("ok");
     for (let i = 0; i < 3; i++) await flush();
     expect(tabNames()).toEqual(["agent"]);
-    expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "~/src/raterm" });
+    expect(spawns()[0]).toMatchObject({ kind: "terminal", cwd: "~/src/raterm" });
+  });
+
+  test("can open a Claude tab instead", async () => {
+    await boot();
+    await clickTerminal(true);
+    dialog().querySelector<HTMLInputElement>("input[name=kind][value=claude]")!.checked = true;
+    field("name")!.value = "agent";
+    field("cwd")!.value = "/srv/app";
+    dialog().close("ok");
+    for (let i = 0; i < 3; i++) await flush();
+    expect(tabNames()).toEqual(["agent"]);
+    expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "/srv/app", fallbackToHome: false });
+    // The next opening starts at Terminal again.
+    await clickTerminal(true);
+    expect(dialog().querySelector<HTMLInputElement>("input[name=kind][value=terminal]")!.checked).toBe(true);
   });
 
   test("Escape after an earlier Start does not spawn", async () => {
     await boot();
-    await clickClaude(true);
+    await clickTerminal(true);
     dialog().close("ok");
     await flush();
-    await clickClaude(true);
+    await clickTerminal(true);
     dialog().close();
     for (let i = 0; i < 3; i++) await flush();
     expect(callsOf("pty_spawn")).toHaveLength(1);
@@ -521,20 +588,22 @@ describe("restoring tabs", () => {
       { tabId: "t3", kind: "claude", name: "agent", renamed: true, cwd: "/home/me/src", command: null, claudeSession: SESSION },
       { tabId: "t4", kind: "claude", name: "✳ Review", renamed: false, cwd: null, command: null, claudeSession: null },
       { tabId: "t5", kind: "terminal", name: "logs", renamed: true, cwd: "/var/log", command: "tail -f syslog", claudeSession: null },
+      { tabId: "t6", kind: "terminal", name: "shell", renamed: false, cwd: "/home/me/app", command: null, claudeSession: SESSION },
     ],
   };
 
   test("reopens each tab with its kind, directory, command and session", async () => {
     savedLayout = layout;
     await boot();
-    expect(tabNames()).toEqual(["agent", "✳ Review", "logs"]);
-    const [a, b, c] = spawns();
+    expect(tabNames()).toEqual(["agent", "✳ Review", "logs", "shell"]);
+    const [a, b, c, d] = spawns();
     expect(a).toMatchObject({ tabId: "t3", kind: "claude", cwd: "/home/me/src", claudeSession: SESSION });
     expect(b.kind).toBe("claude");
     expect(b.claudeSession).toMatch(UUID);
     expect(b.tabId).toBe("t4");
-    expect(c).toMatchObject({ tabId: "t5", kind: "terminal", cwd: "/var/log", command: "tail -f syslog" });
-    expect(c).not.toHaveProperty("claudeSession");
+    expect(c).toMatchObject({ tabId: "t5", kind: "terminal", cwd: "/var/log", command: "tail -f syslog", claudeSession: null });
+    // The backend types `claude --resume` at this shell's prompt.
+    expect(d).toMatchObject({ tabId: "t6", kind: "terminal", cwd: "/home/me/app", command: null, claudeSession: SESSION });
     expect(tabs()[1].classList.contains("active")).toBe(true);
     expect(tabs()[2].querySelector(".icon")).toBeNull();
   });
@@ -551,7 +620,7 @@ describe("restoring tabs", () => {
     savedLayout = layout;
     await boot();
     await win.closeRequested!();
-    expect(lastSaved()?.tabs.map((t) => t.tabId)).toEqual(["t3", "t4", "t5"]);
+    expect(lastSaved()?.tabs.map((t) => t.tabId)).toEqual(["t3", "t4", "t5", "t6"]);
   });
 
   test("restored user names survive titles; others follow them", async () => {
@@ -559,7 +628,7 @@ describe("restoring tabs", () => {
     await boot();
     terms()[0].handlers.title("✳ x");
     terms()[1].handlers.title("✳ y");
-    expect(tabNames()).toEqual(["agent", "✳ y", "logs"]);
+    expect(tabNames()).toEqual(["agent", "✳ y", "logs", "shell"]);
   });
 
   test("a vanished directory falls back to the home directory", async () => {
@@ -587,22 +656,152 @@ describe("saving tabs", () => {
   test("closing the window saves every tab with its live directory and session", async () => {
     await boot();
     await clickClaude();
-    await clickClaude(true);
-    field("name")!.value = "agent";
+    await clickTerminal(true);
+    field("name")!.value = "dev";
     dialog().close("ok");
     for (let i = 0; i < 3; i++) await flush();
     liveCwds = { 1: "/home/me/src", 2: "/home/me" };
+    // Like the backend, which only reports terminal tabs it was asked about.
+    openClaudes = { 1: "6fa459ea-ee8a-4ca4-894e-db77e160355e", 2: SESSION };
     await win.closeRequested!();
-    const [first, second] = spawns().map((s) => s.claudeSession);
+    const first = spawns()[0].claudeSession;
     const [firstTab, secondTab] = spawns().map((s) => s.tabId);
     expect(firstTab).not.toBe(secondTab);
+    expect(callsOf("claude_open_sessions").at(-1)?.args).toEqual({ tabs: [{ id: 2, tabId: secondTab }] });
     expect(lastSaved()).toEqual({
       active: 1,
       tabs: [
         { tabId: firstTab, kind: "claude", name: "Claude 1", renamed: false, cwd: "/home/me/src", claudeSession: first },
-        { tabId: secondTab, kind: "claude", name: "agent", renamed: true, cwd: "/home/me", claudeSession: second },
+        { tabId: secondTab, kind: "terminal", name: "dev", renamed: true, cwd: "/home/me", command: null, claudeSession: SESSION },
       ],
     });
+    // Once Claude has quit in it, the terminal tab is saved without a session.
+    openClaudes = {};
+    await win.closeRequested!();
+    expect(lastSaved()?.tabs[1]).toMatchObject({ kind: "terminal", claudeSession: null });
+  });
+
+  test("a restored terminal tab resumes its Claude session once, not on a restart", async () => {
+    savedLayout = {
+      active: 0,
+      tabs: [{ tabId: "t", kind: "terminal", name: "shell", renamed: false, cwd: null, command: null, claudeSession: SESSION }],
+    };
+    await boot();
+    spawns()[0].onExit.onmessage(0);
+    terms()[0].handlers.data("\r");
+    await flush();
+    expect(spawns().map((s) => s.claudeSession)).toEqual([SESSION, null]);
+  });
+
+  describe("a terminal tab's Claude session", () => {
+    const restoredShell = () => ({
+      active: 0,
+      tabs: [{ tabId: "t", kind: "terminal" as const, name: "shell", renamed: false, cwd: null, command: null, claudeSession: SESSION }],
+    });
+    const savedSession = () => lastSaved()?.tabs[0].claudeSession;
+    let now: number;
+    beforeEach(() => {
+      now = 1_000_000;
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    test("is kept while the resumed Claude starts, and dropped once it is gone", async () => {
+      savedLayout = restoredShell();
+      await boot();
+      // Claude has not reported yet: the shell alone is no reason to forget it.
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+      now += 61_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBeNull();
+    });
+
+    test("is kept when the check cannot tell, or the tab never started", async () => {
+      spawnBehaviour = () => {
+        throw { code: "failed", message: "no pty" };
+      };
+      savedLayout = restoredShell();
+      await boot();
+      now += 61_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+    });
+
+    test("is kept when the check is unknown or fails", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      savedLayout = restoredShell();
+      await boot();
+      now += 61_000;
+      claudeStates = { 1: { state: "unknown" } };
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+      failing.add("claude_open_sessions");
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+    });
+
+    test("is dropped when its shell exits", async () => {
+      savedLayout = restoredShell();
+      await boot();
+      spawns()[0].onExit.onmessage(0);
+      await win.closeRequested!();
+      expect(savedSession()).toBeNull();
+    });
+
+    test("without a conversation it is dropped, and a notice says why", async () => {
+      resumeReport = { state: "noConversation" };
+      savedLayout = restoredShell();
+      await boot();
+      expect(noticeText()).toContain("saved no conversation there");
+      await win.closeRequested!();
+      expect(savedSession()).toBeNull();
+    });
+
+    test("a resume that failed is kept for next time, and a notice says why", async () => {
+      resumeReport = { state: "failed", message: "could not type the command" };
+      savedLayout = restoredShell();
+      await boot();
+      expect(noticeText()).toContain("Claude could not be reopened in “shell” (could not type the command)");
+      now += 61_000;
+      claudeStates = { 1: { state: "unknown" } };
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+    });
+
+    test("starting or quitting Claude is saved within seconds", async () => {
+      await boot();
+      await clickTerminal();
+      openClaudes = { 1: SESSION };
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(savedSession()).toBe(SESSION);
+      openClaudes = {};
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(savedSession()).toBeNull();
+    });
+
+    test("a claude that bypassed the wrapper is reported once it has run a while", async () => {
+      await boot();
+      await clickTerminal();
+      claudeStates = { 1: { state: "untracked", pid: 77 } };
+      await win.closeRequested!();
+      expect(noticeText()).not.toContain("wrapper");
+      now += 11_000;
+      await win.closeRequested!();
+      expect(noticeText()).toContain("Claude in “shell 1” did not start through raterm's claude wrapper");
+      expect(savedSession()).toBeNull();
+    });
+  });
+
+  test("tabs are still saved when the open Claude sessions cannot be checked", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickTerminal();
+    failing.add("claude_open_sessions");
+    await win.closeRequested!();
+    expect(lastSaved()?.tabs[0]).toMatchObject({ kind: "terminal", claudeSession: null });
+    expect(error).toHaveBeenCalledWith("raterm: could not check for Claude sessions in terminal tabs", "claude_open_sessions failed");
+    error.mockRestore();
   });
 
   test("closing the last tab saves an empty layout", async () => {
@@ -1146,15 +1345,15 @@ describe("new tab directory", () => {
       tabs: [{ tabId: "a", kind: "claude", name: "a", renamed: true, cwd: "/srv/app", command: null, claudeSession: null }],
     };
     await boot();
-    await clickClaude();
+    await clickTerminal();
     expect(spawns()[1].cwd).toBe("/srv/app");
   });
 
   test("still opens a tab when the directory lookup fails", async () => {
     await boot();
-    await clickClaude();
+    await clickTerminal();
     failing.add("pty_cwds");
-    await clickClaude();
+    await clickTerminal();
     expect(tabs()).toHaveLength(2);
     expect(spawns()[1].cwd).toBeNull();
   });
@@ -1163,7 +1362,7 @@ describe("new tab directory", () => {
     await boot();
     await clickClaude();
     liveCwds = { 1: "/home/me/x" };
-    await clickClaude(true);
+    await clickTerminal(true);
     dialog().close("ok");
     for (let i = 0; i < 3; i++) await flush();
     expect(spawns()[1].cwd).toBe("/home/me/x");
@@ -1519,19 +1718,19 @@ describe("edge cases", () => {
 
   test("starting in the home directory is also shown as a notice", async () => {
     await boot();
-    await clickClaude();
+    await clickTerminal();
     liveCwds = { 1: "/gone" };
     missingDirs.add("/gone");
-    await clickClaude();
-    expect(noticeText()).toContain("/gone no longer exists, so “Claude 2” started in the home directory.");
+    await clickTerminal();
+    expect(noticeText()).toContain("/gone no longer exists, so “shell 2” started in the home directory.");
   });
 
   test("a new tab from a vanished active directory starts in the home directory", async () => {
     await boot();
-    await clickClaude();
+    await clickTerminal();
     liveCwds = { 1: "/gone" };
     missingDirs.add("/gone");
-    await clickClaude();
+    await clickTerminal();
     expect(spawns().map((s) => [s.cwd, s.fallbackToHome])).toEqual([[null, true], ["/gone", true]]);
     expect(tabs()[1].classList.contains("exited")).toBe(false);
   });
@@ -1539,7 +1738,7 @@ describe("edge cases", () => {
   test("a directory typed into the dialog does not fall back silently", async () => {
     missingDirs.add("/typo");
     await boot();
-    await clickClaude(true);
+    await clickTerminal(true);
     field("cwd")!.value = "/typo";
     dialog().close("ok");
     for (let i = 0; i < 3; i++) await flush();
@@ -1547,12 +1746,23 @@ describe("edge cases", () => {
     expect(tabs()[0].classList.contains("exited")).toBe(true);
   });
 
+  test("a claude wrapper that could not be installed is reported", async () => {
+    storeReport.wrapperProblem = "cannot write the claude wrapper in /d/bin: Read-only file system";
+    await boot();
+    expect(noticeText()).toContain(
+      "Claude sessions started in terminal tabs will not be reopened: cannot write the claude wrapper in /d/bin",
+    );
+  });
+
   test("restores the layout fixture the Rust tests also parse", async () => {
     savedLayout = JSON.parse(sharedLayout);
     await boot();
-    expect(tabNames()).toEqual(["agent", "logs"]);
+    expect(tabNames()).toEqual(["agent", "logs", "shell"]);
     expect(spawns()[0]).toMatchObject({ kind: "claude", tabId: "t1", claudeSession: SESSION, cwd: "/home/me/src" });
-    expect(spawns()[1]).toMatchObject({ kind: "terminal", tabId: "t2", command: "tail -f syslog" });
+    expect(spawns()[1]).toMatchObject({ kind: "terminal", tabId: "t2", command: "tail -f syslog", claudeSession: null });
+    expect(spawns()[2]).toMatchObject({ kind: "terminal", tabId: "t3", command: null, claudeSession: SESSION });
+    // Still open in the restored shell at the next save.
+    openClaudes = { 3: SESSION };
     await win.closeRequested!();
     expect(lastSaved()).toEqual(JSON.parse(sharedLayout));
   });

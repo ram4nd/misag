@@ -22,18 +22,25 @@ fn payload(session: &str) -> String {
     format!(r#"{{"session_id":"{session}","source":"clear","hook_event_name":"SessionStart"}}"#)
 }
 
-/// Starts the hook command the way Claude does.
+/// Starts the hook command the way Claude does. An empty value in `env` removes
+/// that variable instead.
 fn start_hook(exe: &Path, env: &[(&str, &str)], payload: &str) -> std::process::Child {
-    let mut child = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .args(["-c", &claude::hook_command(exe)])
         // Start clean, so only the variables a case passes are set.
         .env_remove(claude::TAB_ENV)
         .env_remove(claude::DB_ENV)
-        .envs(env.iter().copied())
-        .stdin(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+        // Claude Code always sets it for hooks.
+        .env(claude::PID_ENV, "4242");
+    for &(key, value) in env {
+        if value.is_empty() {
+            command.env_remove(key);
+        } else {
+            command.env(key, value);
+        }
+    }
+    let mut child = command.stdin(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(payload.as_bytes()).unwrap();
     child
 }
@@ -62,6 +69,32 @@ fn records_the_session_through_a_path_with_spaces() {
     let env = [(claude::TAB_ENV, "tab-1"), (claude::DB_ENV, db_path.to_str().unwrap())];
     assert!(run_hook(&exe, &env, &payload(SESSION)).success());
     assert_eq!(stored_session(&db_path, "tab-1").as_deref(), Some(SESSION));
+}
+
+#[test]
+fn records_the_claude_process_with_the_session() {
+    let dir = temp_dir("hook-pid");
+    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let (_app, db_path) = app_db(&dir);
+    let env = [(claude::TAB_ENV, "t"), (claude::DB_ENV, db_path.to_str().unwrap()), (claude::PID_ENV, "4242")];
+    assert!(run_hook(exe, &env, &payload(SESSION)).success());
+    let pid: Option<u32> = db::connect_existing(&db_path)
+        .unwrap()
+        .query_row("SELECT claude_pid FROM claude_sessions WHERE tab_id = 't'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(pid, Some(4242));
+}
+
+#[test]
+fn a_missing_claude_pid_is_recorded_and_logged() {
+    let dir = temp_dir("hook-no-pid");
+    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let (_app, db_path) = app_db(&dir);
+    let env = [(claude::TAB_ENV, "t"), (claude::DB_ENV, db_path.to_str().unwrap()), (claude::PID_ENV, "")];
+    assert!(run_hook(exe, &env, &payload(SESSION)).success());
+    assert_eq!(stored_session(&db_path, "t").as_deref(), Some(SESSION));
+    let log = std::fs::read_to_string(dir.join(claude::HOOK_LOG)).unwrap();
+    assert!(log.contains("CLAUDE_PID is missing"), "{log}");
 }
 
 #[test]

@@ -114,6 +114,16 @@ body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
 .tree .row .chevron { flex: none; width: 14px; height: 14px; color: var(--muted); }
 .tree .row .kind { flex: none; display: grid; color: var(--muted); }
 .tree .row .name { overflow: hidden; text-overflow: ellipsis; }
+/* A folder's row with its Claude button, which shows on hover or keyboard focus. */
+.tree .line { position: relative; }
+.tree .line:hover .row { background: var(--press); }
+.tree .open-claude {
+  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
+  display: none; place-items: center; width: 22px; height: 22px; padding: 0; border-radius: 4px; background: none;
+}
+.tree .line:hover .open-claude, .tree .line:focus-within .open-claude { display: grid; }
+.tree .open-claude:hover { background: var(--hover); }
+.tree .line .row { padding-right: 30px; }
 .tree .row.root { font-weight: 600; cursor: default; }
 .tree .row.root:hover { background: none; }
 .tree .note { padding: 2px 8px; color: var(--muted); white-space: nowrap; }
@@ -170,6 +180,9 @@ dialog {
 dialog::backdrop { background: rgb(0 0 0 / .5); }
 dialog form { display: flex; flex-direction: column; gap: 10px; }
 dialog h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+dialog .kind { display: flex; gap: 16px; }
+dialog .kind label { display: flex; align-items: center; gap: 6px; }
+dialog .kind input { width: auto; margin: 0; }
 menu { display: flex; gap: 8px; margin: 0; padding: 0; }
 menu .primary { order: 1; }
 .spacer { flex: 1; }

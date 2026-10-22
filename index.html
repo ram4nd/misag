@@ -9,9 +9,9 @@
     <nav id="tabbar">
       <button id="toggle-sidebar" title="Toggle sidebar"><span data-icon="menu" data-size="18"></span></button>
       <div id="tabs"></div>
-      <!-- Buttons for opening new tabs, one per tab kind. -->
+      <!-- The new-tab button. Claude tabs also open from the folders in the Workspace box. -->
       <div id="tab-actions">
-        <button id="new-claude" title="New Claude session (Shift+click: choose name and directory)"></button>
+        <button id="new-terminal" title="New terminal (Shift+click: choose terminal or Claude, name and directory)"><span data-icon="square-terminal" data-size="18"></span></button>
       </div>
     </nav>
     <div id="notice" role="status" hidden><span></span><button title="Dismiss"><span data-icon="x" data-size="14"></span></button></div>
@@ -29,7 +29,7 @@
         <button id="open-settings" title="Settings"><span data-icon="settings"></span>Settings</button>
       </aside>
       <main id="terminals">
-        <p id="empty-state">No tabs open. Start a Claude session with the button at the top right.</p>
+        <p id="empty-state">No tabs open. Open a terminal with the button at the top right, or Claude in a folder from the Workspace box.</p>
         <!-- The settings tab's page, shown in place of the terminals (see showActive in main.ts). Every change is saved right away. -->
         <section id="settings" class="page" aria-label="Settings" tabindex="-1">
           <form novalidate>
@@ -63,7 +63,11 @@
 
     <dialog id="spawn-dialog">
       <form method="dialog">
-        <h2>New Claude session</h2>
+        <h2>New tab</h2>
+        <div class="kind" role="radiogroup" aria-label="Tab kind">
+          <label><input type="radio" name="kind" value="terminal" checked /> Terminal</label>
+          <label><input type="radio" name="kind" value="claude" /> Claude</label>
+        </div>
         <input name="name" placeholder="Name (optional)" />
         <input name="cwd" placeholder="Working directory (default: current tab's, or $HOME)" />
         <menu>

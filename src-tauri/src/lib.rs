@@ -62,6 +62,20 @@ fn open_store(dir: Result<PathBuf, String>) -> db::Db {
     db
 }
 
+/// The `claude` wrapper for terminal tabs. Without it, `claude` in a terminal tab
+/// runs untracked, nothing worse; the UI says why (see `store_status`).
+fn install_wrapper(store: &db::Db, exe: &commands::AppExe) -> commands::Wrapper {
+    let installed = match (store.hook_path(), exe.path()) {
+        (None, _) => Err("raterm is running without its database".to_string()),
+        (_, Err(e)) => Err(e.to_string()),
+        (Some(db), Ok(exe)) => claude::install_wrapper(db, exe),
+    };
+    if let Err(e) = &installed {
+        eprintln!("raterm: no claude wrapper for terminal tabs: {e}");
+    }
+    commands::Wrapper(installed)
+}
+
 pub fn run() {
     let exe = own_exe();
     let sessions = match exe.path_str() {
@@ -92,7 +106,9 @@ pub fn run() {
             // without the dev config's identifier never touches an installed raterm's.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string());
             let dir = dir.map(|d| if cfg!(debug_assertions) { d.join("dev") } else { d });
-            app.manage(open_store(dir));
+            let store = open_store(dir);
+            app.manage(install_wrapper(&store, &app.state::<commands::AppExe>()));
+            app.manage(store);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -106,6 +122,7 @@ pub fn run() {
             commands::layout_save,
             commands::store_status,
             commands::claude_reported,
+            commands::claude_open_sessions,
             commands::settings_load,
             commands::settings_save,
             commands::fs_list,

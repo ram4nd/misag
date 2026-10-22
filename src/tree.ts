@@ -1,4 +1,4 @@
-import { icon } from "./icons";
+import { CLAUDE_ICON, icon } from "./icons";
 
 /** Mirrors `files::Entry` in src-tauri/src/files.rs. */
 export interface Entry {
@@ -22,6 +22,8 @@ export interface TreeOptions {
   /** The text shown for a rejected listing. */
   errorText(err: unknown): string;
   onPickFile(path: string): void;
+  /** Opens Claude in a folder, from the Claude button on the folder's row. */
+  onOpenClaude(dir: string): void;
 }
 
 export interface Tree {
@@ -71,6 +73,20 @@ export function createTree(el: HTMLUListElement, opts: TreeOptions): Tree {
     return listing;
   }
 
+  /** `row` in a line with a button that opens Claude in `dir`, shown on hover or focus. */
+  function withClaudeButton(row: HTMLElement, dir: string): HTMLDivElement {
+    // Next to the row, not inside it: a button cannot hold another button.
+    const claude = document.createElement("button");
+    claude.className = "open-claude";
+    claude.title = `Open Claude in ${dir}`;
+    claude.innerHTML = CLAUDE_ICON;
+    claude.onclick = () => opts.onOpenClaude(dir);
+    const line = document.createElement("div");
+    line.className = "line";
+    line.append(row, claude);
+    return line;
+  }
+
   function item(path: string, entry: Entry, depth: number): HTMLLIElement {
     const li = document.createElement("li");
     const row = document.createElement("button");
@@ -85,12 +101,13 @@ export function createTree(el: HTMLUListElement, opts: TreeOptions): Tree {
     name.className = "name";
     name.textContent = entry.name;
     row.append(chevron, kind, name);
-    li.append(row);
     if (!entry.dir) {
+      li.append(row);
       kind.append(icon("file", 14));
       row.onclick = () => opts.onPickFile(path);
       return li;
     }
+    li.append(withClaudeButton(row, path));
     const children = document.createElement("ul");
     li.append(children);
     const show = (open: boolean) => {
@@ -118,7 +135,7 @@ export function createTree(el: HTMLUListElement, opts: TreeOptions): Tree {
     label.textContent = dir.replace(/\/+$/, "").split("/").pop() || dir;
     label.title = dir;
     const children = document.createElement("ul");
-    head.append(label);
+    head.append(withClaudeButton(label, dir));
     el.replaceChildren(head, children);
     void fill(children, dir, 1).then((listing) => {
       if (listing && root === dir) listedRoot = listing.dir;

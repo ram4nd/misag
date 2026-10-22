@@ -13,9 +13,19 @@
       "tabId": "t2",
       "kind": "terminal",
       "command": "tail -f syslog",
+      "claudeSession": null,
       "name": "logs",
       "renamed": false,
       "cwd": null
+    },
+    {
+      "tabId": "t3",
+      "kind": "terminal",
+      "command": null,
+      "claudeSession": "0f8fad5b-d9cb-469f-a165-70867728950e",
+      "name": "shell",
+      "renamed": false,
+      "cwd": "/home/me/app"
     }
   ]
 }

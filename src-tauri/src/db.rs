@@ -56,6 +56,10 @@ const MIGRATIONS: &[&str] = &[r#"
     INSERT INTO settings (id) VALUES (1);
 "#, r#"
     ALTER TABLE settings ADD COLUMN workspace TEXT;
+"#, r#"
+    -- The Claude process that reported, so `session_run_by` can tell whether a
+    -- terminal tab still has that session open.
+    ALTER TABLE claude_sessions ADD COLUMN claude_pid INTEGER;
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -302,7 +306,8 @@ impl Db {
         let mut stmt = conn
             .prepare(
                 "SELECT t.tab_id, t.kind, t.name, t.renamed, t.cwd, t.command,
-                        COALESCE(c.session_id, t.claude_session)
+                        CASE WHEN t.kind = 'claude' THEN COALESCE(c.session_id, t.claude_session)
+                             ELSE t.claude_session END
                  FROM tabs t LEFT JOIN claude_sessions c USING (tab_id)
                  ORDER BY t.position",
             )
@@ -316,15 +321,19 @@ impl Db {
         let mut tabs = Vec::with_capacity(rows.len());
         for (tab_id, kind, name, renamed, cwd, command, session) in rows {
             let tab_id = TabId::parse(&tab_id)?;
+            let claude_session = session.map(|s| SessionId::parse(&s)).transpose();
             // The names match the serde tags of `TabKind` and the schema's CHECK.
             let kind = match kind.as_str() {
-                "terminal" => TabKind::Terminal { command },
-                "claude" => TabKind::Claude {
-                    claude_session: session
-                        .map(|s| SessionId::parse(&s))
-                        .transpose()
-                        .map_err(|e| format!("tab {tab_id}: {e}"))?,
+                // Only a hint for reopening Claude in the shell, so a bad one is dropped
+                // rather than failing the whole restore.
+                "terminal" => TabKind::Terminal {
+                    command,
+                    claude_session: claude_session.unwrap_or_else(|e| {
+                        eprintln!("raterm: tab {tab_id}: {e}; not reopening its Claude session");
+                        None
+                    }),
                 },
+                "claude" => TabKind::Claude { claude_session: claude_session.map_err(|e| format!("tab {tab_id}: {e}"))? },
                 _ => return Err(format!("tab {tab_id} has a kind this raterm does not know ({kind:?})")),
             };
             tabs.push(Tab { tab_id, kind, name, renamed, cwd });
@@ -342,7 +351,8 @@ impl Db {
     }
 
     /// Stores the layout. Each Claude tab is stored with the session its hook last
-    /// reported, so the `tabs` table holds the current session too.
+    /// reported, so the `tabs` table holds the current session too; a terminal tab
+    /// with the Claude session the caller found open in it.
     pub fn save_layout(&self, layout: Layout) -> Result<(), String> {
         let layout = layout.validated()?;
         let mut conn = self.conn();
@@ -354,14 +364,16 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
                          CASE WHEN ?3 = 'claude'
                               THEN COALESCE((SELECT session_id FROM claude_sessions WHERE tab_id = ?2), ?8)
+                              ELSE ?8
                          END)",
             )
             .map_err(sql)?;
         for (position, t) in layout.tabs.iter().enumerate() {
             let (kind, command, session) = match &t.kind {
-                TabKind::Terminal { command } => ("terminal", command.as_deref(), None),
-                TabKind::Claude { claude_session } => ("claude", None, claude_session.as_ref().map(SessionId::as_str)),
+                TabKind::Terminal { command, claude_session } => ("terminal", command.as_deref(), claude_session),
+                TabKind::Claude { claude_session } => ("claude", None, claude_session),
             };
+            let session = session.as_ref().map(SessionId::as_str);
             insert
                 .execute(params![position as i64, t.tab_id.as_str(), kind, t.name, t.renamed, t.cwd, command, session])
                 .map_err(sql)?;
@@ -423,6 +435,21 @@ impl Db {
         id.map(|id| SessionId::parse(&id).map_err(|e| format!("tab {tab_id}: {e}"))).transpose()
     }
 
+    /// The session the hook last reported for `tab_id` if the Claude process `pid`
+    /// reported it, so that process still being in the tab means the session is open.
+    pub fn session_run_by(&self, tab_id: &TabId, pid: u32) -> Result<Option<SessionId>, String> {
+        let id: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT session_id FROM claude_sessions WHERE tab_id = ?1 AND claude_pid = ?2",
+                params![tab_id.as_str(), pid],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql)?;
+        id.map(|id| SessionId::parse(&id).map_err(|e| format!("tab {tab_id}: {e}"))).transpose()
+    }
+
     /// Whether the hook has reported a session for `tab_id` since `since` (unix
     /// seconds, the tab's start); a report from an earlier run does not count.
     pub fn claude_reported(&self, tab_id: &TabId, since: u64) -> Result<bool, String> {
@@ -438,12 +465,16 @@ impl Db {
             .map_err(sql)
     }
 
-    /// Drops hook reports for tabs that no longer exist. Run at startup; the
-    /// single-instance guard means no other raterm's Claude tabs can be reporting.
+    /// Drops hook reports for tabs that no longer exist, and forgets the Claude
+    /// processes of the last run: they are gone, and a new process could reuse a
+    /// pid. Run at startup; the single-instance guard means no other raterm's tabs
+    /// can be reporting.
     pub fn prune_claude_sessions(&self) -> Result<(), String> {
         self.conn()
-            .execute("DELETE FROM claude_sessions WHERE tab_id NOT IN (SELECT tab_id FROM tabs)", [])
-            .map(drop)
+            .execute_batch(
+                "DELETE FROM claude_sessions WHERE tab_id NOT IN (SELECT tab_id FROM tabs);
+                 UPDATE claude_sessions SET claude_pid = NULL;",
+            )
             .map_err(sql)
     }
 }
@@ -496,6 +527,8 @@ pub struct SessionReport<'a> {
     pub source: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub transcript_path: Option<&'a str>,
+    /// The Claude process (`CLAUDE_PID` in the hook's environment).
+    pub claude_pid: Option<u32>,
 }
 
 /// Records the session a tab is now in, replacing any earlier report for it. The
@@ -504,12 +537,21 @@ pub struct SessionReport<'a> {
 pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Result<(), String> {
     let now = i64::try_from(unix_secs(SystemTime::now())).unwrap_or(i64::MAX);
     conn.execute(
-        "INSERT INTO claude_sessions (tab_id, session_id, source, cwd, transcript_path, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO claude_sessions (tab_id, session_id, source, cwd, transcript_path, updated_at, claude_pid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT (tab_id) DO UPDATE SET
             session_id = excluded.session_id, source = excluded.source, cwd = excluded.cwd,
-            transcript_path = excluded.transcript_path, updated_at = excluded.updated_at",
-        params![report.tab_id.as_str(), report.session_id.as_str(), report.source, report.cwd, report.transcript_path, now],
+            transcript_path = excluded.transcript_path, updated_at = excluded.updated_at,
+            claude_pid = excluded.claude_pid",
+        params![
+            report.tab_id.as_str(),
+            report.session_id.as_str(),
+            report.source,
+            report.cwd,
+            report.transcript_path,
+            now,
+            report.claude_pid
+        ],
     )
     .map(drop)
     .map_err(sql)
@@ -550,7 +592,7 @@ pub(crate) mod tests {
     fn terminal_tab(id: &str) -> Tab {
         Tab {
             tab_id: tid(id),
-            kind: TabKind::Terminal { command: Some("htop".into()) },
+            kind: TabKind::Terminal { command: Some("htop".into()), claude_session: None },
             name: format!("tab {id}"),
             renamed: true,
             cwd: None,
@@ -559,7 +601,7 @@ pub(crate) mod tests {
 
     /// A report with only a tab and a session (source `clear`).
     pub(crate) fn report<'a>(tab_id: &'a TabId, session_id: &'a SessionId) -> SessionReport<'a> {
-        SessionReport { tab_id, session_id, source: Some("clear"), cwd: None, transcript_path: None }
+        SessionReport { tab_id, session_id, source: Some("clear"), cwd: None, transcript_path: None, claude_pid: None }
     }
 
     fn files_named(dir: &Path, prefix: &str) -> Vec<String> {
@@ -696,6 +738,43 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_terminal_tab_keeps_the_session_saved_with_it_not_the_latest_report() {
+        let path = temp_db("terminal-session");
+        let db = Db::open(path.clone()).unwrap();
+        let open = |session: Option<&str>| Tab {
+            kind: TabKind::Terminal { command: None, claude_session: session.map(sid) },
+            ..terminal_tab("t")
+        };
+        db.save_layout(Layout { active: 0, tabs: vec![open(Some(S1))] }).unwrap();
+        // A later report (Claude ran again, then quit) does not override what the save found open.
+        record_claude_session(&connect_existing(&path).unwrap(), &report(&tid("t"), &sid(S2))).unwrap();
+        assert_eq!(db.load_layout().unwrap().tabs, vec![open(Some(S1))]);
+        db.save_layout(Layout { active: 0, tabs: vec![open(None)] }).unwrap();
+        assert_eq!(db.load_layout().unwrap().tabs, vec![open(None)]);
+    }
+
+    #[test]
+    fn knows_the_session_a_claude_process_reported() {
+        let path = temp_db("run-by");
+        let db = Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        let (t, s1) = (tid("t"), sid(S1));
+        assert_eq!(db.session_run_by(&t, 42).unwrap(), None);
+        record_claude_session(&conn, &SessionReport { claude_pid: Some(42), ..report(&t, &s1) }).unwrap();
+        assert_eq!(db.session_run_by(&t, 42).unwrap(), Some(s1.clone()));
+        assert_eq!(db.session_run_by(&t, 43).unwrap(), None, "another process");
+        assert_eq!(db.session_run_by(&tid("u"), 42).unwrap(), None, "another tab");
+        // Claude quit and ran again in the same tab: only the new process matches.
+        let s2 = sid(S2);
+        record_claude_session(&conn, &SessionReport { claude_pid: Some(43), ..report(&t, &s2) }).unwrap();
+        assert_eq!(db.session_run_by(&t, 42).unwrap(), None);
+        assert_eq!(db.session_run_by(&t, 43).unwrap(), Some(s2));
+        // A report without a pid (an older hook) never matches.
+        record_claude_session(&conn, &report(&t, &s1)).unwrap();
+        assert_eq!(db.session_run_by(&t, 42).unwrap(), None);
+    }
+
+    #[test]
     fn knows_which_tabs_have_reported_since_they_started() {
         let path = temp_db("reported");
         let db = Db::open(path.clone()).unwrap();
@@ -735,6 +814,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_bad_terminal_session_is_dropped_not_fatal() {
+        let path = temp_db("bad-terminal-session");
+        let db = Db::open(path.clone()).unwrap();
+        db.save_layout(Layout { active: 0, tabs: vec![terminal_tab("a")] }).unwrap();
+        connect(&path).unwrap().execute("UPDATE tabs SET claude_session = 'bad'", []).unwrap();
+        assert_eq!(db.load_layout().unwrap().tabs, vec![terminal_tab("a")]);
+    }
+
+    #[test]
     fn prunes_reports_for_closed_tabs() {
         let path = temp_db("prune");
         let db = Db::open(path.clone()).unwrap();
@@ -751,6 +839,19 @@ pub(crate) mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(ids, ["a"]);
+    }
+
+    #[test]
+    fn pruning_forgets_the_claude_processes_of_the_last_run() {
+        let path = temp_db("prune-pids");
+        let db = Db::open(path.clone()).unwrap();
+        db.save_layout(Layout { active: 0, tabs: vec![terminal_tab("t")] }).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        record_claude_session(&conn, &SessionReport { claude_pid: Some(42), ..report(&tid("t"), &sid(S1)) }).unwrap();
+        db.prune_claude_sessions().unwrap();
+        // A new process reusing pid 42 must not look like the old Claude.
+        assert_eq!(db.session_run_by(&tid("t"), 42).unwrap(), None);
+        assert_eq!(db.reported_session(&tid("t")).unwrap(), Some(sid(S1)), "the report itself is kept");
     }
 
     #[test]

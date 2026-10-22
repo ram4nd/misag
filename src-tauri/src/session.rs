@@ -127,10 +127,11 @@ fn is_posix_shell(shell: &str) -> bool {
 }
 
 /// Variables that only a running Claude Code session sets, to mark its own
-/// process and its children (seen in Claude Code 2.1). They describe whatever
-/// launched raterm, such as a Claude Code session running a dev build, not the
-/// user's environment, so tabs never inherit them; otherwise a `claude` in a tab
-/// would behave as a child of that session. Update when Claude Code adds markers.
+/// process and its children (seen in Claude Code 2.1), plus the ones raterm sets
+/// on its own tabs. They describe whatever launched raterm, such as a Claude Code
+/// session running a dev build or another raterm's tab, not the user's
+/// environment, so tabs never inherit them; otherwise a `claude` in a tab would
+/// behave as a child of that session. Update when Claude Code adds markers.
 /// User settings (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_*`,
 /// ...) are not on this list.
 pub const LAUNCHER_ENV: &[&str] = &[
@@ -143,6 +144,12 @@ pub const LAUNCHER_ENV: &[&str] = &[
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
     "CLAUDE_PID",
+    // Set by raterm on its own tabs. A raterm started from one of them must not
+    // pass on the outer raterm's tab and database (`launch_plan` also drops the
+    // outer wrapper directory from PATH).
+    "RATERM_TAB",
+    "RATERM_DB",
+    "RATERM_WRAPPER",
 ];
 
 /// Variables Claude Code also sets for the commands it runs (for example
@@ -390,6 +397,31 @@ impl Sessions {
         path.into_os_string().into_string().map_err(|p| eprintln!("raterm: non-UTF-8 directory {p:?}")).ok()
     }
 
+    /// The leader of the session's foreground process group, when that is not the
+    /// session process itself: the program a shell is running in the foreground,
+    /// such as `claude` typed at its prompt.
+    /// An error means it could not be told (no such session, or the PTY query
+    /// failed), which callers must not read as "nothing in the foreground".
+    pub fn foreground(&self, id: u32) -> Result<Option<u32>, String> {
+        let s = self.get(id)?;
+        let master = lock(&s.master);
+        let fd = master.as_raw_fd().ok_or_else(|| format!("session {id} has no PTY descriptor"))?;
+        // SAFETY: plain syscall on a descriptor the locked master keeps open.
+        let leader = unsafe { libc::tcgetpgrp(fd) };
+        if leader <= 0 {
+            let e = format!("session {id}: cannot read the foreground process: {}", std::io::Error::last_os_error());
+            eprintln!("raterm: {e}");
+            return Err(e);
+        }
+        let leader = leader as u32;
+        Ok((Some(leader) != s.pid).then_some(leader))
+    }
+
+    /// The name the kernel gives the process (`/proc/<pid>/comm`), such as `claude`.
+    pub fn process_name(pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|name| name.trim_end().to_owned())
+    }
+
     /// Hangs up every session, force-killing survivors after the grace period in
     /// the background. Returns the threads doing that.
     pub fn kill_all(&self) -> Vec<std::thread::JoinHandle<()>> {
@@ -551,6 +583,23 @@ mod tests {
         s.write(p.id, b"abc\n".to_vec()).unwrap();
         assert_eq!(p.exit_code(), 0);
         assert!(p.text().contains("got:abc"), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn knows_the_program_a_shell_runs_in_the_foreground() {
+        // With job control on, as at an interactive prompt, the job gets its own process group.
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300));
+        let p = spawn(&s, "echo idle; sleep 0.5; set -m; sh -c 'echo fg:$$; exec sleep 60'; true");
+        p.wait_for("idle");
+        assert_eq!(s.foreground(p.id), Ok(None), "only the shell runs");
+        p.wait_for("fg:");
+        let text = p.text();
+        let pid: u32 = text.split("fg:").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        assert_eq!(s.foreground(p.id), Ok(Some(pid)));
+        assert_eq!(Sessions::process_name(pid).as_deref(), Some("sleep"));
+        s.kill(p.id);
+        p.exit_code();
+        assert!(s.foreground(p.id).is_err(), "gone with the session: unknown, not idle");
     }
 
     #[test]
