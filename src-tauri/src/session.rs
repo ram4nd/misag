@@ -422,6 +422,15 @@ impl Sessions {
         std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|name| name.trim_end().to_owned())
     }
 
+    /// The command line process `pid` was started with, if it can be read.
+    pub fn process_args(pid: u32) -> Option<Vec<String>> {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        // Each argument ends in a NUL; a process that is exiting reads as empty.
+        let args: Vec<String> = raw.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        let args = args.split_last().map_or(&args[..], |(_, rest)| rest);
+        (!args.is_empty()).then(|| args.to_vec())
+    }
+
     /// Hangs up every session, force-killing survivors after the grace period in
     /// the background. Returns the threads doing that.
     pub fn kill_all(&self) -> Vec<std::thread::JoinHandle<()>> {
@@ -597,9 +606,11 @@ mod tests {
         let pid: u32 = text.split("fg:").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
         assert_eq!(s.foreground(p.id), Ok(Some(pid)));
         assert_eq!(Sessions::process_name(pid).as_deref(), Some("sleep"));
+        assert_eq!(Sessions::process_args(pid), Some(vec!["sleep".to_string(), "60".to_string()]));
         s.kill(p.id);
         p.exit_code();
         assert!(s.foreground(p.id).is_err(), "gone with the session: unknown, not idle");
+        assert_eq!(Sessions::process_args(pid), None, "gone");
     }
 
     #[test]

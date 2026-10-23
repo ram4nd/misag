@@ -36,14 +36,14 @@
             <fieldset>
               <h2><span class="claude-icon"></span>Claude</h2>
               <label class="check"><input name="skipPermissions" type="checkbox" /> Skip permission prompts (<code>--dangerously-skip-permissions</code>)</label>
-              <p class="hint">Claude then runs every tool without asking. Applies to Claude tabs started or restarted from now on, which show a red <b>!</b>.</p>
+              <p class="hint">Claude then runs every tool without asking. Applies to Claude tabs started or restarted from now on, and to every <code>claude</code> started in a terminal tab, scripts included. Their tab's tooltip says so.</p>
               <label>Auto memory
                 <select name="disableAutoMemory">
                   <option value="false">Auto</option>
                   <option value="true">Disable</option>
                 </select>
               </label>
-              <p class="hint">Auto leaves it to your Claude settings; Disable turns off Claude's auto memory. Applies to Claude tabs started, restarted or restored from now on.</p>
+              <p class="hint">Auto leaves it to your Claude settings; Disable turns off Claude's auto memory. Applies to Claude tabs started, restarted or restored from now on, and to every <code>claude</code> started in a terminal tab.</p>
             </fieldset>
             <p class="hint not-saving" hidden>raterm is running without its database, so settings last only until it quits.</p>
             <p class="error" role="alert" hidden></p>

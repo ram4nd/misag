@@ -8,11 +8,14 @@
 //! mode, which records them in the database for the tab named by `RATERM_TAB`.
 //!
 //! Terminal tabs find a `claude` wrapper first on their `PATH` (see
-//! `install_wrapper`), which starts the real `claude` with the same hook, so a
-//! Claude session started in a terminal tab is recorded for that tab too.
+//! `install_wrapper`), which hands `claude` to `raterm --claude-launch`: that
+//! starts the real `claude` with the same hook and the current settings, so a
+//! Claude session started in a terminal tab is recorded for that tab and set up
+//! like a Claude tab's.
 
 use crate::db::{self, unix_secs, Db, SessionReport};
 use crate::layout::TabId;
+use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::ffi::OsString;
@@ -35,6 +38,8 @@ pub const PID_ENV: &str = "CLAUDE_PID";
 pub const WRAPPER_DIR: &str = "bin";
 /// Command-line flag that runs the binary as the hook.
 pub const HOOK_FLAG: &str = "--claude-hook";
+/// Command-line flag the wrapper runs the binary with to start the real `claude`.
+pub const LAUNCH_FLAG: &str = "--claude-launch";
 /// Hook failures are appended here, next to the database, since Claude does not
 /// show a successful hook's stderr.
 pub const HOOK_LOG: &str = "hook.log";
@@ -160,11 +165,6 @@ pub fn hook_command(exe: &Path) -> String {
     format!("{} {HOOK_FLAG}", shell_quote(&exe.to_string_lossy()))
 }
 
-/// The `--settings` JSON that installs raterm's SessionStart hook.
-fn hook_settings(exe: &Path) -> String {
-    settings_json(Some(exe), Map::new()).expect("the hook is a setting")
-}
-
 /// The `--settings` JSON: `keys` (from raterm's own settings) plus, with `hook_exe`,
 /// the SessionStart hook. None when that is empty, so no `--settings` is passed.
 fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
@@ -184,16 +184,19 @@ pub fn wrapper_dir(db: &Path) -> Option<PathBuf> {
     Some(db.parent()?.join(WRAPPER_DIR))
 }
 
-/// The `claude` wrapper: takes its own directory off `PATH` and runs the real
-/// `claude` with the hook. Inside a Claude session (`CLAUDECODE`, which terminal
-/// tabs never inherit) it adds no hook, so a `claude` that Claude itself runs
-/// cannot replace the session recorded for the tab.
+/// The `claude` wrapper: takes its own directory off `PATH` and has `exe` start the
+/// real `claude` (see `LAUNCH_FLAG`), or runs `claude` unchanged with a warning if
+/// `exe` has gone (another raterm build rewrote the shared wrapper, say). Inside a
+/// Claude session (`CLAUDECODE`, which
+/// terminal tabs never inherit) it runs `claude` unchanged, so a `claude` that
+/// Claude itself runs cannot replace the session recorded for the tab.
 fn wrapper_script(dir: &str, exe: &Path) -> String {
-    let (dir, settings) = (shell_quote(dir), shell_quote(&hook_settings(exe)));
+    let (dir, exe) = (shell_quote(dir), shell_quote(&exe.to_string_lossy()));
     format!(
         r#"#!/bin/sh
 # Written by raterm at every start; changes are lost. Terminal tabs have this
-# directory first on PATH, so `claude` there reports its session to raterm.
+# directory first on PATH, so `claude` there starts with raterm's settings and
+# reports its session to raterm.
 self={dir}
 rest=
 set -f
@@ -206,13 +209,17 @@ set +f
 PATH=$rest
 export PATH
 if [ -n "$CLAUDECODE" ]; then exec claude "$@"; fi
-exec claude --settings {settings} "$@"
+if [ ! -x {exe} ]; then
+  echo "raterm: "{exe}" is gone, so claude starts without raterm's settings and session hook" >&2
+  exec claude "$@"
+fi
+exec {exe} {LAUNCH_FLAG} "$@"
 "#
     )
 }
 
 /// Writes the `claude` wrapper (see `wrapper_script`) into `wrapper_dir(db)`,
-/// replacing any earlier one, so it always runs this raterm's hook. Returns the
+/// replacing any earlier one, so it always starts `claude` through this raterm. Returns the
 /// directory.
 pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
@@ -243,6 +250,17 @@ pub fn args(session: &SessionId, resume: bool, hook_exe: Option<&Path>, settings
         args.extend(["--settings".to_string(), json]);
     }
     args
+}
+
+/// Arguments for a `claude` started in a terminal tab: what `settings` add to a
+/// Claude tab, the hook (with `hook_exe`), then the user's own `args` unchanged.
+pub fn launch_args(settings: &Settings, hook_exe: Option<&Path>, args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut all: Vec<OsString> = settings.claude_args().into_iter().map(OsString::from).collect();
+    if let Some(json) = settings_json(hook_exe, settings.claude_settings()) {
+        all.extend(["--settings".into(), json.into()]);
+    }
+    all.extend(args);
+    all
 }
 
 /// The part of Claude's SessionStart payload raterm records.
@@ -479,14 +497,21 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&args[3]).unwrap(), serde_json::json!({ "autoMemoryEnabled": false }));
     }
 
-    /// Runs the installed wrapper with a stand-in `claude` that prints its
-    /// arguments and `PATH`, one per line.
+    /// Writes an executable stand-in at `path` that prints `name`, its arguments
+    /// and `PATH`, one per line.
+    fn stand_in(path: &Path, name: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' {name} \"$@\" \"PATH=$PATH\"\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Runs the installed wrapper with stand-ins for raterm and the real `claude`.
     fn run_wrapper(base: &Path, extra_env: &[(&str, &str)]) -> Vec<String> {
-        let wrapper = install_wrapper(&base.join("data/raterm.db"), Path::new(EXE)).unwrap();
+        let exe = base.join("my apps/raterm");
+        stand_in(&exe, "raterm");
+        let wrapper = install_wrapper(&base.join("data/raterm.db"), &exe).unwrap();
         let real = base.join("real");
-        fs::create_dir_all(&real).unwrap();
-        fs::write(real.join("claude"), "#!/bin/sh\nprintf '%s\\n' \"$@\" \"PATH=$PATH\"\n").unwrap();
-        fs::set_permissions(real.join("claude"), fs::Permissions::from_mode(0o755)).unwrap();
+        stand_in(&real.join("claude"), "claude");
         let path = format!("{}:{}/:{}:/usr/bin:/bin", wrapper.display(), wrapper.display(), real.display());
         let out = std::process::Command::new("claude")
             .args(["--resume", "it's"])
@@ -500,12 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn the_wrapper_runs_the_real_claude_with_the_hook() {
+    fn the_wrapper_hands_claude_to_raterm() {
         let base = crate::test_support::temp_dir("wrapper");
         let lines = run_wrapper(&base, &[]);
-        assert_eq!(lines[0], "--settings");
-        assert_eq!(lines[1], hook_settings(Path::new(EXE)));
-        assert_eq!(lines[2..4], ["--resume", "it's"]);
+        assert_eq!(lines[..4], ["raterm", LAUNCH_FLAG, "--resume", "it's"]);
         assert_eq!(lines[4], format!("PATH={}:/usr/bin:/bin", base.join("real").display()), "its own directory is gone");
         // Installing again replaces it.
         assert_eq!(run_wrapper(&base, &[]), lines);
@@ -518,8 +541,28 @@ mod tests {
         let wrapper = install_wrapper(&base.join("data/raterm.db"), Path::new(EXE)).unwrap();
         // Listed twice and with a trailing slash: every spelling must be taken off.
         let path = format!("{w}:{w}/:{w}:{empty}", w = wrapper.display(), empty = base.display());
-        let out = std::process::Command::new(wrapper.join("claude")).env("PATH", path).env_remove("CLAUDECODE").output().unwrap();
+        // Nested in Claude, the wrapper runs `claude` itself rather than through raterm.
+        let out = std::process::Command::new(wrapper.join("claude")).env("PATH", path).env("CLAUDECODE", "1").output().unwrap();
         assert_eq!(out.status.code(), Some(127), "{}", String::from_utf8_lossy(&out.stderr));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_wrapper_whose_raterm_is_gone_still_runs_claude() {
+        let base = crate::test_support::temp_dir("wrapper-stale");
+        let wrapper = install_wrapper(&base.join("data/raterm.db"), &base.join("gone/raterm")).unwrap();
+        let real = base.join("real");
+        stand_in(&real.join("claude"), "claude");
+        let out = std::process::Command::new("claude")
+            .arg("-c")
+            .env("PATH", format!("{}:{}:/usr/bin:/bin", wrapper.display(), real.display()))
+            .env_remove("CLAUDECODE")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let lines: Vec<String> = String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect();
+        assert_eq!(lines[..2], ["claude", "-c"]);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("gone/raterm"), "says why the settings are missing");
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -543,8 +586,22 @@ mod tests {
     fn inside_a_claude_session_the_wrapper_adds_no_hook() {
         let base = crate::test_support::temp_dir("wrapper-nested");
         let lines = run_wrapper(&base, &[("CLAUDECODE", "1")]);
-        assert_eq!(lines[..2], ["--resume", "it's"]);
+        assert_eq!(lines[..3], ["claude", "--resume", "it's"]);
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_launch_from_a_terminal_gets_the_settings_and_the_hook_before_the_users_arguments() {
+        let s = crate::settings::Settings { skip_permissions: true, disable_auto_memory: true, ..Default::default() };
+        let args = launch_args(&s, Some(Path::new(EXE)), ["--resume".into(), "it's".into()]);
+        let json = settings_json(Some(Path::new(EXE)), s.claude_settings()).unwrap();
+        let expected = ["--dangerously-skip-permissions", "--settings", &json, "--resume", "it's"];
+        assert_eq!(args, expected.map(OsString::from));
+    }
+
+    #[test]
+    fn a_launch_without_settings_or_a_hook_passes_the_users_arguments_alone() {
+        assert_eq!(launch_args(&Default::default(), None, ["-p".into()]), [OsString::from("-p")]);
     }
 
     #[test]

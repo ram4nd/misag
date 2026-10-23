@@ -389,11 +389,7 @@ impl Db {
 
     /// The stored settings (the migration created their row with the defaults).
     pub fn load_settings(&self) -> Result<Settings, String> {
-        self.conn()
-            .query_row("SELECT skip_permissions, workspace, disable_auto_memory FROM settings WHERE id = 1", [], |r| {
-                Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)? })
-            })
-            .map_err(sql)
+        load_settings(&self.conn())
     }
 
     /// Stores the settings (checked by the caller, see `Settings::validated`),
@@ -533,6 +529,14 @@ pub struct SessionReport<'a> {
     pub transcript_path: Option<&'a str>,
     /// The Claude process (`CLAUDE_PID` in the hook's environment).
     pub claude_pid: Option<u32>,
+}
+
+/// The settings stored in `conn`; see `Db::load_settings`.
+pub fn load_settings(conn: &Connection) -> Result<Settings, String> {
+    conn.query_row("SELECT skip_permissions, workspace, disable_auto_memory FROM settings WHERE id = 1", [], |r| {
+        Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)? })
+    })
+    .map_err(sql)
 }
 
 /// Records the session a tab is now in, replacing any earlier report for it. The

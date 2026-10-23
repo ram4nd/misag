@@ -6,7 +6,7 @@ use crate::claude::{self, HookProblem, SessionId};
 use crate::db::{Db, StoreStatus};
 use crate::layout::{Layout, TabId};
 use crate::session::{self, Launch, SpawnError, Sessions, SpawnRequest};
-use crate::settings::Settings;
+use crate::settings::{skips_permissions, Settings};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -385,37 +385,48 @@ pub struct TabSession {
     tab_id: TabId,
 }
 
-/// Whether a terminal tab has a Claude session open. Mirrored by `ClaudeState` in
-/// src/main.ts.
+/// Whether a terminal tab has a Claude session open, and whether that Claude runs
+/// tools without asking (see `settings::skips_permissions`). Mirrored by
+/// `ClaudeState` in src/main.ts.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ClaudeState {
     /// The Claude process that last reported for the tab is in the foreground.
-    Open { session: SessionId },
+    Open { session: SessionId, skips_permissions: bool },
     /// Something else is: another program, or just the shell.
     Closed,
     /// A `claude` that never reported for the tab is: it bypassed the wrapper.
-    Untracked { pid: u32 },
+    Untracked { pid: u32, skips_permissions: bool },
     /// It could not be told, so whatever was known before still stands.
     Unknown,
 }
 
 /// The state of each tab, keyed by PTY id: `foreground` gives a session's
 /// foreground program, `run_by` the session a Claude process reported for a tab,
-/// and `name` a process's name.
+/// `name` a process's name, and `skips` whether a Claude process skips permission
+/// prompts (None when its command line cannot be read).
 pub fn claude_states(
     tabs: Vec<TabSession>,
     foreground: impl Fn(u32) -> Result<Option<u32>, String>,
     run_by: impl Fn(&TabId, u32) -> Result<Option<SessionId>, String>,
     name: impl Fn(u32) -> Option<String>,
+    skips: impl Fn(u32) -> Option<bool>,
 ) -> HashMap<u32, ClaudeState> {
     let state = |t: &TabSession| {
         // A session that is gone or cannot be asked is not known to be idle.
         let Ok(foreground) = foreground(t.id) else { return ClaudeState::Unknown };
         let Some(pid) = foreground else { return ClaudeState::Closed };
         match run_by(&t.tab_id, pid) {
-            Ok(Some(session)) => ClaudeState::Open { session },
-            Ok(None) if name(pid).as_deref() == Some("claude") => ClaudeState::Untracked { pid },
+            // A Claude that may skip permission prompts is not known to be safe, so
+            // without its command line the earlier warning stands.
+            Ok(Some(session)) => match skips(pid) {
+                Some(skips_permissions) => ClaudeState::Open { session, skips_permissions },
+                None => ClaudeState::Unknown,
+            },
+            Ok(None) if name(pid).as_deref() == Some("claude") => match skips(pid) {
+                Some(skips_permissions) => ClaudeState::Untracked { pid, skips_permissions },
+                None => ClaudeState::Unknown,
+            },
             Ok(None) => ClaudeState::Closed,
             Err(e) => {
                 eprintln!("raterm: could not look up the Claude session in tab {}: {e}", t.tab_id);
@@ -433,7 +444,8 @@ pub fn claude_open_sessions(
     db: State<'_, Db>,
     tabs: Vec<TabSession>,
 ) -> HashMap<u32, ClaudeState> {
-    claude_states(tabs, |id| state.foreground(id), |tab, pid| db.session_run_by(tab, pid), Sessions::process_name)
+    let skips = |pid| Sessions::process_args(pid).map(|args| skips_permissions(&args));
+    claude_states(tabs, |id| state.foreground(id), |tab, pid| db.session_run_by(tab, pid), Sessions::process_name, skips)
 }
 
 /// Current working directory of each live session, keyed by id.
@@ -633,9 +645,11 @@ mod tests {
         let tabs = |ids: &[u32]| ids.iter().map(|&id| TabSession { id, tab_id: tid(&format!("t{id}")) }).collect();
         // Tab 1 runs the Claude that reported (pid 10); tab 2 an idle shell; tab 3 vim
         // (pid 30); tab 4 a claude that never reported (pid 40); tab 5 cannot be asked;
-        // tab 6's lookup fails.
+        // tab 6's lookup fails; tab 7 runs the Claude that reported (pid 70), whose
+        // command line cannot be read.
         let foreground = |id: u32| match id {
             1 => Ok(Some(10)),
+            7 => Ok(Some(70)),
             2 => Ok(None),
             3 => Ok(Some(30)),
             4 => Ok(Some(40)),
@@ -643,21 +657,25 @@ mod tests {
             _ => Err("no session".to_string()),
         };
         let run_by = |tab: &TabId, pid: u32| match (tab.as_str(), pid) {
-            ("t1", 10) => Ok(Some(session())),
+            ("t1", 10) | ("t7", 70) => Ok(Some(session())),
             ("t6", _) => Err("database is locked".to_string()),
             _ => Ok(None),
         };
         let name = |pid: u32| Some(if pid == 30 { "vim" } else { "claude" }.to_string());
-        let states = claude_states(tabs(&[1, 2, 3, 4, 5, 6]), foreground, run_by, name);
-        assert_eq!(states[&1], ClaudeState::Open { session: session() });
+        // Only the untracked claude was started with --dangerously-skip-permissions.
+        let skips = |pid: u32| if pid == 70 { None } else { Some(pid == 40) };
+        let states = claude_states(tabs(&[1, 2, 3, 4, 5, 6, 7]), foreground, run_by, name, skips);
+        assert_eq!(states[&1], ClaudeState::Open { session: session(), skips_permissions: false });
         assert_eq!(states[&2], ClaudeState::Closed);
         assert_eq!(states[&3], ClaudeState::Closed);
-        assert_eq!(states[&4], ClaudeState::Untracked { pid: 40 });
+        assert_eq!(states[&4], ClaudeState::Untracked { pid: 40, skips_permissions: true });
         assert_eq!(states[&5], ClaudeState::Unknown);
         assert_eq!(states[&6], ClaudeState::Unknown);
+        assert_eq!(states[&7], ClaudeState::Unknown, "it might skip permissions: not known to be safe");
         let json = serde_json::to_value(&states[&1]).unwrap();
-        assert_eq!(json, serde_json::json!({ "state": "open", "session": ID }));
-        assert_eq!(serde_json::to_value(&states[&4]).unwrap(), serde_json::json!({ "state": "untracked", "pid": 40 }));
+        assert_eq!(json, serde_json::json!({ "state": "open", "session": ID, "skipsPermissions": false }));
+        let json = serde_json::to_value(&states[&4]).unwrap();
+        assert_eq!(json, serde_json::json!({ "state": "untracked", "pid": 40, "skipsPermissions": true }));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { shellQuote, untypeable } from "./paths";
+import { folderLabel, shellQuote, untypeable } from "./paths";
 
 describe("shellQuote", () => {
   test("leaves plain paths alone and single-quotes the rest", () => {
@@ -19,5 +19,16 @@ describe("untypeable", () => {
       expect(untypeable(bad), JSON.stringify(bad)).toContain("control characters");
     }
     expect(untypeable("a\\b")).toContain("backslash");
+  });
+});
+
+describe("folderLabel", () => {
+  test("is the last folder of the path, ~ for home and / for the root", () => {
+    expect(folderLabel("/home/me/src/raterm", "/home/me")).toBe("raterm");
+    expect(folderLabel("/home/me/src/raterm/", "/home/me")).toBe("raterm");
+    expect(folderLabel("/home/me", "/home/me")).toBe("~");
+    expect(folderLabel("/home/me/", "/home/me")).toBe("~");
+    expect(folderLabel("/home/me", null)).toBe("me");
+    expect(folderLabel("/", "/home/me")).toBe("/");
   });
 });

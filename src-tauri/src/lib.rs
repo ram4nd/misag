@@ -42,7 +42,40 @@ pub fn run_exec() -> i32 {
     if err.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }
 }
 
-/// raterm's own binary, for Claude's hook and the `--exec` trampoline.
+/// `raterm --claude-launch [args]`, run by the `claude` wrapper in terminal tabs:
+/// replaces this process with the real `claude` (the wrapper took itself off
+/// `PATH`), started like a Claude tab with the settings and hook from the database
+/// in `RATERM_DB`. Without a usable database it starts untracked with the cautious
+/// settings; if only the settings cannot be read, it is still tracked. Returns only
+/// on failure, with the exit code a shell uses (127 not found, 126 otherwise).
+pub fn run_launch() -> i32 {
+    use std::os::unix::process::CommandExt;
+    let db_path = std::env::var_os(claude::DB_ENV).map(PathBuf::from);
+    let store = db_path.as_deref().map(db::connect_existing).transpose();
+    let settings = store.as_ref().map_err(String::clone).and_then(|conn| match conn {
+        Some(conn) => db::load_settings(conn),
+        None => Err(format!("{} is not set", claude::DB_ENV)),
+    });
+    let settings = settings.unwrap_or_else(|e| {
+        eprintln!("raterm: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
+        settings::Settings::cautious()
+    });
+    let exe = own_exe();
+    let hook = match (exe.path(), &store) {
+        (Ok(exe), Ok(Some(_))) => Some(exe),
+        (Err(e), Ok(Some(_))) => {
+            eprintln!("raterm: {e}, so this Claude session will not be remembered");
+            None
+        }
+        _ => None,
+    };
+    let args = claude::launch_args(&settings, hook, std::env::args_os().skip(2));
+    let err = std::process::Command::new("claude").args(args).exec();
+    eprintln!("raterm: could not run claude: {err}");
+    if err.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }
+}
+
+/// raterm's own binary, for Claude's hook, `--claude-launch` and the `--exec` trampoline.
 fn own_exe() -> commands::AppExe {
     commands::AppExe::new(
         std::env::current_exe()

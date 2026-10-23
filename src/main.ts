@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
+import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -7,7 +8,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
-import { shellQuote, untypeable } from "./paths";
+import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
 
 /**
@@ -40,18 +41,23 @@ interface Session {
   id: number | null;
   /** Counts the tab's starts (restarts included), so checks from an earlier start can tell they are stale. */
   starts: number;
+  /** The user's name for the tab, or else the terminal's latest title (shown in the tooltip). */
   name: string;
   /** True once the user renamed the tab, so terminal titles stop overwriting it. */
   renamed: boolean;
   /** Directory the tab was opened in; saves use its live directory when they can. */
   cwd?: string;
+  /** The process's current directory, last time it was checked. */
+  liveCwd?: string;
   term: Terminal;
   fit: FitAddon;
   el: HTMLDivElement;
   exited: boolean;
   closing: boolean;
-  /** The running process is Claude started with `--dangerously-skip-permissions`. */
+  /** The tab's Claude was started with `--dangerously-skip-permissions`. */
   skipsPermissions: boolean;
+  /** For terminal tabs: Claude was in the foreground at the latest clear check. */
+  inClaude: boolean;
   /**
    * For terminal tabs: the Claude session last known to be open in the shell,
    * saved with the tab so a restore reopens it. A check that cannot tell keeps it.
@@ -99,9 +105,9 @@ type ResumeReport = { state: "typed" } | { state: "noConversation" } | { state: 
 
 /** Mirrors `commands::ClaudeState` in src-tauri/src/commands.rs. */
 type ClaudeState =
-  | { state: "open"; session: string }
+  | { state: "open"; session: string; skipsPermissions: boolean }
   | { state: "closed" }
-  | { state: "untracked"; pid: number }
+  | { state: "untracked"; pid: number; skipsPermissions: boolean }
   | { state: "unknown" };
 
 /** Mirrors `db::StoreStatus` in src-tauri/src/db.rs. */
@@ -151,10 +157,11 @@ interface Settings {
 const HOOK_REPORT_DELAY_MS = 60_000;
 /** Polling interval for the backend's saving and hook status, and for re-checking a hook report. */
 const STORE_POLL_MS = 30_000;
-/** How often tabs are saved while terminal tabs run, so Claude starting or quitting in one is saved. */
-const CLAUDE_POLL_MS = 5_000;
 /** How long a `claude` must run without reporting before it is taken to bypass the wrapper. */
 const UNTRACKED_GRACE_MS = 10_000;
+
+/** How often the tabs' directories and terminal tabs' Claude are checked (see `pollTabs`). */
+const TAB_POLL_MS = 2_000;
 
 /** Tab changes are saved this long after the last one, so a burst is one save. */
 const SAVE_DELAY_MS = 300;
@@ -269,7 +276,7 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, fit, el, exited: false, closing: false, skipsPermissions: false,
+    id: null, starts: 0, term, fit, el, exited: false, closing: false, skipsPermissions: false, inClaude: false,
     claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
@@ -298,13 +305,7 @@ async function spawn(opts: SpawnOptions) {
   term.onTitleChange((title) => {
     if (!title || s.renamed || title === s.name) return;
     s.name = title;
-    // Claude retitles often while working; only this tab's label changes.
-    const tab = tabsEl.children[sessions.indexOf(s)];
-    const label = tab?.querySelector(".name");
-    if (tab instanceof HTMLElement && label) {
-      tab.title = tabTitle(s);
-      label.textContent = title;
-    }
+    updateTab(s);
     scheduleSave();
   });
 
@@ -436,6 +437,10 @@ function write(s: Session, data: Uint8Array) {
 function markExited(s: Session, message: string, error = false) {
   if (s.closing) return;
   s.exited = true;
+  if (s.run.kind === "terminal") {
+    s.inClaude = false;
+    s.skipsPermissions = false;
+  }
   s.term.write(`\r\n\x1b[${error ? "31" : "2"}m[${message}; press Enter to restart]\x1b[0m\r\n`);
   renderSessions();
 }
@@ -494,7 +499,9 @@ function close(s: Session) {
 
 function rename(s: Session, tab: HTMLElement) {
   const input = document.createElement("input");
-  input.value = s.name;
+  // What the tab shows; leaving it unchanged keeps the tab following its folder.
+  const shown = tabLabel(s);
+  input.value = shown;
   tab.replaceChildren(input);
   input.focus();
   input.select();
@@ -504,7 +511,7 @@ function rename(s: Session, tab: HTMLElement) {
     if (finished) return;
     finished = true;
     const name = input.value.trim();
-    if (save && name) {
+    if (save && name && name !== shown) {
       s.name = name;
       s.renamed = true;
       scheduleSave();
@@ -528,11 +535,10 @@ function renderSessions() {
       tab.title = tabTitle(s);
       tab.classList.toggle("active", s === active && shownPage === null);
       tab.classList.toggle("exited", s.exited);
-      tab.classList.toggle("skips-permissions", s.skipsPermissions);
 
       const name = document.createElement("span");
       name.className = "name";
-      name.textContent = s.name;
+      name.textContent = tabLabel(s);
 
       const x = document.createElement("button");
       x.className = "x";
@@ -543,19 +549,7 @@ function renderSessions() {
         close(s);
       };
 
-      if (s.run.kind === "claude") {
-        const mark = document.createElement("span");
-        mark.className = "icon";
-        mark.innerHTML = CLAUDE_ICON;
-        tab.append(mark);
-      }
-      if (s.skipsPermissions) {
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = "!";
-        tab.append(badge);
-      }
-      tab.append(name, x);
+      tab.append(tabIcon(s), name, x);
       tab.onclick = () => activate(s);
       tab.ondblclick = () => rename(s, tab);
       // Middle-click closes the tab.
@@ -571,9 +565,94 @@ function renderSessions() {
   }
 }
 
-/** The tab's tooltip: its name, and a warning while Claude runs tools without asking. */
+/** The tab's directory: its live one, else the one it was opened in. */
+const tabDir = (s: Session) => s.liveCwd ?? s.cwd;
+
+/** The tab's label: the user's name for it, else its folder, else its title until the folder is known. */
+function tabLabel(s: Session): string {
+  const dir = tabDir(s);
+  return s.renamed || !dir ? s.name : folderLabel(dir, home);
+}
+
+/** The tab's tooltip: its title and directory, and a warning while Claude runs tools without asking. */
 function tabTitle(s: Session): string {
-  return s.skipsPermissions ? `${s.name} (Claude runs tools without asking: --dangerously-skip-permissions)` : s.name;
+  const dir = tabDir(s);
+  const text = dir ? `${s.name}\n${dir}` : s.name;
+  return s.skipsPermissions ? `${text}\n(Claude runs tools without asking: --dangerously-skip-permissions)` : text;
+}
+
+/** The tab's icon: Claude's while Claude runs in it, else a terminal. */
+function tabIcon(s: Session): HTMLElement {
+  const mark = document.createElement("span");
+  mark.className = "icon";
+  const claude = s.run.kind === "claude" || s.inClaude;
+  mark.dataset.kind = claude ? "claude" : "terminal";
+  if (claude) mark.innerHTML = CLAUDE_ICON;
+  else mark.append(icon("square-terminal"));
+  return mark;
+}
+
+/**
+ * Refreshes one tab's label, tooltip and icon in place; titles, directories and
+ * Claude change often. A tab being renamed is left alone, so its input stays open;
+ * finishing the rename renders it again.
+ */
+function updateTab(s: Session) {
+  const tab = tabsEl.children[sessions.indexOf(s)];
+  const label = tab?.querySelector(".name");
+  const mark = tab?.querySelector(".icon");
+  if (!(tab instanceof HTMLElement) || !label || !mark) return;
+  tab.title = tabTitle(s);
+  label.textContent = tabLabel(s);
+  mark.replaceWith(tabIcon(s));
+}
+
+/** The home directory, shown as `~`; null until known, or if it cannot be. */
+let home: string | null = null;
+homeDir().then(
+  (dir) => {
+    home = dir;
+    sessions.forEach(updateTab);
+  },
+  (err) => console.error("raterm: could not find the home directory", err),
+);
+
+/** True while `pollTabs` waits for the backend, so a slow check is not started twice. */
+let polling = false;
+
+/**
+ * Checks the running tabs' directories and the Claude in terminal tabs, so labels
+ * and icons follow them, and saves when either changed (a Claude starting or
+ * quitting in a terminal tab changes nothing else). Answers for a tab that exited,
+ * restarted or closed meanwhile are dropped.
+ */
+async function pollTabs() {
+  if (polling) return;
+  const running = sessions.filter((s) => s.id !== null && !s.exited).map((s) => ({ s, id: s.id!, starts: s.starts }));
+  if (!running.length) return;
+  polling = true;
+  try {
+    const terminals = running.filter(({ s }) => s.run.kind === "terminal");
+    const [cwds, claudes] = await Promise.all([
+      liveCwds(running.map(({ id }) => id)),
+      claudeStates(terminals.map(({ s }) => s)),
+    ]);
+    let changed = false;
+    for (const { s, id, starts } of running) {
+      if (s.exited || s.starts !== starts || !sessions.includes(s)) continue;
+      const before = { dir: s.liveCwd, claude: s.claudeOpen };
+      if (s.run.kind === "terminal") followClaude(s, claudes[id]);
+      if (cwds[id]) s.liveCwd = cwds[id];
+      if (s.liveCwd === before.dir && s.claudeOpen === before.claude) continue;
+      changed = true;
+      updateTab(s);
+    }
+    if (changed) scheduleSave();
+  } catch (err) {
+    console.error("raterm: could not check the tabs", err);
+  } finally {
+    polling = false;
+  }
 }
 
 function renderPageTab(id: PageId): HTMLElement {
@@ -815,6 +894,7 @@ async function saveLayout() {
 
 /** The live directories of the given sessions; empty if they cannot be read. */
 async function liveCwds(ids: number[]): Promise<Record<number, string>> {
+  if (!ids.length) return {};
   return invoke<Record<number, string>>("pty_cwds", { ids }).catch((err) => {
     console.error("raterm: could not read tab directories", err);
     return {};
@@ -833,13 +913,16 @@ async function claudeStates(tabs: Session[]): Promise<Record<number, ClaudeState
 
 /**
  * Updates the Claude session a terminal tab is known to have open from its latest
- * check (`state`, undefined when it was not checked). Only a clear answer changes
- * it: a tab that could not be checked, or never started, keeps what it had.
+ * check (`state`, undefined when it was not checked), and its icon and tooltip with
+ * it. Only a clear answer changes them: a tab that could not be checked, or never
+ * started, keeps what it had.
  */
 function followClaude(s: Session, state: ClaudeState | undefined) {
-  // Its shell has exited, so nothing can still run in it.
-  if (s.id !== null && s.exited) s.claudeOpen = null;
+  // Its shell has exited, so nothing can still run in it, whatever a check that
+  // started earlier says.
+  if (s.id !== null && s.exited) return void (s.claudeOpen = null);
   if (!state || state.state === "unknown") return;
+  showClaudeIn(s, state.state !== "closed", state.state !== "closed" && state.skipsPermissions);
   if (state.state === "open") {
     s.claudeOpen = state.session;
     s.resumingUntil = 0;
@@ -857,6 +940,14 @@ function followClaude(s: Session, state: ClaudeState | undefined) {
       String(state.pid),
     );
   }
+}
+
+/** Shows whether Claude runs in a terminal tab, and whether it skips permissions, in its icon and tooltip. */
+function showClaudeIn(s: Session, inClaude: boolean, skipsPermissions: boolean) {
+  if (inClaude === s.inClaude && skipsPermissions === s.skipsPermissions) return;
+  s.inClaude = inClaude;
+  s.skipsPermissions = skipsPermissions;
+  updateTab(s);
 }
 
 /** Shows what the backend knows about saving and about the Claude session hook. */
@@ -1146,10 +1237,8 @@ const checkStore = () =>
 checkStore();
 // Session-hook failures can happen at any time, so they are checked on a timer.
 setInterval(checkStore, STORE_POLL_MS);
-// A Claude starting or quitting in a terminal tab changes nothing else, so it is caught by saving every few seconds (unchanged layouts are not written).
-setInterval(() => {
-  if (sessions.some((s) => s.run.kind === "terminal" && s.id !== null && !s.exited)) scheduleSave();
-}, CLAUDE_POLL_MS);
+// Directories and the Claude in terminal tabs change without telling raterm.
+setInterval(pollTabs, TAB_POLL_MS);
 restore().catch((err) => {
   console.error("raterm: restore failed", err);
   canSave = false;

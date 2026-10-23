@@ -9,6 +9,8 @@ fn main() {
     match mode.as_ref().and_then(|a| a.to_str()) {
         // Claude Code runs this binary as its SessionStart hook for Claude tabs.
         Some(claude::HOOK_FLAG) => std::process::exit(claude::run_hook()),
+        // The `claude` wrapper in terminal tabs starts Claude through this binary.
+        Some(claude::LAUNCH_FLAG) => std::process::exit(raterm_lib::run_launch()),
         // Non-POSIX login shells launch Claude tabs through this binary.
         Some(session::EXEC_FLAG) => std::process::exit(raterm_lib::run_exec()),
         _ => raterm_lib::run(),

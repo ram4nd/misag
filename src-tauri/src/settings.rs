@@ -4,20 +4,25 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// The Claude flag that runs tools without asking.
+pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
-    /// Start Claude tabs with `--dangerously-skip-permissions`.
+    /// Start Claude tabs, and a `claude` started in a terminal tab, with
+    /// `--dangerously-skip-permissions`.
     pub skip_permissions: bool,
     /// The workspace folder the sidebar shows; None for the home directory.
     pub workspace: Option<String>,
-    /// When true, Claude tabs get `autoMemoryEnabled: false`; when false, nothing is
-    /// passed and the user's own Claude configuration decides.
+    /// When true, Claude tabs and a `claude` started in a terminal tab get
+    /// `autoMemoryEnabled: false`; when false, nothing is passed and the user's own
+    /// Claude configuration decides.
     pub disable_auto_memory: bool,
 }
 
 impl Settings {
-    /// What Claude tabs start with when the stored settings cannot be read: the
+    /// What Claude starts with when the stored settings cannot be read: the
     /// defaults (Claude asks before running tools), but with auto memory off, so a
     /// read error never turns memory back on for someone who disabled it.
     pub fn cautious() -> Self {
@@ -38,13 +43,13 @@ impl Settings {
         Ok(self)
     }
 
-    /// The arguments these settings add to every Claude tab.
+    /// The arguments these settings add to every Claude raterm starts.
     pub fn claude_args(&self) -> Vec<String> {
-        if self.skip_permissions { vec!["--dangerously-skip-permissions".into()] } else { vec![] }
+        if self.skip_permissions { vec![SKIP_PERMISSIONS_FLAG.into()] } else { vec![] }
     }
 
-    /// The Claude settings keys these settings add to every Claude tab's `--settings`
-    /// JSON. A setting left at its default adds nothing, so the user's own Claude
+    /// The Claude settings keys these settings add to the `--settings` JSON of every
+    /// Claude raterm starts. A setting left at its default adds nothing, so the user's own Claude
     /// configuration decides.
     pub fn claude_settings(&self) -> Map<String, Value> {
         let mut keys = Map::new();
@@ -53,6 +58,17 @@ impl Settings {
         }
         keys
     }
+}
+
+/// Whether a Claude command line runs tools without asking: `SKIP_PERMISSIONS_FLAG`
+/// or `--permission-mode bypassPermissions`, which Claude documents as equivalent.
+/// A `permissions.defaultMode` in Claude's own settings files is not visible here.
+pub fn skips_permissions(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(i, a)| {
+        a == SKIP_PERMISSIONS_FLAG
+            || a == "--permission-mode=bypassPermissions"
+            || (a == "--permission-mode" && args.get(i + 1).is_some_and(|mode| mode == "bypassPermissions"))
+    })
 }
 
 /// Fails unless `dir` is a directory raterm can use, saying why.
@@ -82,6 +98,18 @@ mod tests {
         assert!(Settings::default().claude_args().is_empty());
         let s = Settings { skip_permissions: true, ..Settings::default() };
         assert_eq!(s.claude_args(), ["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn tells_whether_a_command_line_skips_permission_prompts() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(skips_permissions(&args(&["claude", "--dangerously-skip-permissions"])));
+        assert!(skips_permissions(&args(&["claude", "--permission-mode", "bypassPermissions", "-c"])));
+        assert!(skips_permissions(&args(&["claude", "--permission-mode=bypassPermissions"])));
+        assert!(!skips_permissions(&args(&["claude", "--permission-mode", "plan"])));
+        assert!(!skips_permissions(&args(&["claude", "--allow-dangerously-skip-permissions"])), "only makes it available");
+        assert!(!skips_permissions(&args(&["claude", "-p", "explain --dangerously-skip-permissions"])), "inside a prompt");
+        assert!(!skips_permissions(&args(&["claude", "--permission-mode"])));
     }
 
     #[test]

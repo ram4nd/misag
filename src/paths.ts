@@ -13,3 +13,11 @@ export function untypeable(path: string): string | null {
   if (path.includes("\\")) return "its name contains a backslash";
   return null;
 }
+
+/** What a tab shows for directory `path`: its last folder, `~` for `home` and `/` for the root. */
+export function folderLabel(path: string, home: string | null): string {
+  const trimmed = path.replace(/\/+$/, "");
+  if (!trimmed) return "/";
+  if (home !== null && trimmed === home.replace(/\/+$/, "")) return "~";
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1);
+}

@@ -123,6 +123,8 @@ type Layout = {
   active: number;
 };
 
+/** How often main.ts checks tab directories; mirrors TAB_POLL_MS there. */
+const TAB_POLL_MS = 2_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SESSION = "0f8fad5b-d9cb-469f-a165-70867728950e";
 const LOG = "/home/me/.local/share/com.tag1.raterm/hook.log";
@@ -134,7 +136,11 @@ let liveCwds: Record<number, string>;
 /** The Claude session claude_open_sessions finds open, by PTY id; other tabs are closed unless in `claudeStates`. */
 let openClaudes: Record<number, string>;
 /** Other answers of claude_open_sessions, by PTY id. */
-let claudeStates: Record<number, { state: "unknown" } | { state: "untracked"; pid: number }>;
+let claudeStates: Record<number, { state: "unknown" } | { state: "untracked"; pid: number; skipsPermissions?: boolean }>;
+/** PTY ids whose open Claude was started with --dangerously-skip-permissions. */
+let skippingClaudes: Set<number>;
+/** claude_open_sessions waits for this, so a test can hold a check back. */
+let claudeCheckGate: Promise<void>;
 /** What pty_spawn reports about a terminal tab's saved Claude session. */
 let resumeReport: { state: "typed" } | { state: "noConversation" } | { state: "failed"; message: string };
 let failing: Set<string>;
@@ -229,6 +235,8 @@ beforeEach(() => {
   liveCwds = {};
   openClaudes = {};
   claudeStates = {};
+  skippingClaudes = new Set();
+  claudeCheckGate = Promise.resolve();
   resumeReport = { state: "typed" };
   failing = new Set();
   storeReport = { store: { state: "saving" }, hookProblem: null };
@@ -266,6 +274,7 @@ beforeEach(() => {
       const resume = call.kind === "terminal" && call.claudeSession ? resumeReport : null;
       return Promise.resolve(id).then((id) => ({ id, fellBackToHome: missing, tracked, skipsPermissions, startedAt: 1000, resume }));
     }
+    if (cmd === "plugin:path|resolve_directory") return "/home/me";
     if (cmd === "store_status") return storeReport;
     if (cmd === "claude_reported") return reported.has((args as { tabId: string }).tabId);
     if (cmd === "layout_load") return savedLayout;
@@ -290,12 +299,14 @@ beforeEach(() => {
     }
     if (cmd === "claude_open_sessions") {
       const ids = (args as { tabs: { id: number }[] }).tabs.map((t) => t.id);
-      return Object.fromEntries(
+      return claudeCheckGate.then(() => Object.fromEntries(
         ids.map((id) => [
           id,
-          id in openClaudes ? { state: "open", session: openClaudes[id] } : (claudeStates[id] ?? { state: "closed" }),
+          id in openClaudes
+            ? { state: "open", session: openClaudes[id], skipsPermissions: skippingClaudes.has(id) }
+            : (claudeStates[id] ?? { state: "closed" }),
         ]),
-      );
+      ));
     }
     if (cmd === "pty_cwds") {
       // Like the backend, only the requested sessions are answered.
@@ -341,7 +352,7 @@ describe("tabs", () => {
     expect(document.querySelector("#new-terminal svg")).not.toBeNull();
     await clickTerminal();
     expect(tabNames()).toEqual(["shell 1"]);
-    expect(tabs()[0].querySelector(".icon")).toBeNull();
+    expect(tabs()[0].querySelector<HTMLElement>(".icon")!.dataset.kind).toBe("terminal");
     expect(noTabs()).toBe(false);
     expect(spawns()[0]).toMatchObject({ kind: "terminal", command: null, claudeSession: null, cwd: null });
     expect(spawns()[0].tabId).toMatch(UUID);
@@ -353,7 +364,7 @@ describe("tabs", () => {
     expect(button.title).toBe("Open Claude in /home/me/work");
     expect(button.closest(".line")!.querySelector("button.row")!.textContent).toBe("work");
     await clickClaude();
-    expect(tabNames()).toEqual(["Claude 1"]);
+    expect(tabNames()).toEqual(["work"]);
     expect(tabs()[0].querySelector(".icon svg")).not.toBeNull();
     expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "/home/me/work", fallbackToHome: false });
     expect(spawns()[0]).not.toHaveProperty("command");
@@ -393,7 +404,7 @@ describe("tabs", () => {
     x.click();
     x.click();
     expect(callsOf("pty_kill").map((c) => c.args.id)).toEqual([2]);
-    expect(tabNames()).toEqual(["Claude 1", "Claude 3"]);
+    expect(tabNames()).toEqual(["work", "work"]);
     expect(terms()[1].disposed).toBe(true);
   });
 
@@ -401,7 +412,8 @@ describe("tabs", () => {
     await boot();
     await openClaudeTabs(2);
     tabs()[0].dispatchEvent(new MouseEvent("auxclick", { button: 1, bubbles: true }));
-    expect(tabNames()).toEqual(["Claude 2"]);
+    expect(callsOf("pty_kill").map((c) => c.args.id)).toEqual([1]);
+    expect(tabs()).toHaveLength(1);
   });
 
   test("closing the last tab keeps the window open and shows the hint", async () => {
@@ -412,22 +424,221 @@ describe("tabs", () => {
     expect(noTabs()).toBe(true);
   });
 
-  test("titles rename tabs until the user renames one", async () => {
+  test("titles show in the tooltip until the user renames the tab", async () => {
     await boot();
     await clickClaude();
     terms()[0].handlers.title("✳ Fix the build");
-    expect(tabNames()).toEqual(["✳ Fix the build"]);
+    expect(tabs()[0].title).toContain("✳ Fix the build");
     renameTab(0, "build");
     expect(tabNames()).toEqual(["build"]);
     terms()[0].handlers.title("✳ Something else");
     expect(tabNames()).toEqual(["build"]);
+    expect(tabs()[0].title).not.toContain("Something else");
   });
 
   test("Escape cancels a rename", async () => {
     await boot();
     await clickClaude();
     renameTab(0, "discarded", "Escape");
-    expect(tabNames()).toEqual(["Claude 1"]);
+    expect(tabNames()).toEqual(["work"]);
+  });
+});
+
+describe("tab labels", () => {
+  const tooltip = (i: number) => tabs()[i].title;
+
+  test("a tab is labelled with its folder's name", async () => {
+    await boot();
+    await clickClaude();
+    expect(tabNames()).toEqual(["work"]);
+  });
+
+  test("the label follows the tab's current directory", async () => {
+    await boot();
+    await clickClaude();
+    liveCwds[1] = "/home/me/src/raterm";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabNames()).toEqual(["raterm"]);
+    liveCwds[1] = "/home/me";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabNames()).toEqual(["~"]);
+  });
+
+  test("the terminal title and the full directory are in the tooltip", async () => {
+    await boot();
+    await clickClaude();
+    terms()[0].handlers.title("✳ Fix the build");
+    expect(tabNames()).toEqual(["work"]);
+    expect(tooltip(0)).toContain("✳ Fix the build");
+    expect(tooltip(0)).toContain("/home/me/work");
+  });
+
+  test("the rename box starts with what the tab shows", async () => {
+    await boot();
+    await clickClaude();
+    terms()[0].handlers.title("✳ Fix the build");
+    tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    expect(tabs()[0].querySelector("input")!.value).toBe("work");
+  });
+
+  test("a rename left unchanged keeps the tab following its folder", async () => {
+    await boot();
+    await clickClaude();
+    renameTab(0, "work");
+    liveCwds[1] = "/home/me/src";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabNames()).toEqual(["src"]);
+  });
+
+  test("a check while renaming keeps the rename box open", async () => {
+    await boot();
+    await clickTerminal();
+    tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    openClaudes[1] = SESSION;
+    liveCwds[1] = "/home/me/src";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    const input = tabs()[0].querySelector("input")!;
+    expect(input).not.toBeNull();
+    key(input, "Escape");
+    expect(tabs()[0].querySelector<HTMLElement>(".icon")!.dataset.kind).toBe("claude");
+    expect(tabNames()).toEqual(["src"]);
+  });
+
+  test("a renamed tab keeps its name wherever it goes", async () => {
+    await boot();
+    await clickClaude();
+    renameTab(0, "build");
+    liveCwds[1] = "/home/me/src";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabNames()).toEqual(["build"]);
+  });
+
+  test("a tab whose directory is not known yet shows its name", async () => {
+    await boot();
+    await clickTerminal();
+    expect(tabNames()).toEqual(["shell 1"]);
+    liveCwds[1] = "/home/me/app";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabNames()).toEqual(["app"]);
+  });
+
+  test("exited tabs are not polled", async () => {
+    await boot();
+    await clickClaude();
+    spawns()[0].onExit.onmessage(0);
+    const before = callsOf("pty_cwds").length;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS * 3);
+    expect(callsOf("pty_cwds").length).toBe(before);
+  });
+});
+
+describe("tab icons", () => {
+  const kind = (i: number) => tabs()[i].querySelector<HTMLElement>(".icon")?.dataset.kind;
+
+  test("Claude tabs show the Claude icon and terminal tabs a terminal icon", async () => {
+    await boot();
+    await clickClaude();
+    await clickTerminal();
+    expect([kind(0), kind(1)]).toEqual(["claude", "terminal"]);
+    expect(tabs()[1].querySelector(".icon svg")).not.toBeNull();
+  });
+
+  test("a terminal tab shows the Claude icon while Claude runs in it", async () => {
+    await boot();
+    await clickTerminal();
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(kind(0)).toBe("claude");
+    delete openClaudes[1];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(kind(0)).toBe("terminal");
+  });
+
+  test("a claude that bypassed the wrapper also counts", async () => {
+    await boot();
+    await clickTerminal();
+    claudeStates[1] = { state: "untracked", pid: 77 };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(kind(0)).toBe("claude");
+  });
+
+  test("a check that cannot tell keeps the icon", async () => {
+    await boot();
+    await clickTerminal();
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    delete openClaudes[1];
+    claudeStates[1] = { state: "unknown" };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(kind(0)).toBe("claude");
+  });
+
+  test("an exited terminal tab goes back to the terminal icon", async () => {
+    await boot();
+    await clickTerminal();
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    spawns()[0].onExit.onmessage(0);
+    expect(kind(0)).toBe("terminal");
+  });
+
+  test("a check that returns after the tab exited does not bring the Claude icon back", async () => {
+    await boot();
+    await clickTerminal();
+    openClaudes[1] = SESSION;
+    let release!: () => void;
+    claudeCheckGate = new Promise((r) => (release = r));
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    spawns()[0].onExit.onmessage(0);
+    release();
+    await flush();
+    expect(tabs()[0].querySelector<HTMLElement>(".icon")!.dataset.kind).toBe("terminal");
+    expect(tabs()[0].title).not.toContain("--dangerously-skip-permissions");
+  });
+
+  test("a slow check is not started again until it returns", async () => {
+    await boot();
+    await clickTerminal();
+    await vi.advanceTimersByTimeAsync(1000);
+    let release!: () => void;
+    claudeCheckGate = new Promise((r) => (release = r));
+    const before = callsOf("claude_open_sessions").length;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS * 3);
+    expect(callsOf("claude_open_sessions").length).toBe(before + 1);
+    release();
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(callsOf("claude_open_sessions").length).toBe(before + 2);
+  });
+
+  test("a Claude started in a terminal tab is saved by the next check", async () => {
+    await boot();
+    await clickTerminal();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(lastSaved()?.tabs[0].claudeSession).toBeNull();
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS + 500);
+    expect(lastSaved()?.tabs[0].claudeSession).toBe(SESSION);
+  });
+
+  test("an untracked claude that skips permissions is noted too", async () => {
+    await boot();
+    await clickTerminal();
+    claudeStates[1] = { state: "untracked", pid: 77, skipsPermissions: true };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
+  });
+
+  test("a terminal tab's Claude that skips permissions is noted in the tooltip, and the note goes with it", async () => {
+    await boot();
+    await clickTerminal();
+    openClaudes[1] = SESSION;
+    skippingClaudes.add(1);
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
+    expect(tabs()[0].querySelector(".badge")).toBeNull();
+    delete openClaudes[1];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabs()[0].title).not.toContain("--dangerously-skip-permissions");
   });
 });
 
@@ -595,7 +806,8 @@ describe("restoring tabs", () => {
   test("reopens each tab with its kind, directory, command and session", async () => {
     savedLayout = layout;
     await boot();
-    expect(tabNames()).toEqual(["agent", "✳ Review", "logs", "shell"]);
+    // An unnamed tab shows its folder, or its title while the folder is unknown.
+    expect(tabNames()).toEqual(["agent", "✳ Review", "logs", "app"]);
     const [a, b, c, d] = spawns();
     expect(a).toMatchObject({ tabId: "t3", kind: "claude", cwd: "/home/me/src", claudeSession: SESSION });
     expect(b.kind).toBe("claude");
@@ -605,7 +817,7 @@ describe("restoring tabs", () => {
     // The backend types `claude --resume` at this shell's prompt.
     expect(d).toMatchObject({ tabId: "t6", kind: "terminal", cwd: "/home/me/app", command: null, claudeSession: SESSION });
     expect(tabs()[1].classList.contains("active")).toBe(true);
-    expect(tabs()[2].querySelector(".icon")).toBeNull();
+    expect(tabs()[2].querySelector<HTMLElement>(".icon")!.dataset.kind).toBe("terminal");
   });
 
   test("kills leftover sessions before restoring", async () => {
@@ -628,7 +840,7 @@ describe("restoring tabs", () => {
     await boot();
     terms()[0].handlers.title("✳ x");
     terms()[1].handlers.title("✳ y");
-    expect(tabNames()).toEqual(["agent", "✳ y", "logs", "shell"]);
+    expect(tabNames()).toEqual(["agent", "✳ y", "logs", "app"]);
   });
 
   test("a vanished directory falls back to the home directory", async () => {
@@ -863,7 +1075,7 @@ describe("settings", () => {
     await boot();
     await openClaudeTabs(2);
     await openSettings();
-    expect(tabNames()).toEqual(["Claude 1", "Claude 2", "Settings"]);
+    expect(tabNames()).toEqual(["work", "work", "Settings"]);
     expect(tabs().map((t) => t.classList.contains("active"))).toEqual([false, false, true]);
     expect(pageShown()).toBe(true);
     expect([...document.querySelectorAll(".term.active")]).toHaveLength(0);
@@ -871,14 +1083,14 @@ describe("settings", () => {
     expect(setting("skipPermissions").checked).toBe(false);
 
     await openSettings();
-    expect(tabNames()).toEqual(["Claude 1", "Claude 2", "Settings"]);
+    expect(tabNames()).toEqual(["work", "work", "Settings"]);
     tabs()[0].click();
     expect(pageShown()).toBe(false);
     expect(tabs().map((t) => t.classList.contains("active"))).toEqual([true, false, false]);
     tabs()[2].click();
     expect(pageShown()).toBe(true);
     settingsTabX().click();
-    expect(tabNames()).toEqual(["Claude 1", "Claude 2"]);
+    expect(tabNames()).toEqual(["work", "work"]);
     expect(document.querySelectorAll(".term")[0].classList.contains("active")).toBe(true);
   });
 
@@ -1014,11 +1226,11 @@ describe("settings", () => {
     expect(pageError().textContent).toContain("Claude tabs start with permission prompts and auto memory off");
   });
 
-  test("Claude tabs started with skipped permissions are marked", async () => {
+  test("Claude tabs started with skipped permissions say so in the tooltip, with no badge", async () => {
     storedSettings = { ...DEFAULTS, skipPermissions: true };
     await boot();
     await openClaudeTabs(1);
-    expect(tabs()[0].querySelector(".badge")).not.toBeNull();
+    expect(tabs()[0].querySelector(".badge")).toBeNull();
     expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
     storedSettings = { ...DEFAULTS };
     terms()[0].handlers.title?.("busy");
@@ -1027,7 +1239,7 @@ describe("settings", () => {
     spawns()[0].onExit.onmessage(0);
     terms()[0].handlers.data("\r");
     for (let i = 0; i < 3; i++) await flush();
-    expect(tabs()[0].querySelector(".badge")).toBeNull();
+    expect(tabs()[0].title).not.toContain("--dangerously-skip-permissions");
   });
 
   test("without a database the page says settings are not kept", async () => {
@@ -1174,13 +1386,13 @@ describe("file tree", () => {
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
     button(".configure").click();
     await settle();
-    expect(tabNames()).toEqual(["Claude 1", "Settings", "Workspace settings"]);
+    expect(tabNames()).toEqual(["notes", "Settings", "Workspace settings"]);
     const shown = () => [...document.querySelectorAll(".page.active")].map((p) => p.id);
     expect(shown()).toEqual(["workspace-settings"]);
     tabs()[1].click();
     expect(shown()).toEqual(["settings"]);
     tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
-    expect(tabNames()).toEqual(["Claude 1", "Workspace settings"]);
+    expect(tabNames()).toEqual(["notes", "Workspace settings"]);
     expect(shown()).toEqual([]);
     expect(document.querySelectorAll(".term")[0].classList.contains("active")).toBe(true);
     tabs()[1].click();
@@ -1801,7 +2013,7 @@ describe("edge cases", () => {
   test("restores the layout fixture the Rust tests also parse", async () => {
     savedLayout = JSON.parse(sharedLayout);
     await boot();
-    expect(tabNames()).toEqual(["agent", "logs", "shell"]);
+    expect(tabNames()).toEqual(["agent", "logs", "app"]);
     expect(spawns()[0]).toMatchObject({ kind: "claude", tabId: "t1", claudeSession: SESSION, cwd: "/home/me/src" });
     expect(spawns()[1]).toMatchObject({ kind: "terminal", tabId: "t2", command: "tail -f syslog", claudeSession: null });
     expect(spawns()[2]).toMatchObject({ kind: "terminal", tabId: "t3", command: null, claudeSession: SESSION });
