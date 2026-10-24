@@ -17,7 +17,8 @@
     <div id="notice" role="status" hidden><span></span><button title="Dismiss"><span data-icon="x" data-size="14"></span></button></div>
     <div id="content">
       <aside id="sidebar">
-        <!-- A toolbox: a header (a toggle that collapses it, plus its own buttons) and a body; see setupToolbox in main.ts. -->
+        <!-- A toolbox: a header (a toggle that collapses it, plus its own buttons) and a body; see setupToolbox in main.ts.
+             Toolboxes are reordered by dragging their header; see src/toolbox.ts. -->
         <section class="toolbox" id="workspace-box">
           <header>
             <button class="toggle" title="Collapse or expand"><span class="chevron" data-icon="chevron-down" data-size="14"></span>Workspace</button>
@@ -35,6 +36,20 @@
           <div class="body">
             <ul class="flows"></ul>
             <p class="hint empty" hidden>No flows yet. Add one with the gear button.</p>
+            <p class="error" role="alert" hidden></p>
+          </div>
+        </section>
+        <!-- Claude sessions saved in the active tab's folder (see src/history.ts). -->
+        <section class="toolbox" id="history-box">
+          <header>
+            <button class="toggle" title="Collapse or expand"><span class="chevron" data-icon="chevron-down" data-size="14"></span>Session history</button>
+            <button class="refresh" title="Reload the sessions"><span data-icon="refresh-cw" data-size="14"></span></button>
+          </header>
+          <div class="body">
+            <ul class="sessions"></ul>
+            <button class="load-more" hidden>Load more</button>
+            <p class="note unreadable" hidden></p>
+            <p class="hint" hidden></p>
             <p class="error" role="alert" hidden></p>
           </div>
         </section>
@@ -56,6 +71,11 @@
                 </select>
               </label>
               <p class="hint">Auto leaves it to your Claude settings; Disable turns off Claude's auto memory. Applies to Claude tabs started, restarted or restored from now on, and to every <code>claude</code> started in a terminal tab.</p>
+            </fieldset>
+            <fieldset>
+              <h2><span data-icon="menu"></span>Sidebar</h2>
+              <button type="button" class="reset-sidebar">Reset sidebar</button>
+              <p class="hint">Puts the toolboxes back in their first order and opens them all. Drag a toolbox by its header (or press Alt+Up or Alt+Down on it) to move it.</p>
             </fieldset>
             <p class="hint not-saving" hidden>raterm is running without its database, so settings last only until it quits.</p>
             <p class="error" role="alert" hidden></p>

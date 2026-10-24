@@ -190,6 +190,15 @@ let activeRuns: Run[];
 /** The prompt flow_start and flow_continue return; a string makes them fail with it. */
 let runPrompt: string | null;
 let runRefusal: string | null;
+type Past = { id: string; title: string; cwd: string; modified: number };
+/** What claude_history lists per folder; other folders have none. */
+let pastSessions: Record<string, Past[]>;
+/** claude_history for a folder waits for its promise here, so a test can hold an answer back. */
+let historyGates: Record<string, Promise<void>>;
+/** How many transcripts claude_history reports it could not read. */
+let historyUnreadable: number;
+/** The session each tab's hook reported, by tab id (claude_tab_sessions). */
+let tabSessions: Record<string, string>;
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -340,6 +349,10 @@ beforeEach(() => {
   activeRuns = [];
   runPrompt = null;
   runRefusal = null;
+  pastSessions = {};
+  historyGates = {};
+  historyUnreadable = 0;
+  tabSessions = {};
   fsTree = { "~": [{ name: "work", dir: true }] };
   picker.picked = null;
   picker.fails = false;
@@ -384,6 +397,14 @@ beforeEach(() => {
         return { dir: listed, entries: fsTree[dir], truncated: false, skipped: fsHidden[dir] ?? 0 };
       });
     }
+    if (cmd === "claude_history") {
+      const { dir, limit } = args as { dir: string; limit: number };
+      return (historyGates[dir] ?? Promise.resolve()).then(() => {
+        const all = pastSessions[dir] ?? [];
+        return { sessions: all.slice(0, limit), more: all.length > limit, unreadable: historyUnreadable };
+      });
+    }
+    if (cmd === "claude_tab_sessions") return tabSessions;
     if (cmd === "settings_load") return settingsLoadGate.then(() => storedSettings);
     if (cmd === "settings_save") {
       // Like the backend (without its trimming): a changed workspace folder must exist.
@@ -3041,5 +3062,353 @@ describe("flow runs and Claude's state", () => {
     ok.click();
     await settle();
     expect(callsOf("flow_continue")).toHaveLength(1);
+  });
+});
+
+describe("session history", () => {
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) await flush();
+  };
+  const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+  const box = () => document.querySelector<HTMLElement>("#history-box")!;
+  const rows = () => [...box().querySelectorAll<HTMLElement>(".sessions > li")];
+  const titles = () => rows().map((li) => li.querySelector(".title")!.textContent);
+  const hint = () => box().querySelector<HTMLElement>(".hint")!;
+  const OTHER = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+  const past = (id: string, title: string, cwd = "/home/me/work"): Past => ({ id, title, cwd, modified: Date.now() - 60_000 });
+
+  beforeEach(() => {
+    pastSessions = { "/home/me/work": [past(SESSION, "Fix the build"), past(OTHER, "Add tests")] };
+  });
+
+  test("lists the Claude sessions of the active tab's folder, and follows the active tab", async () => {
+    await boot();
+    expect(rows()).toHaveLength(0);
+    expect(hint().hidden).toBe(false);
+    await openClaudeTabs(1);
+    await settle();
+    expect(titles()).toEqual(["Fix the build", "Add tests"]);
+    expect(callsOf("claude_history").at(-1)!.args).toEqual({ dir: "/home/me/work", limit: 10 });
+    liveCwds = { 1: "/elsewhere" };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    expect(callsOf("claude_history").at(-1)!.args).toEqual({ dir: "/elsewhere", limit: 10 });
+    expect(rows()).toHaveLength(0);
+    expect(hint().textContent).toContain("No Claude sessions");
+  });
+
+  test("clicking a session resumes it in the active Claude tab", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(typed()).toEqual([`\x1b[200~/resume ${OTHER}\x1b[201~`, "\r"]);
+  });
+
+  test("in a terminal tab it starts claude at the shell prompt, or resumes in the Claude running there", async () => {
+    await boot();
+    liveCwds = { 1: "/home/me/work" };
+    await clickTerminal();
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    expect(typed()).toEqual([`claude --resume ${SESSION}\r`]);
+    openClaudes = { 1: OTHER };
+    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(typed().slice(1)).toEqual([`\x1b[200~/resume ${SESSION}\x1b[201~`, "\r"]);
+  });
+
+  test("an exited tab is not typed into", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    spawns()[0].onExit.onmessage(0);
+    await settle();
+    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    expect(typed()).toEqual([]);
+    expect(noticeText()).toContain("not running");
+  });
+
+  test("the new-tab button resumes the session in a new Claude tab in its folder", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    rows()[1].querySelector<HTMLButtonElement>("button.new-tab")!.click();
+    await settle();
+    expect(spawns()[1]).toMatchObject({ kind: "claude", claudeSession: OTHER, cwd: "/home/me/work" });
+    expect(tabs()).toHaveLength(2);
+  });
+
+  test("shows the newest 10, and Load more shows 10 more until there are none", async () => {
+    const many = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
+    pastSessions = { "/home/me/work": many, "/elsewhere": many };
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    const more = () => box().querySelector<HTMLButtonElement>("button.load-more")!;
+    expect(rows()).toHaveLength(10);
+    expect(callsOf("claude_history").at(-1)!.args).toEqual({ dir: "/home/me/work", limit: 10 });
+    more().click();
+    await settle();
+    expect(rows()).toHaveLength(20);
+    more().click();
+    await settle();
+    expect(rows()).toHaveLength(25);
+    expect(more().hidden).toBe(true);
+    // Another folder starts again at 10.
+    liveCwds = { 1: "/elsewhere" };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    expect(rows()).toHaveLength(10);
+    expect(more().hidden).toBe(false);
+  });
+
+  test("a session open in a tab is marked, and clicking it shows that tab instead of resuming", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    tabSessions = { [spawns()[0].tabId]: OTHER, [spawns()[1].tabId]: SESSION };
+    box().querySelector<HTMLButtonElement>(".refresh")!.click();
+    await settle();
+    expect(rows().map((li) => li.querySelector(".open")?.textContent)).toEqual(["this tab", "in work"]);
+    rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    expect(tabs()[0].classList.contains("active")).toBe(true);
+    rows()[1].querySelector<HTMLButtonElement>("button.new-tab")!.click();
+    await settle();
+    expect(spawns()).toHaveLength(2);
+    expect(typed()).toEqual([]);
+  });
+
+  test("an answer for a folder the tab has left is dropped", async () => {
+    pastSessions["/elsewhere"] = [past(OTHER, "Elsewhere", "/elsewhere")];
+    let release!: () => void;
+    historyGates["/home/me/work"] = new Promise((r) => (release = r));
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    liveCwds = { 1: "/elsewhere" };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    release();
+    await settle();
+    expect(titles()).toEqual(["Elsewhere"]);
+  });
+
+  test("a reload that changes nothing keeps the rows, and the focus in them", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    const button = rows()[1].querySelector<HTMLButtonElement>("button.new-tab")!;
+    button.focus();
+    box().querySelector<HTMLButtonElement>(".refresh")!.click();
+    await settle();
+    expect(rows()[1].querySelector("button.new-tab")).toBe(button);
+    expect(document.activeElement).toBe(button);
+  });
+
+  test("the box is read every 10 seconds only while it can be seen", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    const reads = () => callsOf("claude_history").length;
+    let before = reads();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads()).toBeGreaterThan(before);
+    box().querySelector<HTMLButtonElement>(".toggle")!.click();
+    before = reads();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reads()).toBe(before);
+    // Shown again, it is read at once.
+    box().querySelector<HTMLButtonElement>(".toggle")!.click();
+    await settle();
+    expect(reads()).toBe(before + 1);
+    document.querySelector<HTMLButtonElement>("#toggle-sidebar")!.click();
+    before = reads();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reads()).toBe(before);
+  });
+
+  test("a failed Load more keeps the sessions shown, and the next try asks for the same page", async () => {
+    pastSessions["/home/me/work"] = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    failing.add("claude_history");
+    box().querySelector<HTMLButtonElement>("button.load-more")!.click();
+    await settle();
+    expect(rows()).toHaveLength(10);
+    expect(box().querySelector<HTMLElement>(".error")!.hidden).toBe(false);
+    failing.delete("claude_history");
+    box().querySelector<HTMLButtonElement>("button.load-more")!.click();
+    await settle();
+    expect(callsOf("claude_history").at(-1)!.args).toMatchObject({ limit: 20 });
+    expect(rows()).toHaveLength(20);
+    expect(box().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
+  });
+
+  test("transcripts that could not be read are counted in the box", async () => {
+    historyUnreadable = 2;
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    const note = box().querySelector<HTMLElement>(".unreadable")!;
+    expect(note.hidden).toBe(false);
+    expect(note.textContent).toContain("2 sessions could not be read");
+  });
+
+  test("a tab running a flow is not switched to another session", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [{
+      id: 5, flowId: 1, flowName: "Deploy", tabId: spawns()[0].tabId, stepId: "p", step: "Fix",
+      status: "running", note: null, outputs: ["pass"], steps: 1,
+    }];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(typed()).toEqual([]);
+    expect(noticeText()).toContain("flow");
+  });
+
+  test("when a terminal tab cannot be checked for Claude, nothing is typed", async () => {
+    await boot();
+    liveCwds = { 1: "/home/me/work" };
+    await clickTerminal();
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    failing.add("claude_open_sessions");
+    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    expect(typed()).toEqual([]);
+    expect(noticeText()).toContain("could not tell");
+  });
+
+  test("the refresh button reads the sessions again, and a failure is shown", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    pastSessions["/home/me/work"].push(past("9b2e1f0c-1d2e-4f3a-8b4c-5d6e7f8a9b0c", "Third"));
+    box().querySelector<HTMLButtonElement>(".refresh")!.click();
+    await settle();
+    expect(titles()).toEqual(["Fix the build", "Add tests", "Third"]);
+    failing.add("claude_history");
+    box().querySelector<HTMLButtonElement>(".refresh")!.click();
+    await settle();
+    expect(box().querySelector<HTMLElement>(".error")!.hidden).toBe(false);
+  });
+});
+
+describe("toolbox order", () => {
+  const order = () => [...document.querySelectorAll<HTMLElement>("#sidebar .toolbox")].map((b) => b.id);
+  const header = (id: string) => document.querySelector<HTMLElement>(`#${id} header .toggle`)!;
+  const mouse = (target: EventTarget, type: string, clientY: number) =>
+    target.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0, clientY }));
+
+  beforeEach(() => {
+    // Each toolbox is 100px tall, stacked in its current order from the sidebar's top at 0.
+    const top = (el: HTMLElement) => Math.max([...document.querySelectorAll("#sidebar .toolbox")].indexOf(el), 0) * 100;
+    vi.spyOn(HTMLElement.prototype, "offsetTop", "get").mockImplementation(function (this: HTMLElement) {
+      return top(this);
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockReturnValue(100);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      const t = this.id === "sidebar" ? 0 : top(this);
+      return { top: t, bottom: t + 100, height: 100, left: 0, right: 200, width: 200, x: 0, y: t, toJSON() {} } as DOMRect;
+    });
+  });
+
+  /** Drags a toolbox by its header to `y`, then releases it, with the click a browser sends after. */
+  function drag(id: string, y: number) {
+    const start = order().indexOf(id) * 100 + 10;
+    mouse(header(id), "mousedown", start);
+    mouse(document, "mousemove", start + 2);
+    mouse(document, "mousemove", y);
+    mouse(document, "mouseup", y);
+    header(id).click();
+  }
+
+  test("a toolbox dragged by its header moves, without collapsing, and the order is remembered", async () => {
+    await boot();
+    expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
+    drag("history-box", 10);
+    expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
+    expect(document.querySelector("#history-box")!.classList.contains("collapsed")).toBe(false);
+    drag("workspace-box", 290);
+    expect(order()).toEqual(["history-box", "flows-box", "workspace-box"]);
+    // Let go, it settles into its place.
+    expect(document.querySelector<HTMLElement>("#workspace-box")!.style.transform).toBe("");
+    // A fresh app instance on a fresh page.
+    vi.resetModules();
+    await boot();
+    expect(order()).toEqual(["history-box", "flows-box", "workspace-box"]);
+  });
+
+  test("Alt+Up and Alt+Down on a header move its toolbox, and the order is remembered", async () => {
+    await boot();
+    const keyOn = (id: string, key: string) =>
+      header(id).dispatchEvent(new KeyboardEvent("keydown", { key, altKey: true, bubbles: true }));
+    keyOn("history-box", "ArrowUp");
+    expect(order()).toEqual(["workspace-box", "history-box", "flows-box"]);
+    keyOn("workspace-box", "ArrowDown");
+    expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
+    expect(document.activeElement).toBe(header("workspace-box"));
+    vi.resetModules();
+    await boot();
+    expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
+  });
+
+  test("Reset sidebar on the Settings page restores the order and opens every toolbox", async () => {
+    await boot();
+    drag("history-box", 10);
+    header("flows-box").click();
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    for (let i = 0; i < 6; i++) await flush();
+    document.querySelector<HTMLButtonElement>("#settings .reset-sidebar")!.click();
+    expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
+    expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(false);
+    vi.resetModules();
+    await boot();
+    expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
+    expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(false);
+  });
+
+  test("a drag released outside the window does not swallow a later click", async () => {
+    await boot();
+    const start = 210;
+    mouse(header("history-box"), "mousedown", start);
+    mouse(document, "mousemove", start + 2);
+    mouse(document, "mousemove", 10);
+    mouse(document, "mouseup", 10);
+    // No click follows; a while later the person clicks a header.
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 5_000);
+    header("flows-box").click();
+    expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(true);
+  });
+
+  test("a click without a drag still collapses", async () => {
+    await boot();
+    mouse(header("flows-box"), "mousedown", 110);
+    mouse(document, "mouseup", 111);
+    header("flows-box").click();
+    expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(true);
+    expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
+  });
+
+  test("a stored order with unknown or missing toolboxes keeps the others in place", async () => {
+    localStorage.setItem("raterm.toolboxOrder", JSON.stringify(["flows-box", "gone-box"]));
+    await boot();
+    expect(order()).toEqual(["flows-box", "workspace-box", "history-box"]);
+    vi.resetModules();
+    localStorage.setItem("raterm.toolboxOrder", "not json");
+    await boot();
+    expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
   });
 });

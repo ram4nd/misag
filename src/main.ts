@@ -12,6 +12,8 @@ import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
 import { createFlows, type Flow, type Run } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
+import { createHistory, type Page as HistoryPage, type Past } from "./history";
+import { remember, remembered, setupToolboxes } from "./toolbox";
 
 /**
  * What a tab runs, tagged by `kind`; each kind has only its own fields.
@@ -164,6 +166,9 @@ const UNTRACKED_GRACE_MS = 10_000;
 
 /** How often the tabs' directories and terminal tabs' Claude are checked (see `pollTabs`). */
 const TAB_POLL_MS = 2_000;
+
+/** How often the Session history box, while it can be seen, reads the active folder's sessions again, as Claude adds to them. */
+const HISTORY_POLL_MS = 10_000;
 
 /** Tab changes are saved this long after the last one, so a burst is one save. */
 const SAVE_DELAY_MS = 300;
@@ -470,6 +475,7 @@ function activate(s: Session) {
   active = s;
   shownPage = null;
   showActive();
+  showHistory();
   requestAnimationFrame(() => {
     s.fit.fit();
     s.term.focus();
@@ -517,6 +523,7 @@ function close(s: Session) {
     if (next && shownPage === null) activate(next);
     else active = next;
   }
+  showHistory();
   scheduleSave();
 }
 
@@ -646,8 +653,9 @@ let polling = false;
 
 /**
  * Checks the running tabs' directories and the Claude in terminal tabs, so labels
- * and icons follow them, and saves when either changed (a Claude starting or
- * quitting in a terminal tab changes nothing else). Answers for a tab that exited,
+ * and icons follow them. When either changed it saves (a Claude starting or
+ * quitting in a terminal tab changes nothing else) and shows the Session history
+ * of the active tab's folder, which may have changed. Answers for a tab that exited,
  * restarted or closed meanwhile are dropped.
  */
 async function pollTabs() {
@@ -671,7 +679,10 @@ async function pollTabs() {
       changed = true;
       updateTab(s);
     }
-    if (changed) scheduleSave();
+    if (changed) {
+      showHistory();
+      scheduleSave();
+    }
   } catch (err) {
     console.error("raterm: could not check the tabs", err);
   } finally {
@@ -1181,24 +1192,6 @@ new ResizeObserver(() => {
   if (shownPage === null) active?.fit.fit();
 }).observe(termsEl);
 
-/** Remembers an on/off UI choice. Storage can be unavailable; these are only conveniences. */
-function remember(key: string, on: boolean) {
-  try {
-    localStorage.setItem(key, on ? "1" : "0");
-  } catch (err) {
-    console.debug("raterm: could not remember", key, err);
-  }
-}
-
-function remembered(key: string): boolean {
-  try {
-    return localStorage.getItem(key) === "1";
-  } catch (err) {
-    console.debug("raterm: could not recall", key, err);
-    return false;
-  }
-}
-
 const SIDEBAR_KEY = "raterm.sidebarCollapsed";
 function setSidebar(collapsed: boolean) {
   document.body.classList.toggle("sidebar-collapsed", collapsed);
@@ -1207,20 +1200,10 @@ function setSidebar(collapsed: boolean) {
 setSidebar(remembered(SIDEBAR_KEY));
 $("#toggle-sidebar").onclick = () => {
   setSidebar(!document.body.classList.contains("sidebar-collapsed"));
+  reloadHistoryIfShown();
   active?.term.focus();
 };
 
-/** Wires a sidebar toolbox's header button to collapse it, remembering the choice under `name`. */
-function setupToolbox(box: HTMLElement, name: string) {
-  const key = `raterm.toolbox.${name}.collapsed`;
-  box.classList.toggle("collapsed", remembered(key));
-  box.querySelector<HTMLButtonElement>(".toggle")!.onclick = () => {
-    const collapsed = !box.classList.contains("collapsed");
-    box.classList.toggle("collapsed", collapsed);
-    remember(key, collapsed);
-  };
-}
-setupToolbox(workspaceBox, "workspace");
 workspaceBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => tree.reload();
 workspaceBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("workspace");
 const flowsBox = $<HTMLElement>("#flows-box");
@@ -1248,6 +1231,8 @@ const flows = createFlows({
 const PASTE_SUBMIT_MS = 150;
 /** Tabs whose flow run waits for the person, marked in the tab bar. */
 const waitingTabs = new Set<string>();
+/** Tabs with a flow run, so the Session history box does not switch them to another session. */
+const runTabs = new Set<string>();
 
 /**
  * Types `text` into the tab as one paste and sends it, as if the person had. The
@@ -1328,7 +1313,11 @@ async function pollRuns() {
     runsError = null;
     flows.showRuns(runs);
     waitingTabs.clear();
-    for (const run of runs) if (run.status !== "running") waitingTabs.add(run.tabId);
+    runTabs.clear();
+    for (const run of runs) {
+      runTabs.add(run.tabId);
+      if (run.status !== "running") waitingTabs.add(run.tabId);
+    }
     sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", waitingTabs.has(s.tabId)));
   } catch (err) {
     console.error("raterm: could not read the flow runs", err);
@@ -1384,10 +1373,107 @@ pages.flows.load = async () => {
     showPageError(pages.flows, `Flows could not be read (${errorText(err)}). Close and reopen this tab to try again.`);
   }
 };
-setupToolbox(flowsBox, "flows");
 flowsBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("flows");
 // A failure is already logged and shown in the Flows box.
 flows.reload().catch(() => {});
+
+const historyBox = $<HTMLElement>("#history-box");
+const sessionHistory = createHistory({
+  box: historyBox,
+  list: async (dir, limit) => {
+    const [page] = await Promise.all([invoke<HistoryPage>("claude_history", { dir, limit }), readTabSessions()]);
+    return page;
+  },
+  errorText,
+  openIn: (id) => {
+    const s = tabWithSession(id);
+    return !s ? null : s === active ? "this tab" : `in ${tabLabel(s)}`;
+  },
+  onResume: (past) =>
+    resumeHere(past).catch((err) => {
+      console.error("raterm: could not resume the session", err);
+      setNotice("history", `“${past.title}” could not be resumed: ${errorText(err)}.`);
+    }),
+  onOpenTab: (past) => {
+    const s = tabWithSession(past.id);
+    if (s) return activate(s);
+    openTab({ kind: "claude", claudeSession: past.id }, undefined, past.cwd);
+  },
+});
+const toolboxes = setupToolboxes($<HTMLElement>("#sidebar"), (box) => {
+  if (box === historyBox) reloadHistoryIfShown();
+});
+$<HTMLButtonElement>("#settings .reset-sidebar").onclick = () => toolboxes.reset();
+historyBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => void sessionHistory.reload();
+
+/** Shows the sessions of the active tab's folder; a tab whose folder is not known yet started in home. */
+function showHistory() {
+  sessionHistory.show(active ? (tabDir(active) ?? "~") : null);
+}
+
+/** The Claude session each tab's hook last reported, by tab id, as last read. */
+let reportedSessions: Record<string, string> = {};
+
+/** Reads which session each tab is in; if that fails, the last answer is kept. */
+async function readTabSessions() {
+  try {
+    reportedSessions = await invoke<Record<string, string>>("claude_tab_sessions");
+  } catch (err) {
+    console.error("raterm: could not read the tabs' Claude sessions", err);
+  }
+}
+
+/** The running tab that has Claude session `id` open, if any. */
+function tabWithSession(id: string): Session | undefined {
+  return sessions.find((s) => {
+    if (s.exited || s.closing) return false;
+    const open = s.run.kind === "claude" ? (reportedSessions[s.tabId] ?? s.run.claudeSession) : s.claudeOpen;
+    return open === id;
+  });
+}
+
+/** Whether Claude runs in the tab: asked now for a terminal tab; "unknown" if that check fails. */
+async function claudeIn(s: Session): Promise<"yes" | "no" | "unknown"> {
+  if (s.run.kind === "claude") return "yes";
+  const state = (await claudeStates([s]))[s.id!];
+  if (!state || state.state === "unknown") return "unknown";
+  return state.state === "closed" ? "no" : "yes";
+}
+
+/**
+ * Resumes a past session in the active tab: with /resume in the Claude running
+ * there, else with `claude --resume` at its shell prompt. A session already open
+ * in a tab shows that tab instead, so one conversation never runs twice. The id
+ * came from the backend as a validated UUID, so it is safe to type.
+ */
+async function resumeHere(past: Past) {
+  const open = tabWithSession(past.id);
+  if (open) {
+    setNotice("history", null);
+    return activate(open);
+  }
+  const s = active;
+  const not = `“${past.title}” was not resumed:`;
+  const running = (t: Session | null): t is Session => !!t && !t.exited && !t.closing && t.id !== null && sessions.includes(t);
+  if (!running(s)) return setNotice("history", `${not} the active tab is not running. Its new-tab button opens it in a new tab.`);
+  if (runTabs.has(s.tabId)) return setNotice("history", `${not} “${tabLabel(s)}” runs a flow; stop the run first.`);
+  const claude = await claudeIn(s);
+  if (!running(s)) return setNotice("history", `${not} the tab stopped meanwhile.`);
+  if (claude === "unknown") return setNotice("history", `${not} raterm could not tell whether Claude runs in “${tabLabel(s)}”.`);
+  if (claude === "yes") typePrompt(s, `/resume ${past.id}`);
+  else write(s, encoder.encode(`claude --resume ${past.id}\r`));
+  setNotice("history", null);
+  activate(s);
+}
+
+/** Whether the Session history box can be seen: open, with the sidebar shown, in a visible window. */
+const historyShown = () =>
+  !historyBox.classList.contains("collapsed") && !document.body.classList.contains("sidebar-collapsed") && !document.hidden;
+
+function reloadHistoryIfShown() {
+  if (historyShown()) void sessionHistory.reload();
+}
+document.addEventListener("visibilitychange", reloadHistoryIfShown);
 // The path field is read-only: clicking it (or Enter or Space on it) opens the folder picker.
 const workspaceInput = pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement;
 const pickWorkspace = () =>
@@ -1463,6 +1549,7 @@ setInterval(checkStore, STORE_POLL_MS);
 // flow runs move on in the Stop hook.
 setInterval(pollTabs, TAB_POLL_MS);
 setInterval(pollRuns, TAB_POLL_MS);
+setInterval(reloadHistoryIfShown, HISTORY_POLL_MS);
 restore().catch((err) => {
   console.error("raterm: restore failed", err);
   canSave = false;

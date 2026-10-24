@@ -89,14 +89,23 @@ body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
 
 /* ---------- toolboxes ---------- */
 .toolbox { display: flex; flex-direction: column; min-height: 0; flex: 0 1 auto; }
-.toolbox:not(.collapsed) { flex: 1 1 auto; }
+/* Open toolboxes share the height equally; a line separates each from the one above. */
+.toolbox:not(.collapsed) { flex: 1 1 0; }
+.toolbox + .toolbox { border-top: 1px solid var(--line); }
+.toolbox header { cursor: grab; }
+/* The dragged toolbox is lifted above the others, which slide past under it (see setupToolboxOrder). */
+#sidebar { position: relative; }
+.toolbox { background: var(--panel); transition: box-shadow .15s; }
+.toolbox.dragging { position: relative; z-index: 2; box-shadow: 0 6px 20px rgb(0 0 0 / .18), 0 0 0 1px var(--line); border-radius: 4px; }
+body.dragging-toolbox, body.dragging-toolbox * { cursor: grabbing !important; user-select: none; }
 .toolbox header { flex: none; display: flex; align-items: center; padding: 4px 6px 4px 4px; }
 .toolbox header button { background: none; color: var(--muted); padding: 4px 6px; white-space: nowrap; }
 .toolbox header button:hover { background: var(--press); color: var(--fg); }
 .toolbox .toggle { flex: 1; display: flex; align-items: center; gap: 4px; text-align: left; font-weight: 600; }
 .toolbox .chevron { width: 14px; transition: transform .1s; }
 .toolbox.collapsed .chevron { transform: rotate(-90deg); }
-.toolbox .body { flex: 1; min-height: 0; overflow: auto; }
+/* The gutter keeps the scrollbar off the buttons at the right edge of rows. */
+.toolbox .body { flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
 .toolbox.collapsed .body { display: none; }
 
 /* ---------- file tree ---------- */
@@ -306,3 +315,26 @@ svg.lucide { display: block; flex: none; }
 #flows-box .runs .run-note { padding: 3px 6px; }
 /* A tab whose flow run waits for the person. */
 .tab.needs-you .name::after { content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 6px; border-radius: 50%; background: #e8710a; vertical-align: middle; }
+
+/* ---------- session history (see src/history.ts) ---------- */
+#history-box .sessions { list-style: none; margin: 0; padding: 2px 0; }
+#history-box .sessions li { display: flex; align-items: center; padding-right: 6px; }
+#history-box .sessions li:hover { background: var(--hover); }
+#history-box .resume {
+  flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; padding: 3px 4px 3px 10px;
+  border-radius: 0; background: none; text-align: left; white-space: nowrap;
+}
+#history-box .title { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+#history-box .age { flex: none; color: var(--muted); font-size: 11px; }
+#history-box .new-tab {
+  flex: none; display: grid; visibility: hidden; place-items: center; width: 22px; height: 22px; padding: 0;
+  border-radius: 4px; background: none; color: var(--muted);
+}
+#history-box li:hover .new-tab, #history-box li:focus-within .new-tab { visibility: visible; }
+#history-box .new-tab:hover { background: var(--press); color: var(--fg); }
+#history-box .hint, #history-box .error, #history-box .note { margin: 4px 10px; color: var(--muted); }
+#history-box .open { flex: none; color: var(--accent); font-size: 11px; }
+#history-box .error { color: #b3261e; }
+#history-box [hidden] { display: none; }
+#history-box .load-more { display: block; margin: 4px 10px 8px; padding: 2px 8px; }
+@media (prefers-reduced-motion: reduce) { .toolbox { transition: none; } }

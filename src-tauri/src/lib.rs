@@ -3,6 +3,7 @@ mod commands;
 pub mod db;
 pub mod files;
 pub mod flows;
+pub mod history;
 pub mod runs;
 pub mod layout;
 pub mod session;
@@ -139,6 +140,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(sessions)
         .manage(exe)
+        .manage(history::Cache::default())
         .setup(|app| {
             // Debug builds keep their data in a subdirectory, so even a dev build run
             // without the dev config's identifier never touches an installed raterm's.
@@ -164,6 +166,8 @@ pub fn run() {
             commands::settings_load,
             commands::settings_save,
             commands::fs_list,
+            commands::claude_history,
+            commands::claude_tab_sessions,
             commands::flows_list,
             commands::flow_create,
             commands::flow_rename,

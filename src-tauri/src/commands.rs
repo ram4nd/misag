@@ -558,6 +558,15 @@ pub fn fs_list(dir: String) -> Result<crate::files::Listing, CommandError> {
     Ok(crate::files::list(&dir)?)
 }
 
+/// The newest `limit` conversations Claude saved in `dir`, for the Session history box.
+#[tauri::command(async)]
+pub fn claude_history(cache: State<'_, crate::history::Cache>, dir: String, limit: usize) -> Result<crate::history::Page, CommandError> {
+    let Some(projects) = claude::projects_dir() else {
+        return Err("Claude's config folder is unknown: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string().into());
+    };
+    Ok(cache.list(&projects, &session::expand_tilde(&dir), limit)?)
+}
+
 #[tauri::command(async)]
 pub fn layout_load(db: State<'_, Db>) -> Result<Layout, CommandError> {
     Ok(db.load_layout()?)
@@ -593,6 +602,13 @@ pub fn store_status(db: State<'_, Db>, wrapper: State<'_, Wrapper>) -> StoreRepo
 #[tauri::command(async)]
 pub fn claude_reported(db: State<'_, Db>, tab_id: TabId, since: u64) -> Result<bool, CommandError> {
     Ok(db.claude_reported(&tab_id, since)?)
+}
+
+/// The Claude session each tab's hook last reported, by tab id, so the Session
+/// history box can tell which sessions are open in a tab.
+#[tauri::command(async)]
+pub fn claude_tab_sessions(db: State<'_, Db>) -> Result<HashMap<String, SessionId>, CommandError> {
+    Ok(db.reported_sessions()?)
 }
 
 #[cfg(test)]

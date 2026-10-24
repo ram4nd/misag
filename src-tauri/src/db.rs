@@ -13,6 +13,7 @@ use crate::layout::{Layout, Tab, TabId, TabKind};
 use crate::settings::Settings;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -495,6 +496,25 @@ impl Db {
             .optional()
             .map_err(sql)?;
         id.map(|id| SessionId::parse(&id).map_err(|e| format!("tab {tab_id}: {e}"))).transpose()
+    }
+
+    /// The session the hook last reported for every tab, by tab id. A row this
+    /// version cannot read is left out (and logged).
+    pub fn reported_sessions(&self) -> Result<HashMap<String, SessionId>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT tab_id, session_id FROM claude_sessions").map_err(sql)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(sql)?;
+        let mut sessions = HashMap::new();
+        for row in rows {
+            let (tab_id, id) = row.map_err(sql)?;
+            match SessionId::parse(&id) {
+                Ok(id) => {
+                    sessions.insert(tab_id, id);
+                }
+                Err(e) => eprintln!("raterm: tab {tab_id}: {e}"),
+            }
+        }
+        Ok(sessions)
     }
 
     /// The session the hook last reported for `tab_id` if the Claude process `pid`
@@ -1246,6 +1266,20 @@ pub(crate) mod tests {
         assert_eq!(db.reported_session(&tid("a")).unwrap(), None);
         record_claude_session(&connect_existing(&path).unwrap(), &report(&tid("a"), &sid(S2))).unwrap();
         assert_eq!(db.reported_session(&tid("a")).unwrap(), Some(sid(S2)));
+    }
+
+    #[test]
+    fn lists_the_session_each_tab_reported() {
+        let path = temp_db("reported-sessions");
+        let db = Db::open(path.clone()).unwrap();
+        assert!(db.reported_sessions().unwrap().is_empty());
+        let conn = connect_existing(&path).unwrap();
+        record_claude_session(&conn, &report(&tid("a"), &sid(S1))).unwrap();
+        record_claude_session(&conn, &report(&tid("b"), &sid(S2))).unwrap();
+        let all = db.reported_sessions().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["a"], sid(S1));
+        assert_eq!(all["b"], sid(S2));
     }
 
     #[test]
