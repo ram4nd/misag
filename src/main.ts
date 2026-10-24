@@ -10,6 +10,7 @@ import "@xterm/xterm/css/xterm.css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
+import { createFlows } from "./flows";
 
 /**
  * What a tab runs, tagged by `kind`; each kind has only its own fields.
@@ -203,8 +204,10 @@ interface Page {
   form: HTMLFormElement;
   /** Its tab in the tab bar while it is open. */
   tabEl: HTMLElement | null;
+  /** Fills the page when its tab opens, enabling its form; by default from the stored settings (`loadPage`). */
+  load?: () => Promise<void>;
 }
-type PageId = "settings" | "workspace";
+type PageId = "settings" | "workspace" | "flows";
 function page(title: string, icon: IconName, unreadable: string, sel: string): Page {
   const el = $<HTMLElement>(sel);
   return { title, icon, unreadable, el, form: el.querySelector("form")!, tabEl: null };
@@ -217,6 +220,7 @@ const pages: Record<PageId, Page> = {
     "so the Workspace box shows your home directory and its folder cannot be changed.",
     "#workspace-settings",
   ),
+  flows: page("Flows", "workflow", "", "#flows-settings"),
 };
 const pageIds = Object.keys(pages) as PageId[];
 const settingsForm = pages.settings.form;
@@ -703,6 +707,11 @@ function readSettingsForm(): Settings {
   };
 }
 
+/** Enables or disables every control on the page (each part of it is a fieldset). */
+function enablePage(p: Page, on: boolean) {
+  for (const fieldset of p.el.querySelectorAll("fieldset")) fieldset.disabled = !on;
+}
+
 function showPageError(p: Page, message: string | null) {
   const el = p.form.querySelector<HTMLElement>(".error")!;
   el.hidden = !message;
@@ -720,7 +729,7 @@ async function loadPage(p: Page) {
     fillSettingsForms();
     showWorkspace();
     showPageError(p, null);
-    p.form.querySelector("fieldset")!.disabled = false;
+    enablePage(p, true);
   } catch (err) {
     console.error("raterm: could not load settings", err);
     showPageError(p, `Settings could not be read (${errorText(err)}), ${p.unreadable}`);
@@ -757,9 +766,10 @@ function openPage(id: PageId) {
   const p = pages[id];
   if (!openPages.includes(id)) {
     openPages.push(id);
-    // Disabled now, not when the queued load starts, so nothing can change before it.
-    p.form.querySelector("fieldset")!.disabled = true;
-    queueSettings(() => loadPage(p));
+    // Disabled now, not when the load starts, so nothing can change before it.
+    enablePage(p, false);
+    if (p.load) p.load();
+    else queueSettings(() => loadPage(p));
   }
   shownPage = id;
   renderSessions();
@@ -1174,6 +1184,27 @@ function setupToolbox(box: HTMLElement, name: string) {
 setupToolbox(workspaceBox, "workspace");
 workspaceBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => tree.reload();
 workspaceBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("workspace");
+const flowsBox = $<HTMLElement>("#flows-box");
+const flows = createFlows({
+  box: flowsBox,
+  page: pages.flows.el,
+  errorText,
+  showError: (message) => showPageError(pages.flows, message),
+});
+// The page stays disabled if the flows cannot be read, so nothing is changed blindly.
+pages.flows.load = async () => {
+  try {
+    await flows.reload();
+    showPageError(pages.flows, null);
+    enablePage(pages.flows, true);
+  } catch (err) {
+    showPageError(pages.flows, `Flows could not be read (${errorText(err)}). Close and reopen this tab to try again.`);
+  }
+};
+setupToolbox(flowsBox, "flows");
+flowsBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("flows");
+// A failure is already logged and shown in the Flows box.
+flows.reload().catch(() => {});
 // The path field is read-only: clicking it (or Enter or Space on it) opens the folder picker.
 const workspaceInput = pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement;
 const pickWorkspace = () =>

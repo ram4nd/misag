@@ -64,6 +64,18 @@ const MIGRATIONS: &[&str] = &[r#"
     -- Whether Claude tabs get `autoMemoryEnabled: false`; 0 leaves it to the user's config.
     ALTER TABLE settings ADD COLUMN disable_auto_memory INTEGER NOT NULL DEFAULT 0
         CHECK (disable_auto_memory IN (0, 1));
+"#, r#"
+    -- The user's flows of prompts, in the order the sidebar lists them. `graph` is
+    -- the flow's steps as JSON. Runs of flows get their own tables with the runner.
+    CREATE TABLE flows (
+        id         INTEGER PRIMARY KEY,
+        name       TEXT NOT NULL CHECK (trim(name) <> ''),
+        position   INTEGER NOT NULL,
+        archived   INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+        graph      TEXT NOT NULL DEFAULT '{"nodes":[],"edges":[]}',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -476,6 +488,105 @@ impl Db {
                  UPDATE claude_sessions SET claude_pid = NULL;",
             )
             .map_err(sql)
+    }
+}
+
+/// A flow as the sidebar lists it. Mirrored by `Flow` in src/flows.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowSummary {
+    pub id: i64,
+    pub name: String,
+    pub archived: bool,
+}
+
+/// A flow's name as stored: trimmed, and not empty.
+fn flow_name(name: &str) -> Result<&str, String> {
+    match name.trim() {
+        "" => Err("a flow needs a name".into()),
+        name => Ok(name),
+    }
+}
+
+fn now_secs() -> i64 {
+    i64::try_from(unix_secs(SystemTime::now())).unwrap_or(i64::MAX)
+}
+
+/// Fails unless a statement changed exactly the flow `id`.
+fn one_flow(id: i64, changed: usize) -> Result<(), String> {
+    if changed == 1 { Ok(()) } else { Err(format!("there is no flow {id}")) }
+}
+
+impl Db {
+    /// Every flow in order, archived ones included.
+    pub fn list_flows(&self) -> Result<Vec<FlowSummary>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id, name, archived FROM flows ORDER BY position, id").map_err(sql)?;
+        let flows = stmt
+            .query_map([], |r| Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)? }))
+            .map_err(sql)?
+            .collect::<Result<_, _>>()
+            .map_err(sql);
+        flows
+    }
+
+    /// Adds a flow with no steps after the others.
+    pub fn create_flow(&self, name: &str) -> Result<FlowSummary, String> {
+        let name = flow_name(name)?;
+        let conn = self.conn();
+        let now = now_secs();
+        conn.execute(
+            "INSERT INTO flows (name, position, created_at, updated_at)
+             VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM flows), ?2, ?2)",
+            params![name, now],
+        )
+        .map_err(sql)?;
+        Ok(FlowSummary { id: conn.last_insert_rowid(), name: name.into(), archived: false })
+    }
+
+    pub fn rename_flow(&self, id: i64, name: &str) -> Result<(), String> {
+        let name = flow_name(name)?;
+        let changed = self
+            .conn()
+            .execute("UPDATE flows SET name = ?2, updated_at = ?3 WHERE id = ?1", params![id, name, now_secs()])
+            .map_err(sql)?;
+        one_flow(id, changed)
+    }
+
+    /// Archived flows keep their place, so unarchiving puts them back where they were.
+    pub fn set_flow_archived(&self, id: i64, archived: bool) -> Result<(), String> {
+        let changed = self
+            .conn()
+            .execute("UPDATE flows SET archived = ?2, updated_at = ?3 WHERE id = ?1", params![id, archived, now_secs()])
+            .map_err(sql)?;
+        one_flow(id, changed)
+    }
+
+    /// Puts the flows in the order of `ids`, which must list every flow exactly once.
+    pub fn reorder_flows(&self, ids: &[i64]) -> Result<(), String> {
+        let mut conn = self.conn();
+        // IMMEDIATE, so the hook cannot write between the check and the update.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+        let mut stored: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM flows").map_err(sql)?;
+            let ids = stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?;
+            ids
+        };
+        let mut given = ids.to_vec();
+        stored.sort_unstable();
+        given.sort_unstable();
+        if given != stored {
+            return Err("the new order must list every flow exactly once; the flows may have changed, so reload them".into());
+        }
+        for (position, id) in ids.iter().enumerate() {
+            tx.execute("UPDATE flows SET position = ?2 WHERE id = ?1", params![id, position as i64]).map_err(sql)?;
+        }
+        tx.commit().map_err(sql)
+    }
+
+    pub fn delete_flow(&self, id: i64) -> Result<(), String> {
+        let changed = self.conn().execute("DELETE FROM flows WHERE id = ?1", [id]).map_err(sql)?;
+        one_flow(id, changed)
     }
 }
 
@@ -1077,5 +1188,101 @@ pub(crate) mod tests {
         set_version(&path, 99);
         let err = connect_existing(&path).unwrap_err();
         assert!(err.contains("schema 99"), "{err}");
+    }
+
+    fn flow_names(db: &Db) -> Vec<(String, bool)> {
+        db.list_flows().unwrap().into_iter().map(|f| (f.name, f.archived)).collect()
+    }
+
+    fn names(list: &[&str]) -> Vec<(String, bool)> {
+        list.iter().map(|n| (n.to_string(), false)).collect()
+    }
+
+    #[test]
+    fn flows_are_created_in_order_with_trimmed_names() {
+        let db = Db::open(temp_db("flows-create")).unwrap();
+        assert!(db.list_flows().unwrap().is_empty());
+        let deploy = db.create_flow("  Deploy ").unwrap();
+        assert_eq!((deploy.name.as_str(), deploy.archived), ("Deploy", false));
+        db.create_flow("Review").unwrap();
+        assert_eq!(flow_names(&db), names(&["Deploy", "Review"]));
+        assert_ne!(db.list_flows().unwrap()[0].id, db.list_flows().unwrap()[1].id);
+    }
+
+    #[test]
+    fn a_flow_needs_a_name() {
+        let db = Db::open(temp_db("flows-name")).unwrap();
+        let err = db.create_flow("   ").unwrap_err();
+        assert!(err.contains("name"), "{err}");
+        assert!(db.list_flows().unwrap().is_empty());
+        let id = db.create_flow("Deploy").unwrap().id;
+        assert!(db.rename_flow(id, " ").is_err());
+        db.rename_flow(id, " Ship it ").unwrap();
+        assert_eq!(flow_names(&db), names(&["Ship it"]));
+        let err = db.rename_flow(id + 100, "Gone").unwrap_err();
+        assert!(err.contains("no flow"), "{err}");
+    }
+
+    #[test]
+    fn archiving_keeps_a_flows_place() {
+        let db = Db::open(temp_db("flows-archive")).unwrap();
+        let ids: Vec<i64> = ["a", "b", "c"].iter().map(|n| db.create_flow(n).unwrap().id).collect();
+        db.set_flow_archived(ids[1], true).unwrap();
+        let archived = vec![("a".into(), false), ("b".into(), true), ("c".into(), false)];
+        assert_eq!(flow_names(&db), archived);
+        db.set_flow_archived(ids[1], false).unwrap();
+        assert_eq!(flow_names(&db), names(&["a", "b", "c"]));
+        assert!(db.set_flow_archived(ids[2] + 100, true).unwrap_err().contains("no flow"));
+    }
+
+    #[test]
+    fn flows_are_reordered_only_by_a_complete_order() {
+        let db = Db::open(temp_db("flows-reorder")).unwrap();
+        let ids: Vec<i64> = ["a", "b", "c"].iter().map(|n| db.create_flow(n).unwrap().id).collect();
+        db.reorder_flows(&[ids[2], ids[0], ids[1]]).unwrap();
+        assert_eq!(flow_names(&db), names(&["c", "a", "b"]));
+        // Missing, repeated and unknown ids leave the order alone.
+        for bad in [vec![ids[0], ids[1]], vec![ids[0], ids[0], ids[1]], vec![ids[0], ids[1], ids[2], 999]] {
+            assert!(db.reorder_flows(&bad).is_err(), "{bad:?}");
+            assert_eq!(flow_names(&db), names(&["c", "a", "b"]));
+        }
+        // A new flow still goes last.
+        db.create_flow("d").unwrap();
+        assert_eq!(flow_names(&db), names(&["c", "a", "b", "d"]));
+    }
+
+    #[test]
+    fn a_deleted_flow_is_gone() {
+        let db = Db::open(temp_db("flows-delete")).unwrap();
+        let a = db.create_flow("a").unwrap().id;
+        db.create_flow("b").unwrap();
+        db.delete_flow(a).unwrap();
+        assert_eq!(flow_names(&db), names(&["b"]));
+        assert!(db.delete_flow(a).unwrap_err().contains("no flow"));
+    }
+
+    #[test]
+    fn the_schema_refuses_a_blank_flow_name() {
+        let db = Db::open(temp_db("flows-blank")).unwrap();
+        let blank = db.conn().execute(
+            "INSERT INTO flows (name, position, created_at, updated_at) VALUES ('  ', 0, 0, 0)",
+            [],
+        );
+        assert!(blank.is_err());
+    }
+
+    #[test]
+    fn upgrading_from_schema_5_keeps_the_settings_and_adds_flows() {
+        let path = temp_db("upgrade-v5");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&MIGRATIONS[..5].concat()).unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute("UPDATE settings SET disable_auto_memory = 1", []).unwrap();
+        drop(conn);
+        let db = Db::open(path.clone()).unwrap();
+        assert_eq!(schema_version(&connect(&path).unwrap()).unwrap(), 6);
+        assert!(db.load_settings().unwrap().disable_auto_memory);
+        assert!(db.list_flows().unwrap().is_empty());
+        db.create_flow("Deploy").unwrap();
     }
 }

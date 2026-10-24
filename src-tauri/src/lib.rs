@@ -159,6 +159,12 @@ pub fn run() {
             commands::settings_load,
             commands::settings_save,
             commands::fs_list,
+            commands::flows_list,
+            commands::flow_create,
+            commands::flow_rename,
+            commands::flow_set_archived,
+            commands::flows_reorder,
+            commands::flow_delete,
         ])
         .build(tauri::generate_context!())
         .expect("error while building raterm")

@@ -207,3 +207,26 @@ svg.lucide { display: block; flex: none; }
 .toolbox .toggle { gap: 2px; }
 .tab .x { display: inline-grid; place-items: center; }
 #notice button { display: inline-grid; place-items: center; }
+
+/* ---------- flows (see src/flows.ts) ---------- */
+#flows-box .flows { list-style: none; margin: 0; padding: 2px 0; }
+#flows-box .flows li { display: flex; align-items: center; gap: 6px; padding: 3px 10px; color: var(--fg); }
+#flows-box .flows li svg { color: var(--muted); }
+#flows-box .flows .name, #flows-settings .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#flows-box .hint, #flows-box .error { margin: 4px 10px; color: var(--muted); }
+#flows-box .error { color: #b3261e; }
+#flows-box [hidden] { display: none; }
+#flows-settings form, #flows-settings details { max-width: 520px; }
+#flows-settings ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+#flows-settings li { display: flex; align-items: center; gap: 4px; }
+#flows-settings li .name { flex: 1; }
+#flows-settings li button { padding: 4px; background: none; }
+#flows-settings li button:hover:not(:disabled) { background: var(--hover); }
+#flows-settings li button:disabled { opacity: .35; cursor: default; }
+#flows-settings .new-flow fieldset { flex-direction: row; gap: 8px; margin-top: 16px; }
+#flows-settings details fieldset { margin: 0; padding: 0; border: 0; }
+#flows-settings .new-flow input { flex: 1; }
+#flows-settings .new-flow button { white-space: nowrap; }
+#flows-settings details { margin-top: 20px; color: var(--muted); }
+#flows-settings details ul { margin-top: 8px; color: var(--fg); }
+#flows-settings details li .name { padding: 6px 0; }

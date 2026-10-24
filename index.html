@@ -26,6 +26,18 @@
           </header>
           <div class="body"><ul class="tree" role="tree"></ul></div>
         </section>
+        <!-- Flows of prompts for Claude tabs; the gear opens the Flows page, where they are managed (see src/flows.ts). -->
+        <section class="toolbox" id="flows-box">
+          <header>
+            <button class="toggle" title="Collapse or expand"><span class="chevron" data-icon="chevron-down" data-size="14"></span>Flows</button>
+            <button class="configure" title="Manage flows"><span data-icon="settings" data-size="14"></span></button>
+          </header>
+          <div class="body">
+            <ul class="flows"></ul>
+            <p class="hint empty" hidden>No flows yet. Add one with the gear button.</p>
+            <p class="error" role="alert" hidden></p>
+          </div>
+        </section>
         <button id="open-settings" title="Settings"><span data-icon="settings"></span>Settings</button>
       </aside>
       <main id="terminals">
@@ -64,6 +76,29 @@
             <p class="hint not-saving" hidden>raterm is running without its database, so settings last only until it quits.</p>
             <p class="error" role="alert" hidden></p>
           </form>
+        </section>
+        <!-- The Flows page, opened from the Flows box's gear button. Every change is saved right away. -->
+        <section id="flows-settings" class="page" aria-label="Flows" tabindex="-1">
+          <form class="manage" novalidate>
+            <fieldset>
+              <h2><span data-icon="workflow"></span>Flows</h2>
+              <ul class="flow-list"></ul>
+              <p class="hint empty">No flows yet.</p>
+            </fieldset>
+            <p class="hint not-saving" hidden>raterm is running without its database, so flows last only until it quits.</p>
+            <p class="error" role="alert" hidden></p>
+          </form>
+          <!-- Each part is a fieldset, so the whole page is disabled until the flows have been read. -->
+          <form class="new-flow" novalidate>
+            <fieldset>
+              <input name="name" placeholder="New flow name" aria-label="New flow name" />
+              <button class="primary">Add flow</button>
+            </fieldset>
+          </form>
+          <details class="archived">
+            <summary>Archived</summary>
+            <fieldset><ul class="archived-list"></ul></fieldset>
+          </details>
         </section>
       </main>
     </div>

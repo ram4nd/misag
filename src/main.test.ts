@@ -86,12 +86,19 @@ const picker = vi.hoisted(() => ({
   picked: null as string | null,
   fails: false,
   calls: [] as { defaultPath?: string }[],
+  /** The answer to a yes/no question, and the questions asked. */
+  answer: false,
+  asked: [] as string[],
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: async (options: { defaultPath?: string }) => {
     picker.calls.push(options);
     if (picker.fails) throw new Error("no portal");
     return picker.picked;
+  },
+  ask: async (message: string) => {
+    picker.asked.push(message);
+    return picker.answer;
   },
 }));
 
@@ -162,6 +169,11 @@ let fsTree: Record<string, { name: string; dir: boolean }[]>;
 /** settings_load waits for this, so a test can hold the load back. */
 let settingsLoadGate: Promise<void>;
 const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
+type Flow = { id: number; name: string; archived: boolean };
+/** The stored flows in order, archived ones included; the flow commands change it like the backend. */
+let storedFlows: Flow[];
+/** Flows that flow_delete refuses, as the runner will for running ones. */
+let busyFlows: Set<number>;
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -220,6 +232,48 @@ function renameTab(i: number, name: string, finish = "Enter") {
   input.dispatchEvent(new FocusEvent("blur"));
 }
 
+/** The flow commands, like the backend: names are trimmed, new flows go last. */
+function flowCommand(cmd: string, args: Record<string, unknown>) {
+  const find = (id: unknown) => {
+    const flow = storedFlows.find((f) => f.id === id);
+    if (!flow) throw { code: "failed", message: `there is no flow ${id}` };
+    return flow;
+  };
+  const named = (name: unknown) => {
+    const trimmed = String(name).trim();
+    if (!trimmed) throw { code: "failed", message: "a flow needs a name" };
+    return trimmed;
+  };
+  switch (cmd) {
+    case "flows_list":
+      return storedFlows.map((f) => ({ ...f }));
+    case "flow_create": {
+      const flow = { id: Math.max(0, ...storedFlows.map((f) => f.id)) + 1, name: named(args.name), archived: false };
+      storedFlows.push(flow);
+      return { ...flow };
+    }
+    case "flow_rename":
+      find(args.id).name = named(args.name);
+      return null;
+    case "flow_set_archived":
+      find(args.id).archived = args.archived as boolean;
+      return null;
+    case "flows_reorder": {
+      const ids = args.ids as number[];
+      const same = [...ids].sort().join() === storedFlows.map((f) => f.id).sort().join();
+      if (!same) throw { code: "failed", message: "the order must list every flow once" };
+      storedFlows = ids.map(find);
+      return null;
+    }
+    case "flow_delete":
+      find(args.id);
+      if (busyFlows.has(args.id as number)) throw { code: "failed", message: "the flow is running in a tab" };
+      storedFlows = storedFlows.filter((f) => f.id !== args.id);
+      return null;
+  }
+  throw new Error(`unmocked ${cmd}`);
+}
+
 beforeEach(() => {
   // Fake timers for every test: they are discarded afterwards, so a debounced save
   // left over from one test's app instance cannot fire during the next test.
@@ -244,10 +298,14 @@ beforeEach(() => {
   missingDirs = new Set();
   storedSettings = { ...DEFAULTS };
   settingsLoadGate = Promise.resolve();
+  storedFlows = [];
+  busyFlows = new Set();
   fsTree = { "~": [{ name: "work", dir: true }] };
   picker.picked = null;
   picker.fails = false;
   picker.calls = [];
+  picker.answer = false;
+  picker.asked = [];
   fsGates = {};
   fsHidden = {};
   win.closeRequested = undefined;
@@ -297,6 +355,7 @@ beforeEach(() => {
       storedSettings = next;
       return storedSettings;
     }
+    if (cmd.startsWith("flow")) return flowCommand(cmd, (args ?? {}) as Record<string, unknown>);
     if (cmd === "claude_open_sessions") {
       const ids = (args as { tabs: { id: number }[] }).tabs.map((t) => t.id);
       return claudeCheckGate.then(() => Object.fromEntries(
@@ -2025,5 +2084,240 @@ describe("edge cases", () => {
 
   test("the window may be destroyed after the close-time save", () => {
     expect(JSON.parse(capabilities).permissions).toContain("core:window:allow-destroy");
+  });
+});
+
+describe("flows", () => {
+  const box = () => document.querySelector<HTMLElement>("#flows-box")!;
+  const boxRows = () => [...box().querySelectorAll<HTMLElement>(".flows li .name")].map((n) => n.textContent);
+  const boxText = () => box().querySelector(".body")!.textContent ?? "";
+  const page = () => document.querySelector<HTMLElement>("#flows-settings")!;
+  const pageShown = () => page().classList.contains("active");
+  const pageError = () => page().querySelector<HTMLElement>(".error")!;
+  const listed = (list: "flow-list" | "archived-list") =>
+    [...page().querySelectorAll<HTMLElement>(`.${list} li`)];
+  const listedNames = (list: "flow-list" | "archived-list") =>
+    listed(list).map((li) => li.querySelector<HTMLInputElement>("input.name")?.value ?? li.querySelector(".name")?.textContent);
+  const rowOf = (name: string) =>
+    [...page().querySelectorAll<HTMLElement>("li")].find(
+      (li) => (li.querySelector<HTMLInputElement>("input.name")?.value ?? li.querySelector(".name")?.textContent) === name,
+    )!;
+  const settle = async () => {
+    for (let i = 0; i < 5; i++) await flush();
+  };
+  async function openFlows() {
+    box().querySelector<HTMLButtonElement>(".configure")!.click();
+    await settle();
+  }
+  async function create(name: string) {
+    const form = page().querySelector<HTMLFormElement>("form.new-flow")!;
+    form.querySelector<HTMLInputElement>("input[name=name]")!.value = name;
+    form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await settle();
+  }
+  async function click(name: string, action: string) {
+    rowOf(name).querySelector<HTMLButtonElement>(`button.${action}`)!.click();
+    await settle();
+  }
+  const flows = (...names: string[]) => names.map((name, i) => ({ id: i + 1, name, archived: false }));
+
+  test("the toolbox lists the flows that are not archived, in order", async () => {
+    storedFlows = flows("Deploy", "Old", "Review");
+    storedFlows[1].archived = true;
+    await boot();
+    await settle();
+    expect(boxRows()).toEqual(["Deploy", "Review"]);
+  });
+
+  test("with no flows the toolbox says how to add one", async () => {
+    await boot();
+    await settle();
+    expect(boxRows()).toEqual([]);
+    expect(boxText()).toContain("No flows yet");
+  });
+
+  test("a toolbox that cannot read the flows says so", async () => {
+    failing.add("flows_list");
+    await boot();
+    await settle();
+    expect(boxText()).toContain("flows_list failed");
+  });
+
+  test("the toolbox collapses on its own and remembers it", async () => {
+    await boot();
+    box().querySelector<HTMLButtonElement>(".toggle")!.click();
+    expect(box().classList.contains("collapsed")).toBe(true);
+    expect(document.querySelector("#workspace-box")!.classList.contains("collapsed")).toBe(false);
+    vi.resetModules();
+    await boot();
+    expect(box().classList.contains("collapsed")).toBe(true);
+  });
+
+  test("the gear opens one Flows tab, which is not saved with the tabs", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await openFlows();
+    await openFlows();
+    expect(tabNames()).toEqual(["work", "Flows"]);
+    expect(pageShown()).toBe(true);
+    await win.closeRequested!();
+    expect(lastSaved()!.tabs.map((t) => t.name)).toEqual(["Claude 1"]);
+    tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
+    expect(pageShown()).toBe(false);
+  });
+
+  test("the page lists active and archived flows apart", async () => {
+    storedFlows = flows("Deploy", "Old", "Review");
+    storedFlows[1].archived = true;
+    await boot();
+    await openFlows();
+    expect(listedNames("flow-list")).toEqual(["Deploy", "Review"]);
+    expect(listedNames("archived-list")).toEqual(["Old"]);
+  });
+
+  test("a new flow is created by name and shows up in the toolbox", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    await create("  Review ");
+    expect(callsOf("flow_create").map((c) => c.args.name)).toEqual(["  Review "]);
+    expect(listedNames("flow-list")).toEqual(["Deploy", "Review"]);
+    expect(boxRows()).toEqual(["Deploy", "Review"]);
+    expect(page().querySelector<HTMLInputElement>("form.new-flow input[name=name]")!.value).toBe("");
+  });
+
+  test("a flow that cannot be created shows why and keeps the name", async () => {
+    await boot();
+    await openFlows();
+    await create("   ");
+    expect(pageError().hidden).toBe(false);
+    expect(pageError().textContent).toContain("a flow needs a name");
+    expect(page().querySelector<HTMLInputElement>("form.new-flow input[name=name]")!.value).toBe("   ");
+    await create("Deploy");
+    expect(pageError().hidden).toBe(true);
+  });
+
+  test("renaming a flow saves it and updates the toolbox", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    const input = rowOf("Deploy").querySelector<HTMLInputElement>("input.name")!;
+    input.value = "Ship";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(callsOf("flow_rename").map((c) => c.args)).toEqual([{ id: 1, name: "Ship" }]);
+    expect(boxRows()).toEqual(["Ship"]);
+  });
+
+  test("a rejected rename goes back to the stored name", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    const input = rowOf("Deploy").querySelector<HTMLInputElement>("input.name")!;
+    input.value = " ";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(pageError().textContent).toContain("a flow needs a name");
+    expect(listedNames("flow-list")).toEqual(["Deploy"]);
+  });
+
+  test("moving a flow up or down reorders all flows, archived ones included", async () => {
+    storedFlows = flows("a", "old", "b", "c");
+    storedFlows[1].archived = true;
+    await boot();
+    await openFlows();
+    await click("c", "up");
+    expect(callsOf("flows_reorder").at(-1)!.args.ids).toEqual([1, 2, 4, 3]);
+    expect(listedNames("flow-list")).toEqual(["a", "c", "b"]);
+    expect(boxRows()).toEqual(["a", "c", "b"]);
+    await click("a", "down");
+    expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
+    // The ends cannot move further.
+    expect(rowOf("c").querySelector<HTMLButtonElement>("button.up")!.disabled).toBe(true);
+    expect(rowOf("b").querySelector<HTMLButtonElement>("button.down")!.disabled).toBe(true);
+  });
+
+  test("archiving hides a flow from the toolbox until it is unarchived", async () => {
+    storedFlows = flows("Deploy", "Review");
+    await boot();
+    await openFlows();
+    await click("Deploy", "archive");
+    expect(callsOf("flow_set_archived").map((c) => c.args)).toEqual([{ id: 1, archived: true }]);
+    expect(boxRows()).toEqual(["Review"]);
+    expect(listedNames("archived-list")).toEqual(["Deploy"]);
+    await click("Deploy", "unarchive");
+    expect(boxRows()).toEqual(["Deploy", "Review"]);
+    expect(listedNames("archived-list")).toEqual([]);
+  });
+
+  test("deleting asks first", async () => {
+    storedFlows = flows("Deploy", "Review", "Old");
+    storedFlows[2].archived = true;
+    await boot();
+    await openFlows();
+    await click("Deploy", "delete");
+    expect(picker.asked).toEqual([expect.stringContaining("Deploy")]);
+    expect(callsOf("flow_delete")).toHaveLength(0);
+    picker.answer = true;
+    await click("Deploy", "delete");
+    expect(callsOf("flow_delete").map((c) => c.args)).toEqual([{ id: 1 }]);
+    expect(listedNames("flow-list")).toEqual(["Review"]);
+    expect(boxRows()).toEqual(["Review"]);
+    await click("Old", "delete");
+    expect(listedNames("archived-list")).toEqual([]);
+  });
+
+  test("a flow that cannot be deleted stays, and the page says why", async () => {
+    storedFlows = flows("Deploy");
+    busyFlows.add(1);
+    picker.answer = true;
+    await boot();
+    await openFlows();
+    await click("Deploy", "delete");
+    expect(pageError().textContent).toContain("running");
+    expect(listedNames("flow-list")).toEqual(["Deploy"]);
+  });
+
+  test("while the flows cannot be read, nothing on the page can be changed", async () => {
+    storedFlows = flows("Deploy", "Old");
+    storedFlows[1].archived = true;
+    await boot();
+    await settle();
+    failing.add("flows_list");
+    await openFlows();
+    expect(pageError().textContent).toContain("Flows could not be read");
+    expect(pageError().textContent).toContain("reopen");
+    const controls = [...page().querySelectorAll<HTMLInputElement | HTMLButtonElement>("input, button")];
+    expect(controls.length).toBeGreaterThan(3);
+    for (const c of controls) expect(c.matches(":disabled"), c.outerHTML).toBe(true);
+    // Reopening once they can be read again enables the page.
+    failing.delete("flows_list");
+    tabs().at(-1)!.querySelector<HTMLButtonElement>(".x")!.click();
+    await openFlows();
+    expect(pageError().hidden).toBe(true);
+    for (const f of page().querySelectorAll("fieldset")) expect(f.disabled).toBe(false);
+  });
+
+  test("a change whose reload fails says the list may be out of date", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    failing.add("flows_list");
+    await create("Review");
+    expect(storedFlows.map((f) => f.name)).toEqual(["Deploy", "Review"]);
+    expect(pageError().textContent).toContain("Flows could not be read");
+  });
+
+  test("changes run one at a time, in order", async () => {
+    storedFlows = flows("a", "b", "c");
+    await boot();
+    await openFlows();
+    // Two quick clicks: the second works on the order the first left.
+    rowOf("c").querySelector<HTMLButtonElement>("button.up")!.click();
+    rowOf("c").querySelector<HTMLButtonElement>("button.up")!.click();
+    await settle();
+    await settle();
+    expect(pageError().hidden).toBe(true);
+    expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
   });
 });

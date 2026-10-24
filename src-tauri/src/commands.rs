@@ -3,7 +3,7 @@
 //! the database may wait up to its busy timeout for the hook's write lock.
 
 use crate::claude::{self, HookProblem, SessionId};
-use crate::db::{Db, StoreStatus};
+use crate::db::{Db, FlowSummary, StoreStatus};
 use crate::layout::{Layout, TabId};
 use crate::session::{self, Launch, SpawnError, Sessions, SpawnRequest};
 use crate::settings::{skips_permissions, Settings};
@@ -464,6 +464,36 @@ pub fn settings_load(db: State<'_, Db>) -> Result<Settings, CommandError> {
 pub fn settings_save(db: State<'_, Db>, settings: Settings) -> Result<Settings, CommandError> {
     let stored = db.load_settings()?;
     Ok(db.save_settings(settings.validated(&stored)?)?)
+}
+
+#[tauri::command(async)]
+pub fn flows_list(db: State<'_, Db>) -> Result<Vec<FlowSummary>, CommandError> {
+    Ok(db.list_flows()?)
+}
+
+#[tauri::command(async)]
+pub fn flow_create(db: State<'_, Db>, name: String) -> Result<FlowSummary, CommandError> {
+    Ok(db.create_flow(&name)?)
+}
+
+#[tauri::command(async)]
+pub fn flow_rename(db: State<'_, Db>, id: i64, name: String) -> Result<(), CommandError> {
+    Ok(db.rename_flow(id, &name)?)
+}
+
+#[tauri::command(async)]
+pub fn flow_set_archived(db: State<'_, Db>, id: i64, archived: bool) -> Result<(), CommandError> {
+    Ok(db.set_flow_archived(id, archived)?)
+}
+
+#[tauri::command(async)]
+pub fn flows_reorder(db: State<'_, Db>, ids: Vec<i64>) -> Result<(), CommandError> {
+    Ok(db.reorder_flows(&ids)?)
+}
+
+#[tauri::command(async)]
+pub fn flow_delete(db: State<'_, Db>, id: i64) -> Result<(), CommandError> {
+    Ok(db.delete_flow(id)?)
 }
 
 /// One level of the sidebar's file tree.

@@ -1,4 +1,8 @@
 import {
+  Archive,
+  ArchiveRestore,
+  ArrowDown,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
   createElement,
@@ -11,6 +15,8 @@ import {
   RefreshCw,
   Settings,
   SquareTerminal,
+  Trash2,
+  Workflow,
   X,
 } from "lucide";
 
@@ -24,6 +30,10 @@ export const CLAUDE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria
 
 /** The Lucide icons raterm uses, by name: for `data-icon` attributes in index.html and for `icon()`. */
 const ICONS = {
+  archive: Archive,
+  "archive-restore": ArchiveRestore,
+  "arrow-down": ArrowDown,
+  "arrow-up": ArrowUp,
   "chevron-down": ChevronDown,
   "chevron-right": ChevronRight,
   file: File,
@@ -35,6 +45,8 @@ const ICONS = {
   "refresh-cw": RefreshCw,
   settings: Settings,
   "square-terminal": SquareTerminal,
+  "trash-2": Trash2,
+  workflow: Workflow,
   x: X,
 };
 
