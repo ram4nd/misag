@@ -659,7 +659,7 @@ impl Db {
     /// Stores the flow's steps if they pass `flows::check`.
     pub fn save_flow_graph(&self, id: i64, graph: &Graph) -> Result<(), String> {
         flows::check(graph)?;
-        let graph = graph_json(graph)?;
+        let graph = graph_json(&flows::stored(graph.clone()))?;
         let changed = self
             .conn()
             .execute("UPDATE flows SET graph = ?2, updated_at = ?3 WHERE id = ?1", params![id, graph, now_secs()])
@@ -1413,6 +1413,17 @@ pub(crate) mod tests {
         assert_eq!(db.load_flow(id).unwrap().1, runnable);
         assert!(db.load_flow(id + 100).unwrap_err().contains("no flow"));
         assert!(db.save_flow_graph(id + 100, &runnable).unwrap_err().contains("no flow"));
+    }
+
+    #[test]
+    fn a_graph_is_stored_as_the_oldest_format_that_holds_it() {
+        let db = Db::open(temp_db("flows-version")).unwrap();
+        let id = db.create_flow("Deploy").unwrap().id;
+        let mut g = crate::flows::tests::runnable();
+        g.nodes[1].max_runs = Some(2);
+        db.save_flow_graph(id, &g).unwrap();
+        let (_, loaded) = db.load_flow(id).unwrap();
+        assert_eq!((loaded.version, loaded.nodes[1].max_runs), (2, Some(2)));
     }
 
     #[test]

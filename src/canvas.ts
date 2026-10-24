@@ -102,7 +102,8 @@ export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
       selected = null;
       for (const s of graph.nodes) {
         const inputs = s.kind === "start" ? 0 : 1;
-        const html = `<div class="kind">${KIND_LABELS[s.kind]}</div><div class="title"></div>`;
+        const limit = s.maxRuns === undefined ? "" : `<span class="limit" title="Runs at most ${s.maxRuns} times">≤${s.maxRuns}</span>`;
+        const html = `<div class="kind">${KIND_LABELS[s.kind]}${limit}</div><div class="title"></div>`;
         const id = df.addNode(s.kind, inputs, s.outputs.length, s.x, s.y, s.kind, {}, html, false);
         stepOf.set(String(id), s);
         drawnAs.set(s.id, id);

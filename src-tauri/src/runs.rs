@@ -148,14 +148,45 @@ fn left(tx: &Transaction, run: i64, node_id: &str, output: &str) -> Result<(), S
     .map_err(sql)
 }
 
+/// Who moves a run on.
+#[derive(Clone, Copy)]
+enum By {
+    /// The flow itself: Claude's reply, or the start.
+    Flow,
+    /// The person, who is not held back by a step's `max_runs`. (Their picks also
+    /// restart the count toward `MAX_RUN_STEPS`, through the `steps` they pass.)
+    Person,
+}
+
+/// How often the run has taken `step` so far, counting a visit it is on now.
+fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
+    let earlier: i64 = tx
+        .query_row("SELECT COUNT(*) FROM flow_run_events WHERE run_id = ?1 AND node_id = ?2", params![run.id, step], |r| r.get(0))
+        .map_err(sql)?;
+    Ok(earlier + i64::from(run.node_id == step))
+}
+
 /// Moves the run from `from` along `output` to the step it leads to, if any, with
 /// the run's step count at `steps`; returns the prompt to send when that is a
-/// prompt step. At `MAX_RUN_STEPS` the run instead waits at `from` for the person.
-fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, note: Option<&str>) -> Result<Option<String>, String> {
+/// prompt step. The run instead waits at `from` for the person when going on
+/// would pass `MAX_RUN_STEPS` (into a prompt step) or, for `By::Flow` only, when
+/// the next step has already run its `max_runs`.
+fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, note: Option<&str>, by: By) -> Result<Option<String>, String> {
     let next = flows::next_step(&run.graph, &from.id, output);
+    let wait = |why: String| set(tx, run.id, &from.id, Status::Attention, steps, Some(&why)).map(|()| None);
     if next.is_some_and(|n| n.kind == Kind::Prompt) && steps >= MAX_RUN_STEPS {
-        let why = format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on.");
-        return set(tx, run.id, &from.id, Status::Attention, steps, Some(&why)).map(|()| None);
+        return wait(format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on."));
+    }
+    if let (Some(next), By::Flow) = (next, by) {
+        if let Some(max) = next.max_runs {
+            if runs_of(tx, run, &next.id)? >= i64::from(max) {
+                let name = next.name();
+                let times = if max == 1 { "once".to_string() } else { format!("{max} times") };
+                return wait(format!(
+                    "\"{name}\" has already run {times}, its limit. Pick \"{output}\" to run it once more, or another output."
+                ));
+            }
+        }
     }
     left(tx, run.id, &from.id, output)?;
     let Some(next) = next else {
@@ -202,7 +233,7 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Opti
         other => other.map_err(sql)?,
     };
     let run = Stored { id: tx.last_insert_rowid(), graph, node_id: start.id.clone(), status: Status::Running, steps: 0 };
-    let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, None)?;
+    let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, None, By::Flow)?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
 }
@@ -244,7 +275,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
             "Claude ended with \"FLOW: {m}\", which is not an output of \"{}\".",
             node.name()
         )),
-        Some(m) => go(&tx, &run, &node, &m, run.steps, None),
+        Some(m) => go(&tx, &run, &node, &m, run.steps, None, By::Flow),
     }?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
@@ -262,7 +293,7 @@ pub fn proceed(conn: &mut Connection, run_id: i64, output: &str, note: &str) -> 
     if !node.outputs.iter().any(|o| o == output) {
         return Err(format!("\"{}\" has no output {output:?}", node.name()));
     }
-    let prompt = go(&tx, &run, &node, output, 0, Some(note))?;
+    let prompt = go(&tx, &run, &node, output, 0, Some(note), By::Person)?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
 }
@@ -628,6 +659,65 @@ mod tests {
         // Stepping in sends the next prompt and starts the count over.
         assert!(proceed(&mut conn, run.id, "fail", "").unwrap().is_some());
         assert_eq!(only_run(&conn).steps, 1);
+    }
+
+    /// Start → Review, whose issues go to Fix and back, at most twice; clean ends.
+    fn review_loop() -> Graph {
+        let mut review = node("review", Kind::Prompt, &["clean", "issues"]);
+        review.max_runs = Some(2);
+        graph(
+            vec![review, node("fix", Kind::Prompt, &["done"])],
+            vec![edge("start", "next", "review"), edge("review", "issues", "fix"), edge("fix", "done", "review")],
+        )
+    }
+
+    #[test]
+    fn a_step_run_its_most_times_waits_for_the_person() {
+        let g = review_loop();
+        let (_db, mut conn, flow) = setup("runs-max", &g);
+        let t = tab("t1");
+        assert_eq!(start(&mut conn, flow, &t).unwrap(), prompt_of(&g, "review", None));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix", None));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), prompt_of(&g, "review", None));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix", None));
+        // A third review would be one too many: the run waits after the fix.
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), None);
+        let run = only_run(&conn);
+        assert_eq!((run.status, run.step_id.as_str()), (Status::Attention, "fix"));
+        let note = run.note.unwrap();
+        assert!(note.contains("REVIEW") && note.contains("already run 2 times"), "{note}");
+        // The person can send it round once more; the next round waits again.
+        assert_eq!(proceed(&mut conn, run.id, "done", "").unwrap(), prompt_of(&g, "review", None));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix", None));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), None);
+        assert_eq!(only_run(&conn).status, Status::Attention);
+        assert_eq!(proceed(&mut conn, run.id, "done", "").unwrap(), prompt_of(&g, "review", None));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: clean")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_step_that_may_run_once_says_so() {
+        let mut g = review_loop();
+        g.nodes[1].max_runs = Some(1);
+        let (_db, mut conn, flow) = setup("runs-max-once", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        on_stop(&mut conn, &tab("t1"), Some("FLOW: issues")).unwrap();
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap(), None);
+        let note = only_run(&conn).note.unwrap();
+        assert!(note.contains("already run once") && note.contains("Pick \"done\""), "{note}");
+    }
+
+    #[test]
+    fn a_step_that_loops_onto_itself_counts_its_runs_too() {
+        let mut p = node("p", Kind::Prompt, &["again", "done"]);
+        p.max_runs = Some(2);
+        let g = graph(vec![p], vec![edge("start", "next", "p"), edge("p", "again", "p")]);
+        let (_db, mut conn, flow) = setup("runs-max-self", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        assert!(on_stop(&mut conn, &tab("t1"), Some("FLOW: again")).unwrap().is_some());
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: again")).unwrap(), None);
+        assert_eq!(only_run(&conn).status, Status::Attention);
     }
 
     #[test]

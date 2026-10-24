@@ -2542,6 +2542,63 @@ describe("flow editor", () => {
     expect(field("text").maxLength).toBe(20000);
   });
 
+  test("a step can be limited to a number of runs, for loops", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("P");
+    expect(field("maxRuns").value).toBe("");
+    await edit("maxRuns", "3");
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "p")).toMatchObject({ maxRuns: 3 });
+    // The canvas shows the limit, so a loop's cap can be seen without selecting the step.
+    expect(node("P").querySelector(".limit")!.textContent).toBe("≤3");
+    expect((field("maxRuns") as HTMLInputElement).max).toBe("100");
+    await edit("maxRuns", "0");
+    expect(panel().querySelector(".runs-invalid")!.textContent).toContain("1 to 100");
+    await edit("maxRuns", "");
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "p")).not.toHaveProperty("maxRuns");
+    expect(node("P").querySelector(".limit")).toBeNull();
+    await select("Start");
+    expect(field("maxRuns").closest("label")!.hidden).toBe(true);
+    // Leaving a manual step is always your pick, which no limit holds back.
+    tool("add-manual").click();
+    await settle();
+    await select("Manual step");
+    expect(field("maxRuns").closest("label")!.hidden).toBe(true);
+  });
+
+  test("a saved run limit is shown, and kept when another step is selected before it is committed", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    storedGraphs[1].nodes[1] = { ...storedGraphs[1].nodes[1], maxRuns: 5 } as Step;
+    await boot();
+    await openFromBox("Deploy");
+    await select("P");
+    expect(field("maxRuns").value).toBe("5");
+    field("maxRuns").value = "2";
+    await select("E");
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "p")).toMatchObject({ maxRuns: 2 });
+  });
+
+  test("a run limit edit does not hide what is wrong with the outputs", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("P");
+    await edit("outputs", "ok, needs work");
+    await edit("maxRuns", "3");
+    const shown = [...panel().querySelectorAll<HTMLElement>(".invalid")].filter((e) => !e.hidden).map((e) => e.textContent);
+    expect(shown).toEqual([expect.stringContaining("needs work")]);
+    await edit("maxRuns", "101");
+    const both = [...panel().querySelectorAll<HTMLElement>(".invalid")].filter((e) => !e.hidden);
+    expect(both).toHaveLength(2);
+  });
+
   test("an outputs edit is kept when another step is selected before it is committed", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();

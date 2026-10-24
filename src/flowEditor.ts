@@ -11,6 +11,8 @@ export interface Step {
   title: string;
   text: string;
   outputs: string[];
+  /** How many times a run may take the step before it waits for the person; absent: no limit. */
+  maxRuns?: number;
   x: number;
   y: number;
 }
@@ -35,9 +37,10 @@ interface FlowDetail {
 const SAVE_DELAY_MS = 400;
 /** Outputs as the backend accepts them (see `flows::plain_output`); "attention" is reserved. */
 const OUTPUT = /^[a-z0-9][a-z0-9_-]{0,23}$/;
-/** The backend's limits (`flows::MAX_STEPS`, `MAX_OUTPUTS`, and the title and text lengths). */
+/** The backend's limits (`flows::MAX_STEPS`, `MAX_OUTPUTS`, `MAX_RUNS`, and the title and text lengths). */
 const MAX_STEPS = 200;
 const MAX_OUTPUTS = 8;
+const MAX_RUNS = 100;
 /** The steps the toolbar adds. There is no End to add: an output with no next step ends the flow. */
 const NEW_STEPS: Record<"prompt" | "manual", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
@@ -79,7 +82,11 @@ function editorMarkup(): string {
               <label>Outputs <input name="outputs" />
                 <span class="hint">Comma-separated short words, such as <code>yes, no</code>. Each can lead to a next step (an earlier one makes a loop); an output that leads nowhere ends the flow.</span>
               </label>
+              <label>Run at most (times) <input name="maxRuns" type="number" min="1" placeholder="no limit" />
+                <span class="hint">For a step a loop comes back to, such as a review after a fix: once it has run this many times, the run waits for you before taking it again. Leave empty for no limit.</span>
+              </label>
               <p class="invalid" role="alert" hidden></p>
+              <p class="invalid runs-invalid" role="alert" hidden></p>
               <button type="button" class="delete-step">Delete step</button>
             </div>
             <div class="problems"></div>
@@ -103,7 +110,10 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   const title = $<HTMLInputElement>("[name=title]");
   const text = $<HTMLTextAreaElement>("[name=text]");
   const outputs = $<HTMLInputElement>("[name=outputs]");
-  const invalid = $<HTMLElement>(".invalid");
+  const maxRuns = $<HTMLInputElement>("[name=maxRuns]");
+  maxRuns.max = String(MAX_RUNS);
+  const invalidRuns = $<HTMLElement>(".runs-invalid");
+  const invalid = $<HTMLElement>(".invalid:not(.runs-invalid)");
   const status = $<HTMLElement>(".status");
   const errorEl = $<HTMLElement>(".error");
   form.onsubmit = (e) => e.preventDefault();
@@ -138,8 +148,11 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       removeStep(id);
     },
     selected(id) {
-      // An outputs edit not yet committed (it commits on change) is kept.
-      if (find(selected) && !panel.hidden) commitOutputs();
+      // Edits not yet committed (they commit on change) are kept.
+      if (find(selected) && !panel.hidden) {
+        commitOutputs();
+        commitMaxRuns();
+      }
       selected = id;
       showPanel();
     },
@@ -169,13 +182,17 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     const s = find(selected);
     panel.hidden = !s;
     invalid.hidden = true;
+    invalidRuns.hidden = true;
     if (!s) return;
     title.value = s.title;
     text.value = s.text;
     outputs.value = s.outputs.join(", ");
+    maxRuns.value = s.maxRuns === undefined ? "" : String(s.maxRuns);
     const words = s.kind === "prompt" || s.kind === "manual";
     text.closest("label")!.hidden = !words;
     outputs.closest("label")!.hidden = !words;
+    // Leaving a manual step is always your pick, which no limit holds back.
+    maxRuns.closest("label")!.hidden = s.kind !== "prompt";
     $(".text-label").textContent = s.kind === "prompt" ? "Prompt" : "What the person does";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
@@ -283,6 +300,24 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     changed(true);
   }
   outputs.onchange = commitOutputs;
+  /** Applies the run limit field to the selected prompt step, or says why it cannot. */
+  function commitMaxRuns() {
+    const s = find(selected);
+    if (!s || s.kind !== "prompt") return;
+    const value = maxRuns.value.trim();
+    const n = Number(value);
+    // A number field reads text it cannot parse ("e", "-") as empty: that is not "no limit".
+    const ok = !maxRuns.validity.badInput && (value === "" || (Number.isInteger(n) && n >= 1 && n <= MAX_RUNS));
+    invalidRuns.hidden = ok;
+    invalidRuns.textContent = ok ? "" : `A step runs 1 to ${MAX_RUNS} times; leave it empty for no limit.`;
+    const next = value === "" ? undefined : n;
+    if (!ok || next === s.maxRuns) return;
+    if (next === undefined) delete s.maxRuns;
+    else s.maxRuns = next;
+    // The canvas shows the limit.
+    changed(true);
+  }
+  maxRuns.onchange = commitMaxRuns;
 
   async function load(): Promise<boolean> {
     try {
@@ -301,6 +336,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
 
   async function flush(): Promise<boolean> {
     commitOutputs();
+    commitMaxRuns();
     // A save that failed before is tried again too.
     if (timer !== null || !saved) {
       if (timer !== null) clearTimeout(timer);

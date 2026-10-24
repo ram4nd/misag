@@ -13,15 +13,19 @@ const MAX_TITLE: usize = 200;
 const MAX_TEXT: usize = 20_000;
 const MAX_ID: usize = 40;
 const MAX_OUTPUT: usize = 24;
+/// The most a step's `max_runs` can be.
+const MAX_RUNS: u32 = 100;
 /// The output a Start step leads on by.
 pub const START_OUTPUT: &str = "next";
 /// Reserved for the flow runner, which reads it as "needs a person" in place of
 /// an output, so no step may use it as one.
 pub const ATTENTION: &str = "attention";
 
-/// The graph format this raterm writes; `check` refuses newer ones, which it
-/// could misread.
-pub const GRAPH_VERSION: u32 = 1;
+/// The newest graph format this raterm reads; `check` refuses newer ones, which it
+/// could misread. A graph is stored as the oldest format that holds it (see
+/// `stored`), so older raterms keep reading the flows they can run correctly.
+/// Version 2 added step run limits (`Node::max_runs`).
+pub const GRAPH_VERSION: u32 = 2;
 
 /// Mirrored by `Graph` in src/flowEditor.ts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -61,6 +65,11 @@ pub struct Node {
     /// The ways the step can end, each leading to at most one next step.
     #[serde(default)]
     pub outputs: Vec<String>,
+    /// For a prompt step: how many times the flow may take a run into it, such as a
+    /// review that loops back to a fix. Once reached, the run waits for the person
+    /// at the step before, who can still send it on. None: no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs: Option<u32>,
     pub x: f64,
     pub y: f64,
 }
@@ -83,6 +92,7 @@ impl Default for Graph {
             title: "Start".into(),
             text: String::new(),
             outputs: vec![START_OUTPUT.into()],
+            max_runs: None,
             x: 40.0,
             y: 40.0,
         };
@@ -152,7 +162,25 @@ fn check_node(node: &Node) -> Result<(), String> {
     if !node.x.is_finite() || !node.y.is_finite() {
         return Err(format!("\"{}\" has no valid position", node.name()));
     }
+    match (node.max_runs, node.kind) {
+        (None, _) => {}
+        // Leaving a manual step is always the person's pick, which no limit holds back.
+        (Some(_), Kind::Start | Kind::Manual | Kind::End) => {
+            return Err(format!("\"{}\" cannot have a run limit: only prompt steps can", node.name()));
+        }
+        (Some(n), _) if !(1..=MAX_RUNS).contains(&n) => {
+            return Err(format!("\"{}\" can run 1 to {MAX_RUNS} times, not {n}", node.name()));
+        }
+        (Some(_), _) => {}
+    }
     check_outputs(node)
+}
+
+/// `graph` as stored: in the oldest format that holds it, so a raterm that would
+/// ignore a newer field refuses the graph rather than run it differently.
+pub fn stored(mut graph: Graph) -> Graph {
+    graph.version = if graph.nodes.iter().any(|n| n.max_runs.is_some()) { 2 } else { 1 };
+    graph
 }
 
 /// Ok if `graph` is well formed enough to store (see the module docs), else why not.
@@ -279,6 +307,7 @@ pub(crate) mod tests {
             title: id.to_uppercase(),
             text: if kind == Kind::Prompt { format!("do {id}") } else { String::new() },
             outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            max_runs: None,
             x: 0.0,
             y: 0.0,
         }
@@ -335,8 +364,15 @@ pub(crate) mod tests {
         }))
         .unwrap();
         assert_eq!(parsed.nodes[0].title, "");
+        assert_eq!(parsed.nodes[0].max_runs, None);
+        assert!(json["nodes"][1].get("maxRuns").is_none(), "no limit is left out");
+        let mut limited = runnable();
+        limited.nodes[1].max_runs = Some(3);
+        assert_eq!(serde_json::to_value(limited).unwrap()["nodes"][1]["maxRuns"], 3);
+        let read: Node = serde_json::from_value(serde_json::json!({ "id": "p", "kind": "prompt", "maxRuns": 3, "x": 0, "y": 0 })).unwrap();
+        assert_eq!(read.max_runs, Some(3));
         assert_eq!(parsed.version, 1, "graphs stored before versions are version 1");
-        let newer = serde_json::json!({ "version": 2, "nodes": [], "edges": [] });
+        let newer = serde_json::json!({ "version": 3, "nodes": [], "edges": [] });
         assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer raterm"));
     }
 
@@ -420,6 +456,40 @@ pub(crate) mod tests {
         let mut g = runnable();
         g.edges[2].to = "start".into();
         rejected(&g, "Start");
+    }
+
+    #[test]
+    fn a_run_limit_is_a_sensible_count_on_a_prompt_step() {
+        let with_limit = |id: &str, kind: Kind, max: u32| {
+            let mut g = runnable();
+            let n = g.nodes.iter_mut().find(|n| n.id == id).unwrap();
+            n.kind = kind;
+            n.max_runs = Some(max);
+            if kind == Kind::Manual {
+                n.text.clear();
+            }
+            g
+        };
+        for max in [1, 3, 100] {
+            check(&with_limit("p", Kind::Prompt, max)).unwrap();
+        }
+        // Leaving a manual step is always the person's pick, which no limit holds back.
+        rejected(&with_limit("p", Kind::Manual, 2), "cannot have a run limit");
+        rejected(&with_limit("e", Kind::End, 2), "cannot have a run limit");
+        rejected(&with_limit("start", Kind::Start, 2), "cannot have a run limit");
+        for bad in [0, 101] {
+            rejected(&with_limit("p", Kind::Prompt, bad), "1 to 100 times");
+        }
+    }
+
+    #[test]
+    fn a_graph_with_run_limits_is_a_newer_format() {
+        // An older raterm would ignore the limits, so it must refuse such a graph.
+        let mut g = runnable();
+        assert_eq!(stored(g.clone()).version, 1);
+        g.nodes[1].max_runs = Some(2);
+        assert_eq!(stored(g.clone()).version, 2);
+        check(&stored(g)).unwrap();
     }
 
     #[test]
