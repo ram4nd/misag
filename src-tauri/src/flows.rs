@@ -92,7 +92,7 @@ impl Default for Graph {
 
 impl Node {
     /// The step as the user knows it: its title, or what kind of step it is.
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match (self.title.trim(), self.kind) {
             ("", Kind::Start) => "Start",
             ("", Kind::Prompt) => "Prompt step",
@@ -198,6 +198,44 @@ pub fn check(graph: &Graph) -> Result<(), String> {
     Ok(())
 }
 
+/// The marker Claude ends its reply with, lowercased: the last non-empty line
+/// (closing code fences aside), `FLOW: <word>` in any case, possibly in backticks
+/// or bold. The value must be a single word. None without one.
+pub fn parse_marker(reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).rfind(|line| !line.is_empty() && !line.starts_with("```"))?;
+    let line = line.trim_matches(|c| c == '`' || c == '*').trim();
+    let (label, value) = line.split_once(':')?;
+    let value = value.trim().to_lowercase();
+    let word = !value.is_empty() && !value.contains(char::is_whitespace);
+    (label.trim().eq_ignore_ascii_case("flow") && word).then_some(value)
+}
+
+/// What is sent to Claude for a prompt step: an optional note from the person,
+/// the step's text, and how to end the reply so the runner knows which output.
+/// Control characters (other than newlines and tabs) are dropped: the prompt may be
+/// typed into a terminal, where they would act as keys or end the paste early.
+pub fn prompt_text(node: &Node, note: Option<&str>) -> String {
+    let mut text = String::new();
+    if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+        text.push_str(&format!("A note from the person running this flow: {note}\n\n"));
+    }
+    text.push_str(node.text.trim_end());
+    let outputs: Vec<String> = node.outputs.iter().map(|o| format!("`FLOW: {o}`")).collect();
+    text.push_str(&format!(
+        "\n\nWhen you have finished, end your reply with a last line that is exactly {}, whichever fits. \
+         If you need a person to decide or do something first, end it with `FLOW: {ATTENTION}` instead and say why.",
+        outputs.join(" or ")
+    ));
+    text.retain(|c| !c.is_control() || c == '\n' || c == '\t');
+    text
+}
+
+/// The step `from`'s `output` leads to; None ends the flow there.
+pub fn next_step<'g>(graph: &'g Graph, from: &str, output: &str) -> Option<&'g Node> {
+    let edge = graph.edges.iter().find(|e| e.from == from && e.output == output)?;
+    graph.nodes.iter().find(|n| n.id == edge.to)
+}
+
 /// What keeps a stored graph from running, in the order the steps are listed.
 pub fn problems(graph: &Graph) -> Vec<String> {
     let Some(start) = graph.nodes.iter().find(|n| n.kind == Kind::Start) else {
@@ -219,13 +257,9 @@ pub fn problems(graph: &Graph) -> Vec<String> {
         if node.kind == Kind::Prompt && node.text.trim().is_empty() {
             problems.push(format!("\"{name}\" has no prompt."));
         }
-        for output in &node.outputs {
-            if !graph.edges.iter().any(|e| e.from == node.id && &e.output == output) {
-                problems.push(match node.kind {
-                    Kind::Start => "Start is not connected to a step.".into(),
-                    _ => format!("\"{name}\" has no next step for \"{output}\"."),
-                });
-            }
+        // Other outputs with no next step end the flow there.
+        if node.kind == Kind::Start && !graph.edges.iter().any(|e| e.from == node.id) {
+            problems.push("Start is not connected to a step.".into());
         }
         if !reached.contains(node.id.as_str()) {
             problems.push(format!("\"{name}\" cannot be reached from Start."));
@@ -408,20 +442,63 @@ pub(crate) mod tests {
     fn problems_name_the_steps_in_order() {
         let mut g = runnable();
         g.nodes[1].text = "  ".into();
+        // An output with no next step ends the flow there, which is fine.
         g.edges.retain(|e| e.output != "fail");
         g.nodes.push(Node { title: String::new(), ..node("m", Kind::Manual, &["done"]) });
         assert_eq!(
             problems(&g),
-            vec![
-                "\"P\" has no prompt.",
-                "\"P\" has no next step for \"fail\".",
-                "\"Manual step\" has no next step for \"done\".",
-                "\"Manual step\" cannot be reached from Start.",
-            ]
+            vec!["\"P\" has no prompt.", "\"Manual step\" cannot be reached from Start."]
         );
         let mut g = runnable();
         g.nodes.remove(0);
         g.edges.remove(0);
         assert_eq!(problems(&g)[0], "The flow needs a Start step.");
+    }
+
+    #[test]
+    fn the_flow_line_is_the_last_line_of_the_reply() {
+        for (reply, marker) in [
+            ("Tests pass.\n\nFLOW: pass", Some("pass")),
+            ("FLOW: Pass  \n\n", Some("pass")),
+            ("flow:fail", Some("fail")),
+            ("Done.\n`FLOW: needs-fix`", Some("needs-fix")),
+            ("Done.\n**FLOW: attention**", Some("attention")),
+            ("FLOW: pass\nBut one more thing.", None),
+            ("FLOW:", None),
+            ("FLOW: two words", None),
+            ("", None),
+            ("No marker here.", None),
+            ("Done.\r\nFLOW: pass\r\n", Some("pass")),
+            ("```\nFLOW: pass\n```", Some("pass")),
+            ("Note: see FLOW: pass", None),
+        ] {
+            assert_eq!(parse_marker(reply).as_deref(), marker, "{reply:?}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_asks_for_a_flow_line_naming_its_outputs() {
+        let g = runnable();
+        let text = prompt_text(&g.nodes[1], None);
+        assert!(text.starts_with("do p"), "{text}");
+        for part in ["FLOW: pass", "FLOW: fail", "FLOW: attention", "last line"] {
+            assert!(text.contains(part), "{part:?} in {text}");
+        }
+        let noted = prompt_text(&g.nodes[1], Some("  The CI is flaky.  "));
+        assert!(noted.starts_with("A note from the person running this flow: The CI is flaky.\n\ndo p"), "{noted}");
+        assert_eq!(prompt_text(&g.nodes[1], Some("  ")), text, "a blank note is no note");
+        // Control characters could end the paste the prompt is typed as, or act as keys.
+        let mut odd = g.nodes[1].clone();
+        odd.text = "a\u{1b}[201~b\tc\u{7}d\ne".into();
+        assert!(prompt_text(&odd, Some("x\u{1b}y")).starts_with("A note from the person running this flow: xy\n\na[201~b\tcd\ne"));
+    }
+
+    #[test]
+    fn an_output_leads_to_its_step_or_ends_the_flow() {
+        let g = runnable();
+        assert_eq!(next_step(&g, "p", "pass").map(|n| n.id.as_str()), Some("e"));
+        assert_eq!(next_step(&g, "p", "fail").map(|n| n.id.as_str()), Some("p"));
+        assert_eq!(next_step(&g, "p", "skip"), None);
+        assert_eq!(next_step(&g, "start", START_OUTPUT).map(|n| n.id.as_str()), Some("p"));
     }
 }

@@ -10,7 +10,7 @@ import "@xterm/xterm/css/xterm.css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
-import { createFlows, type Flow } from "./flows";
+import { createFlows, type Flow, type Run } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
 
 /**
@@ -497,6 +497,8 @@ function showActive() {
 function close(s: Session) {
   if (s.closing) return;
   s.closing = true;
+  // Its run can never be answered again: the tab's id is not reused.
+  invoke("flow_stop_tab", { tabId: s.tabId }).catch((err) => console.error("raterm: could not end the tab's flow run", err));
   const i = sessions.indexOf(s);
   sessions.splice(i, 1);
   // A missing session (already exited) is a no-op on the backend.
@@ -560,6 +562,7 @@ function renderSessions() {
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = tabLabel(s);
+      tab.classList.toggle("needs-you", waitingTabs.has(s.tabId));
 
       const x = document.createElement("button");
       x.className = "x";
@@ -1228,7 +1231,111 @@ const flows = createFlows({
   showError: (message) => showPageError(pages.flows, message),
   onOpen: openFlowEditor,
   onChange: followFlows,
+  onRun: startFlow,
+  onContinue: continueRun,
+  onStop: stopRun,
+  onShowRun: (run) => {
+    const s = sessions.find((s) => s.tabId === run.tabId);
+    if (s) activate(s);
+  },
+  tabName: (tabId) => {
+    const s = sessions.find((s) => s.tabId === tabId);
+    return s ? tabLabel(s) : null;
+  },
 });
+
+/** How long after pasting a prompt Claude gets the Enter that sends it, so the paste is not taken as typing. */
+const PASTE_SUBMIT_MS = 150;
+/** Tabs whose flow run waits for the person, marked in the tab bar. */
+const waitingTabs = new Set<string>();
+
+/**
+ * Types `text` into the tab as one paste and sends it, as if the person had. The
+ * backend drops control characters from prompts, so the text cannot end the paste.
+ * If Claude is busy (mid-turn, or in a menu), the paste lands there instead.
+ */
+function typePrompt(s: Session, text: string) {
+  write(s, encoder.encode(`\x1b[200~${text}\x1b[201~`));
+  setTimeout(() => {
+    if (!s.exited && !s.closing) write(s, encoder.encode("\r"));
+  }, PASTE_SUBMIT_MS);
+}
+
+/**
+ * Whether Claude runs in the tab right now, so a prompt typed there goes to Claude
+ * and not to a shell. A terminal tab is asked now, not trusted to its last poll.
+ */
+async function claudeLive(s: Session): Promise<boolean> {
+  if (s.exited || s.closing || s.id === null) return false;
+  if (s.run.kind === "claude") return true;
+  return (await claudeStates([s]))[s.id]?.state === "open";
+}
+
+async function startFlow(flow: Flow) {
+  const s = active && (await claudeLive(active)) ? active : null;
+  if (!s) {
+    flows.showBoxError("Flows run in a Claude tab: select one (or a terminal tab running claude) and press ▶ again.");
+    return;
+  }
+  try {
+    const prompt = await invoke<string | null>("flow_start", { flowId: flow.id, tabId: s.tabId });
+    flows.showBoxError(null);
+    if (prompt !== null) typePrompt(s, prompt);
+  } catch (err) {
+    console.error("raterm: could not start the flow", err);
+    flows.showBoxError(`Could not start "${flow.name}": ${errorText(err)}`);
+  }
+  await pollRuns();
+}
+
+async function continueRun(run: Run, output: string, note: string) {
+  const s = sessions.find((s) => s.tabId === run.tabId);
+  if (!s || !(await claudeLive(s))) {
+    flows.showBoxError(`Claude is not running in ${s ? tabLabel(s) : "the run's tab"}; start it there first, or stop the run.`);
+    await pollRuns();
+    return;
+  }
+  try {
+    const prompt = await invoke<string | null>("flow_continue", { runId: run.id, output, note });
+    flows.showBoxError(null);
+    if (prompt !== null) typePrompt(s, prompt);
+  } catch (err) {
+    console.error("raterm: could not continue the run", err);
+    flows.showBoxError(`Could not go on: ${errorText(err)}`);
+  }
+  await pollRuns();
+}
+
+async function stopRun(run: Run) {
+  try {
+    await invoke("flow_stop", { runId: run.id });
+    flows.showBoxError(null);
+  } catch (err) {
+    console.error("raterm: could not stop the run", err);
+    flows.showBoxError(`Could not stop the run: ${errorText(err)}`);
+  }
+  await pollRuns();
+}
+
+/** The error pollRuns shows, so a later good poll clears only its own. */
+let runsError: string | null = null;
+
+/** Shows the active runs, and marks the tabs whose run waits for the person. */
+async function pollRuns() {
+  try {
+    const runs = await invoke<Run[]>("flow_runs");
+    if (runsError !== null) flows.showBoxError(null);
+    runsError = null;
+    flows.showRuns(runs);
+    waitingTabs.clear();
+    for (const run of runs) if (run.status !== "running") waitingTabs.add(run.tabId);
+    sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", waitingTabs.has(s.tabId)));
+  } catch (err) {
+    console.error("raterm: could not read the flow runs", err);
+    runsError = `Flow runs could not be read: ${errorText(err)}`;
+    flows.showBoxError(runsError);
+  }
+}
 
 /** Opens the flow's editor tab, creating it the first time. */
 function openFlowEditor(flow: Flow) {
@@ -1352,8 +1459,10 @@ const checkStore = () =>
 checkStore();
 // Session-hook failures can happen at any time, so they are checked on a timer.
 setInterval(checkStore, STORE_POLL_MS);
-// Directories and the Claude in terminal tabs change without telling raterm.
+// Directories and the Claude in terminal tabs change without telling raterm, and
+// flow runs move on in the Stop hook.
 setInterval(pollTabs, TAB_POLL_MS);
+setInterval(pollRuns, TAB_POLL_MS);
 restore().catch((err) => {
   console.error("raterm: restore failed", err);
   canSave = false;

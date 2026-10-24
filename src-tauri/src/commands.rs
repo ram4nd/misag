@@ -223,6 +223,10 @@ fn hook_env(tab_id: &TabId, db: &Path) -> Env {
     vec![
         (claude::TAB_ENV.to_string(), tab_id.to_string()),
         (claude::DB_ENV.to_string(), db.to_string_lossy().into_owned()),
+        // A flow run sends one prompt after another from the Stop hook; Claude Code
+        // otherwise stops honouring the hook after 8 in a row. runs::MAX_RUN_STEPS
+        // is raterm's own limit.
+        (claude::STOP_CAP_ENV.to_string(), claude::STOP_CAP.to_string()),
     ]
 }
 
@@ -518,6 +522,32 @@ pub fn flow_save_graph(db: State<'_, Db>, id: i64, graph: Graph) -> Result<Vec<S
 }
 
 #[tauri::command(async)]
+pub fn flow_start(db: State<'_, Db>, flow_id: i64, tab_id: TabId) -> Result<Option<String>, CommandError> {
+    Ok(db.start_run(flow_id, &tab_id)?)
+}
+
+#[tauri::command(async)]
+pub fn flow_continue(db: State<'_, Db>, run_id: i64, output: String, note: String) -> Result<Option<String>, CommandError> {
+    Ok(db.proceed_run(run_id, &output, &note)?)
+}
+
+#[tauri::command(async)]
+pub fn flow_stop(db: State<'_, Db>, run_id: i64) -> Result<(), CommandError> {
+    Ok(db.stop_run(run_id)?)
+}
+
+/// Ends the tab's run, if any, as the tab is closing.
+#[tauri::command(async)]
+pub fn flow_stop_tab(db: State<'_, Db>, tab_id: TabId) -> Result<(), CommandError> {
+    Ok(db.stop_tab_run(&tab_id)?)
+}
+
+#[tauri::command(async)]
+pub fn flow_runs(db: State<'_, Db>) -> Result<Vec<crate::runs::Run>, CommandError> {
+    Ok(db.active_runs()?)
+}
+
+#[tauri::command(async)]
 pub fn flow_delete(db: State<'_, Db>, id: i64) -> Result<(), CommandError> {
     Ok(db.delete_flow(id)?)
 }
@@ -762,7 +792,13 @@ mod tests {
         assert_eq!(args, claude::args(&session(), false, Some(Path::new(EXE)), Default::default()));
         assert_eq!(
             env,
-            [("RATERM_TAB".into(), "tab-1".into()), ("RATERM_DB".into(), "/data/raterm.db".into())]
+            [
+                ("RATERM_TAB".into(), "tab-1".into()),
+                ("RATERM_DB".into(), "/data/raterm.db".into()),
+                // A flow sends prompt after prompt from the Stop hook; Claude Code's own
+                // cap on hook continuations (8) would cut it short.
+                ("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP".into(), "51".into()),
+            ]
         );
     }
 

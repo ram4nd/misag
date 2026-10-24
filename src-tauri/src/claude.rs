@@ -1,11 +1,13 @@
-//! Launching Claude Code in Claude tabs, and the SessionStart hook that reports
-//! which session each tab is in.
+//! Launching Claude Code in Claude tabs, and the hook that reports which session
+//! each tab is in and moves the tab's flow run on.
 //!
 //! Each Claude tab runs `claude` with a hook passed through `--settings`, so the
-//! user's own Claude configuration is untouched. Claude runs the hook whenever a
-//! session starts (launch, `--resume`, `/resume`, `/clear`, compaction) and pipes
-//! the session details to it; the hook is raterm's own binary in `--claude-hook`
-//! mode, which records them in the database for the tab named by `RATERM_TAB`.
+//! user's own Claude configuration is untouched. The hook is raterm's own binary
+//! in `--claude-hook` mode, for the tab named by `RATERM_TAB`. Claude runs it
+//! whenever a session starts (launch, `--resume`, `/resume`, `/clear`, compaction),
+//! and it records the session in the database; and whenever Claude ends a turn
+//! (Stop), and it moves the tab's flow run on (see `runs`), printing the next
+//! prompt for Claude when there is one.
 //!
 //! Terminal tabs find a `claude` wrapper first on their `PATH` (see
 //! `install_wrapper`), which hands `claude` to `raterm --claude-launch`: that
@@ -36,6 +38,14 @@ pub const WRAPPER_ENV: &str = "RATERM_WRAPPER";
 pub const PID_ENV: &str = "CLAUDE_PID";
 /// The subdirectory of the database's directory that holds the `claude` wrapper.
 pub const WRAPPER_DIR: &str = "bin";
+/// Claude Code's cap on Stop-hook continuations in a row (8 by default). Tabs get
+/// it raised to just above raterm's own limit (`runs::MAX_RUN_STEPS`), so a flow
+/// run is not cut short; it applies to the user's own Stop hooks in those tabs too.
+pub const STOP_CAP_ENV: &str = "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP";
+pub const STOP_CAP: u32 = 51;
+/// Hook context longer than this reaches Claude only as a preview, so a longer
+/// prompt is handed over as a "block" reason instead.
+const MAX_CONTEXT: usize = 9_000;
 /// Command-line flag that runs the binary as the hook.
 pub const HOOK_FLAG: &str = "--claude-hook";
 /// Command-line flag the wrapper runs the binary with to start the real `claude`.
@@ -166,15 +176,15 @@ pub fn hook_command(exe: &Path) -> String {
 }
 
 /// The `--settings` JSON: `keys` (from raterm's own settings) plus, with `hook_exe`,
-/// the SessionStart hook. None when that is empty, so no `--settings` is passed.
+/// raterm's hook for SessionStart (to record the tab's session) and Stop (to move
+/// the tab's flow run on). None when there are no keys and no hook, so no
+/// `--settings` is passed.
 fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
     if let Some(exe) = hook_exe {
         debug_assert!(!keys.contains_key("hooks"), "a setting would replace raterm's hook");
         let command = hook_command(exe);
-        keys.insert(
-            "hooks".into(),
-            serde_json::json!({ "SessionStart": [{ "hooks": [{ "type": "command", "command": command }] }] }),
-        );
+        let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]);
+        keys.insert("hooks".into(), serde_json::json!({ "SessionStart": hook, "Stop": hook }));
     }
     (!keys.is_empty()).then(|| Value::Object(keys).to_string())
 }
@@ -274,7 +284,15 @@ struct SessionStart {
 
 fn record(input: &str, tab_id: &TabId, db_path: &Path, claude_pid: Option<u32>) -> Result<(), String> {
     let event: SessionStart = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
-    let conn = db::connect_existing(db_path)?;
+    let mut conn = db::connect_existing(db_path)?;
+    if event.source.as_deref() == Some("clear") {
+        // Claude no longer has the running step's prompt, so it will not answer it.
+        crate::runs::pause_tab(
+            &mut conn,
+            tab_id,
+            "The conversation was cleared, so Claude no longer has this step's prompt. Pick an output to go on.",
+        )?;
+    }
     db::record_claude_session(
         &conn,
         &SessionReport {
@@ -288,15 +306,83 @@ fn record(input: &str, tab_id: &TabId, db_path: &Path, claude_pid: Option<u32>) 
     )
 }
 
-/// Reads one SessionStart payload from `input` and records it for `tab_id`, with
-/// the Claude process that sent it.
-fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<(), String> {
+/// Which hook event a payload is.
+#[derive(Deserialize)]
+struct Event {
+    hook_event_name: Option<String>,
+}
+
+/// The part of Claude's Stop payload the flow runner reads.
+#[derive(Deserialize)]
+struct Stop {
+    /// Claude's final reply; older Claude Code versions do not report it, and the
+    /// run then waits for the person, saying so.
+    last_assistant_message: Option<String>,
+}
+
+/// What the hook did.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    /// Recorded the session a tab is now in.
+    Recorded,
+    /// Handled a Stop (the tab's flow run, if any, moved on), with the hook output
+    /// that hands Claude the next prompt, if there is one.
+    Stopped(Option<String>),
+}
+
+/// The hook output that has Claude go on with `prompt`. Context rather than a
+/// "block" decision, so Claude Code does not show it as a hook error (the same
+/// limit on continuations applies); but context past `MAX_CONTEXT` would reach
+/// Claude only as a preview, so a longer prompt is a block reason.
+fn continuation(prompt: &str) -> String {
+    let output = if prompt.chars().count() > MAX_CONTEXT {
+        serde_json::json!({ "decision": "block", "reason": prompt })
+    } else {
+        serde_json::json!({ "hookSpecificOutput": { "hookEventName": "Stop", "additionalContext": prompt } })
+    };
+    output.to_string()
+}
+
+/// Moves the tab's flow run on after Claude ended a turn, returning the hook output
+/// that hands Claude the next prompt, if there is one.
+fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
+    let event: Stop = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
+    // Across an upgrade (the app not yet restarted) runs cannot be read; every turn
+    // of every tab ends here, so that is not logged each time.
+    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
+    match crate::runs::on_stop(&mut conn, tab_id, event.last_assistant_message.as_deref()) {
+        Ok(prompt) => Ok(prompt.as_deref().map(continuation)),
+        Err(e) => {
+            // Best effort: show the run as waiting rather than running forever.
+            let why = format!("The Stop hook could not move the run on ({e}). Pick an output to go on.");
+            if let Err(also) = crate::runs::pause_tab(&mut conn, tab_id, &why) {
+                return Err(format!("{e}; and could not mark the run: {also}"));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Reads one hook payload from `input`: a SessionStart is recorded for `tab_id`,
+/// with the Claude process that sent it, and a Stop moves the tab's flow run on.
+fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<Outcome, String> {
     let (Some(tab_id), Some(db_path)) = (tab_id, db_path) else {
         return Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}"));
     };
     let mut payload = String::new();
     input.read_to_string(&mut payload).map_err(|e| format!("could not read the payload: {e}"))?;
-    record(&payload, tab_id, db_path, claude_pid).map_err(|e| format!("could not record the Claude session: {e}"))
+    // A payload without a readable event name goes to the session recorder, which
+    // says what is wrong with it.
+    let event = serde_json::from_str::<Event>(&payload).ok().and_then(|e| e.hook_event_name);
+    match event.as_deref() {
+        Some("Stop") => stopped(&payload, tab_id, db_path)
+            .map(Outcome::Stopped)
+            .map_err(|e| format!("could not move the flow run on: {e}")),
+        Some("SessionStart") | None => record(&payload, tab_id, db_path, claude_pid)
+            .map(|()| Outcome::Recorded)
+            .map_err(|e| format!("could not record the Claude session: {e}")),
+        Some(other) => Err(format!("raterm's hook was run for {other}, which it does not handle")),
+    }
 }
 
 /// Appends a failure to the hook log next to the database, starting the log over
@@ -413,12 +499,13 @@ pub fn run_hook() -> i32 {
     match hook(std::io::stdin(), tab_id.as_ref(), db_path.as_deref(), claude_pid) {
         Err(message) => log_failure(db_path.as_deref(), tab_id.as_ref(), &message),
         // Recorded, but a terminal tab cannot tell whether this session is still open.
-        Ok(()) if claude_pid.is_none() => log_failure(
+        Ok(Outcome::Recorded) if claude_pid.is_none() => log_failure(
             db_path.as_deref(),
             tab_id.as_ref(),
             &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
         ),
-        Ok(()) => {}
+        Ok(Outcome::Recorded | Outcome::Stopped(None)) => {}
+        Ok(Outcome::Stopped(Some(output))) => println!("{output}"),
     }
     0
 }
@@ -464,6 +551,8 @@ mod tests {
         let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["command"], "'/opt/my apps/raterm' --claude-hook");
+        // The same command runs when Claude ends a turn, to move a flow run on.
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0], *hook);
         assert_eq!(settings.as_object().unwrap().len(), 1, "only the hook");
     }
 
@@ -834,5 +923,15 @@ mod tests {
         let path = temp_db("hook-bad");
         assert!(record("not json", &tid("tab-1"), &path, None).is_err());
         assert!(record(r#"{"session_id":"; rm -rf ~"}"#, &tid("tab-1"), &path, None).is_err());
+    }
+
+    #[test]
+    fn a_long_prompt_is_handed_over_whole() {
+        // Claude Code shows only a preview of hook context over 10,000 characters.
+        let short: Value = serde_json::from_str(&continuation("Fix it.")).unwrap();
+        assert_eq!(short["hookSpecificOutput"]["additionalContext"], "Fix it.");
+        let long_prompt = "x".repeat(9_500);
+        let long: Value = serde_json::from_str(&continuation(&long_prompt)).unwrap();
+        assert_eq!((long["decision"].as_str(), long["reason"].as_str()), (Some("block"), Some(long_prompt.as_str())));
     }
 }

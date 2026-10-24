@@ -181,6 +181,15 @@ const START: Step = { id: "start", kind: "start", title: "Start", text: "", outp
 let storedGraphs: Record<number, Graph>;
 /** What flow_load and flow_save_graph report as keeping the flow from running. */
 let flowProblems: string[];
+type Run = {
+  id: number; flowId: number; flowName: string; tabId: string; stepId: string; step: string;
+  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number;
+};
+/** What flow_runs reports. */
+let activeRuns: Run[];
+/** The prompt flow_start and flow_continue return; a string makes them fail with it. */
+let runPrompt: string | null;
+let runRefusal: string | null;
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -279,6 +288,18 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
     case "flow_save_graph":
       storedGraphs[find(args.id).id] = structuredClone(args.graph as Graph);
       return flowProblems;
+    case "flow_start":
+    case "flow_continue":
+      if (runRefusal) throw { code: "failed", message: runRefusal };
+      return runPrompt;
+    case "flow_runs":
+      return activeRuns;
+    case "flow_stop":
+      activeRuns = activeRuns.filter((r) => r.id !== args.runId);
+      return null;
+    case "flow_stop_tab":
+      activeRuns = activeRuns.filter((r) => r.tabId !== args.tabId);
+      return null;
     case "flow_delete":
       find(args.id);
       if (busyFlows.has(args.id as number)) throw { code: "failed", message: "the flow is running in a tab" };
@@ -316,6 +337,9 @@ beforeEach(() => {
   busyFlows = new Set();
   storedGraphs = {};
   flowProblems = [];
+  activeRuns = [];
+  runPrompt = null;
+  runRefusal = null;
   fsTree = { "~": [{ name: "work", dir: true }] };
   picker.picked = null;
   picker.fails = false;
@@ -2444,9 +2468,10 @@ describe("flow editor", () => {
     await openFromBox("Deploy");
     tool("add-prompt").click();
     tool("add-manual").click();
-    tool("add-end").click();
     await settle();
-    expect(titles()).toEqual(["Start", "Prompt", "Manual step", "End"]);
+    // There is no End step to add: an output with no next step ends the flow.
+    expect(editor().querySelector("button.add-end")).toBeNull();
+    expect(titles()).toEqual(["Start", "Prompt", "Manual step"]);
     expect(callsOf("flow_save_graph")).toHaveLength(0);
     await afterSave();
     expect(callsOf("flow_save_graph")).toHaveLength(1);
@@ -2455,9 +2480,8 @@ describe("flow editor", () => {
       ["start", ["next"]],
       ["prompt", ["done"]],
       ["manual", ["done"]],
-      ["end", []],
     ]);
-    expect(new Set(graph.nodes.map((n) => n.id)).size).toBe(4);
+    expect(new Set(graph.nodes.map((n) => n.id)).size).toBe(3);
     expect(editor().querySelector(".status")!.textContent).toBe("Saved");
   });
 
@@ -2534,12 +2558,12 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-end").click();
+    tool("add-manual").click();
     await afterSave();
     const first = saved()!.nodes[1].id;
-    await select("End");
+    await select("Manual step");
     panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
-    tool("add-end").click();
+    tool("add-manual").click();
     await afterSave();
     expect(saved()!.nodes[1].id).not.toBe(first);
   });
@@ -2615,7 +2639,7 @@ describe("flow editor", () => {
     const problems = () => [...editor().querySelectorAll(".problems li")].map((li) => li.textContent);
     expect(problems()).toEqual(["Start is not connected to a step."]);
     flowProblems = [];
-    tool("add-end").click();
+    tool("add-manual").click();
     await afterSave();
     expect(problems()).toEqual([]);
     expect(editor().querySelector(".problems")!.textContent).toContain("Ready to run");
@@ -2626,12 +2650,12 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-end").click();
+    tool("add-manual").click();
     await afterSave();
     expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(false);
     expect(editor().querySelector(".error")!.textContent).toContain("flow_save_graph failed");
     failing.delete("flow_save_graph");
-    tool("add-end").click();
+    tool("add-manual").click();
     await afterSave();
     expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
     expect(storedGraphs[1].nodes).toHaveLength(3);
@@ -2641,11 +2665,11 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-end").click();
+    tool("add-manual").click();
     await settle();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await settle();
-    expect(storedGraphs[1].nodes.map((n) => n.kind)).toEqual(["start", "end"]);
+    expect(storedGraphs[1].nodes.map((n) => n.kind)).toEqual(["start", "manual"]);
     expect(tabs()).toHaveLength(0);
   });
 
@@ -2654,7 +2678,7 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-end").click();
+    tool("add-manual").click();
     await settle();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await settle();
@@ -2672,7 +2696,7 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-end").click();
+    tool("add-manual").click();
     await settle();
     await win.closeRequested!();
     expect(win.prevented).toBe(false);
@@ -2684,7 +2708,7 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-end").click();
+    tool("add-manual").click();
     await settle();
     await win.closeRequested!();
     expect(win.prevented).toBe(true);
@@ -2716,12 +2740,249 @@ describe("flow editor", () => {
     await settle();
     expect(tabNames()).toEqual(["Ship", "Flows"]);
     // A change still waiting is dropped with the flow, not saved into nothing.
-    document.querySelector<HTMLElement>(".page.flow-editor button.add-end")!.click();
+    document.querySelector<HTMLElement>(".page.flow-editor button.add-manual")!.click();
     rows()[0].querySelector<HTMLButtonElement>("button.delete")!.click();
     await settle();
     await vi.advanceTimersByTimeAsync(SAVE_MS);
     expect(tabNames()).toEqual(["Flows"]);
     expect(editors()).toHaveLength(0);
     expect(callsOf("flow_save_graph")).toHaveLength(0);
+  });
+});
+
+describe("flow runs", () => {
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) await flush();
+  };
+  const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+  const box = () => document.querySelector<HTMLElement>("#flows-box")!;
+  const flowRow = (name: string) => [...box().querySelectorAll<HTMLElement>(".flows > li")].find((li) => li.querySelector(".name")!.textContent === name)!;
+  const runRows = () => [...box().querySelectorAll<HTMLElement>(".runs li")];
+  const run = (over: Partial<Run> = {}): Run => ({
+    id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
+    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, ...over,
+  });
+  async function poll() {
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+  }
+  async function play(name: string) {
+    flowRow(name).querySelector<HTMLButtonElement>("button.run")!.click();
+    await settle();
+    // The Enter that submits a typed prompt follows the paste.
+    await vi.advanceTimersByTimeAsync(200);
+  }
+
+  beforeEach(() => {
+    storedFlows = [{ id: 1, name: "Deploy", archived: false }];
+  });
+
+  test("▶ starts a flow in the active Claude tab and types its first prompt", async () => {
+    runPrompt = "Fix the tests.\nEnd with FLOW: pass";
+    await boot();
+    await openClaudeTabs(2);
+    tabs()[0].click();
+    await play("Deploy");
+    expect(callsOf("flow_start").map((c) => c.args)).toEqual([{ flowId: 1, tabId: spawns()[0].tabId }]);
+    expect(typed()).toEqual(["\x1b[200~Fix the tests.\nEnd with FLOW: pass\x1b[201~", "\r"]);
+    expect(callsOf("pty_write")[0].args.id).toBe(1);
+  });
+
+  test("a flow that starts at a manual step types nothing", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await play("Deploy");
+    expect(callsOf("flow_start")).toHaveLength(1);
+    expect(typed()).toEqual([]);
+  });
+
+  test("without Claude in the active tab, ▶ says where flows run", async () => {
+    await boot();
+    await play("Deploy");
+    await clickTerminal();
+    await play("Deploy");
+    expect(callsOf("flow_start")).toHaveLength(0);
+    expect(box().querySelector(".error")!.textContent).toContain("Claude tab");
+  });
+
+  test("a start that is refused says why", async () => {
+    runRefusal = "the flow is not ready to run: Start is not connected to a step.";
+    await boot();
+    await openClaudeTabs(1);
+    await play("Deploy");
+    expect(box().querySelector(".error")!.textContent).toContain("not ready to run");
+    expect(typed()).toEqual([]);
+  });
+
+  test("active runs show under their flow, and a tab that waits for you is marked", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    const [a, b] = spawns().map((c) => c.tabId);
+    activeRuns = [run({ tabId: a }), run({ id: 6, tabId: b, status: "manual", step: "Check the form", outputs: ["ok"] })];
+    await poll();
+    expect(runRows().map((li) => li.querySelector(".summary")!.textContent)).toEqual([
+      "work · Fix the tests · Running",
+      "work · Check the form · Waiting for you",
+    ]);
+    expect(tabs().map((t) => t.classList.contains("needs-you"))).toEqual([false, true]);
+    activeRuns = [];
+    await poll();
+    expect(runRows()).toHaveLength(0);
+    expect(tabs().map((t) => t.classList.contains("needs-you"))).toEqual([false, false]);
+  });
+
+  test("a waiting run offers its outputs, and the pick sends the next prompt to its tab", async () => {
+    runPrompt = "Deploy it.";
+    await boot();
+    await openClaudeTabs(2);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId, status: "attention", note: "Claude asked for a person.", outputs: ["pass", "fail"] })];
+    await poll();
+    const row = runRows()[0];
+    expect(row.querySelector(".note")!.textContent).toBe("Claude asked for a person.");
+    expect([...row.querySelectorAll<HTMLButtonElement>("button.output")].map((b) => b.textContent)).toEqual(["pass", "fail"]);
+    row.querySelector<HTMLInputElement>("input.run-note")!.value = "Use staging";
+    row.querySelector<HTMLButtonElement>("button.output")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "pass", note: "Use staging" }]);
+    // Typed into the run's tab, which is not the active one.
+    expect(callsOf("pty_write").map((c) => c.args.id)).toEqual([1, 1]);
+    expect(typed()).toEqual(["\x1b[200~Deploy it.\x1b[201~", "\r"]);
+  });
+
+  test("a running run can be moved on by hand, or stopped", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    // In case Claude was interrupted or crashed, and no reply will come.
+    expect([...runRows()[0].querySelectorAll("button.output")].map((b) => b.textContent)).toEqual(["pass", "fail"]);
+    runRows()[0].querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    await settle();
+    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(runRows()).toHaveLength(0);
+  });
+
+  test("clicking a run shows its tab", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    runRows()[0].querySelector<HTMLElement>(".summary")!.click();
+    expect(tabs().map((t) => t.classList.contains("active"))).toEqual([true, false]);
+  });
+
+  test("a run whose tab is gone can only be stopped", async () => {
+    await boot();
+    activeRuns = [run({ tabId: "gone", status: "manual", outputs: ["ok"] })];
+    await poll();
+    expect(runRows()[0].querySelector(".summary")!.textContent).toBe("closed tab · Fix the tests · Waiting for you");
+    expect(runRows()[0].querySelectorAll("button.output")).toHaveLength(0);
+    expect(runRows()[0].querySelector("button.stop-run")).not.toBeNull();
+  });
+});
+
+describe("flow runs and Claude's state", () => {
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) await flush();
+  };
+  const box = () => document.querySelector<HTMLElement>("#flows-box")!;
+  const runRows = () => [...box().querySelectorAll<HTMLElement>(".runs li")];
+  const boxError = () => box().querySelector<HTMLElement>(".error")!;
+  const run = (over: Partial<Run> = {}): Run => ({
+    id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
+    status: "manual", note: null, outputs: ["ok"], steps: 1, ...over,
+  });
+  async function poll() {
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+  }
+
+  beforeEach(() => {
+    storedFlows = [{ id: 1, name: "Deploy", archived: false }];
+  });
+
+  test("a prompt is only typed into a terminal tab while Claude still runs there", async () => {
+    runPrompt = "Next.";
+    await boot();
+    await clickTerminal();
+    const tabId = spawns()[0].tabId;
+    openClaudes = { 1: SESSION };
+    activeRuns = [run({ tabId })];
+    await poll();
+    // Claude has quit since the last check: the prompt would go to the shell.
+    openClaudes = {};
+    runRows()[0].querySelector<HTMLButtonElement>("button.output")!.click();
+    await settle();
+    expect(callsOf("flow_continue")).toHaveLength(0);
+    expect(callsOf("pty_write")).toHaveLength(0);
+    expect(boxError().textContent).toContain("Claude is not running");
+    // With Claude back, it goes on.
+    openClaudes = { 1: SESSION };
+    runRows()[0].querySelector<HTMLButtonElement>("button.output")!.click();
+    await settle();
+    expect(callsOf("flow_continue")).toHaveLength(1);
+  });
+
+  test("▶ checks a terminal tab's Claude right before starting", async () => {
+    await boot();
+    await clickTerminal();
+    openClaudes = { 1: SESSION };
+    await poll();
+    openClaudes = {};
+    [...box().querySelectorAll<HTMLButtonElement>("button.run")][0].click();
+    await settle();
+    expect(callsOf("flow_start")).toHaveLength(0);
+    expect(boxError().textContent).toContain("Claude tab");
+  });
+
+  test("closing a tab ends its run", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    await settle();
+    expect(callsOf("flow_stop_tab").map((c) => c.args)).toEqual([{ tabId }]);
+  });
+
+  test("a note being typed survives other runs moving on", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    const [a, b] = spawns().map((c) => c.tabId);
+    activeRuns = [run({ tabId: a }), run({ id: 6, tabId: b, status: "running", steps: 1 })];
+    await poll();
+    const note = runRows()[0].querySelector<HTMLInputElement>("input.run-note")!;
+    note.focus();
+    note.value = "Half a thou";
+    activeRuns = [run({ tabId: a }), run({ id: 6, tabId: b, status: "running", steps: 2 })];
+    await poll();
+    const after = runRows()[0].querySelector<HTMLInputElement>("input.run-note")!;
+    expect(after.value).toBe("Half a thou");
+    expect(document.activeElement).toBe(after);
+    expect(runRows()[1].querySelector(".summary")!.getAttribute("title")).toContain("2 steps");
+  });
+
+  test("runs that cannot be read are reported in the box until they can", async () => {
+    await boot();
+    failing.add("flow_runs");
+    await poll();
+    expect(boxError().textContent).toContain("Flow runs could not be read");
+    failing.delete("flow_runs");
+    await poll();
+    expect(boxError().hidden).toBe(true);
+  });
+
+  test("an output is sent once, however often it is clicked", async () => {
+    runPrompt = "Next.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    const ok = runRows()[0].querySelector<HTMLButtonElement>("button.output")!;
+    ok.click();
+    ok.click();
+    await settle();
+    expect(callsOf("flow_continue")).toHaveLength(1);
   });
 });

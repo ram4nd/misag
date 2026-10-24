@@ -38,10 +38,10 @@ const OUTPUT = /^[a-z0-9][a-z0-9_-]{0,23}$/;
 /** The backend's limits (`flows::MAX_STEPS`, `MAX_OUTPUTS`, and the title and text lengths). */
 const MAX_STEPS = 200;
 const MAX_OUTPUTS = 8;
-const NEW_STEPS: Record<Exclude<StepKind, "start">, { title: string; outputs: string[] }> = {
+/** The steps the toolbar adds. There is no End to add: an output with no next step ends the flow. */
+const NEW_STEPS: Record<"prompt" | "manual", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
   manual: { title: "Manual step", outputs: ["done"] },
-  end: { title: "End", outputs: [] },
 };
 
 export interface FlowEditorOptions {
@@ -68,7 +68,6 @@ function editorMarkup(): string {
         <div class="toolbar">
           <button type="button" class="add-prompt">+ Prompt</button>
           <button type="button" class="add-manual">+ Manual step</button>
-          <button type="button" class="add-end">+ End</button>
           <span class="status" role="status"></span>
         </div>
         <div class="workspace">
@@ -78,7 +77,7 @@ function editorMarkup(): string {
               <label>Title <input name="title" maxlength="200" /></label>
               <label><span class="text-label">Prompt</span> <textarea name="text" rows="8" maxlength="20000"></textarea></label>
               <label>Outputs <input name="outputs" />
-                <span class="hint">Comma-separated short words, such as <code>pass, fail</code>. Each can lead to a next step.</span>
+                <span class="hint">Comma-separated short words, such as <code>yes, no</code>. Each can lead to a next step (an earlier one makes a loop); an output that leads nowhere ends the flow.</span>
               </label>
               <p class="invalid" role="alert" hidden></p>
               <button type="button" class="delete-step">Delete step</button>
@@ -221,7 +220,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     changed(true);
   }
 
-  function addStep(kind: Exclude<StepKind, "start">) {
+  function addStep(kind: keyof typeof NEW_STEPS) {
     const n = graph.nodes.length;
     if (n >= MAX_STEPS) {
       showError(`A flow has at most ${MAX_STEPS} steps.`);
@@ -243,7 +242,6 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
 
   $<HTMLButtonElement>(".add-prompt").onclick = () => addStep("prompt");
   $<HTMLButtonElement>(".add-manual").onclick = () => addStep("manual");
-  $<HTMLButtonElement>(".add-end").onclick = () => addStep("end");
   $<HTMLButtonElement>(".delete-step").onclick = () => {
     const s = find(selected);
     if (s && s.kind !== "start") removeStep(s.id);

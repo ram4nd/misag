@@ -3,6 +3,7 @@ mod commands;
 pub mod db;
 pub mod files;
 pub mod flows;
+pub mod runs;
 pub mod layout;
 pub mod session;
 pub mod settings;
@@ -93,6 +94,9 @@ fn open_store(dir: Result<PathBuf, String>) -> db::Db {
     if let Err(e) = db.prune_claude_sessions() {
         eprintln!("raterm: could not prune Claude sessions: {e}");
     }
+    if let Err(e) = db.resume_runs() {
+        eprintln!("raterm: could not resume the flow runs: {e}");
+    }
     db
 }
 
@@ -168,6 +172,11 @@ pub fn run() {
             commands::flow_delete,
             commands::flow_load,
             commands::flow_save_graph,
+            commands::flow_start,
+            commands::flow_continue,
+            commands::flow_stop,
+            commands::flow_runs,
+            commands::flow_stop_tab,
         ])
         .build(tauri::generate_context!())
         .expect("error while building raterm")

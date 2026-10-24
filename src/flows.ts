@@ -2,6 +2,25 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { icon, type IconName } from "./icons";
 
+/** Mirrors the active statuses of `runs::Status` in src-tauri/src/runs.rs. */
+export type RunStatus = "running" | "manual" | "attention";
+
+/** Mirrors `runs::Run`. */
+export interface Run {
+  id: number;
+  flowId: number;
+  flowName: string;
+  tabId: string;
+  stepId: string;
+  step: string;
+  status: RunStatus;
+  note: string | null;
+  outputs: string[];
+  steps: number;
+}
+
+const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
+
 /** Mirrors `db::FlowSummary` in src-tauri/src/db.rs. */
 export interface Flow {
   id: number;
@@ -21,11 +40,25 @@ export interface FlowsOptions {
   onOpen(flow: Flow): void;
   /** Called with the flows each time they have been read. */
   onChange(flows: Flow[]): void;
+  /** Starts the flow (the ▶ button). */
+  onRun(flow: Flow): void;
+  /** The person picked `output` for a waiting run, with a note for Claude. */
+  onContinue(run: Run, output: string, note: string): Promise<void>;
+  /** Stops the run (its Stop button). */
+  onStop(run: Run): void;
+  /** Shows the run's tab. */
+  onShowRun(run: Run): void;
+  /** The label of the tab with this id; null when no such tab is open. */
+  tabName(tabId: string): string | null;
 }
 
 export interface Flows {
   /** Reads the flows again and shows them in the toolbox and on the page. */
   reload(): Promise<void>;
+  /** Shows the active runs under their flows in the toolbox. */
+  showRuns(runs: Run[]): void;
+  /** Shows (or clears, with null) an error in the toolbox. */
+  showBoxError(message: string | null): void;
 }
 
 /** The Flows toolbox and its settings page; every change is stored right away. */
@@ -39,6 +72,7 @@ export function createFlows(opts: FlowsOptions): Flows {
   const newForm = opts.page.querySelector<HTMLFormElement>("form.new-flow")!;
   const newName = newForm.elements.namedItem("name") as HTMLInputElement;
   let flows: Flow[] = [];
+  let runs: Run[] = [];
   /** Changes run one after another, each on the flows the previous one left. */
   let queue = Promise.resolve();
 
@@ -49,8 +83,7 @@ export function createFlows(opts: FlowsOptions): Flows {
       opts.onChange(flows);
     } catch (err) {
       console.error("raterm: could not read the flows", err);
-      boxError.textContent = `Flows could not be read: ${opts.errorText(err)}`;
-      boxError.hidden = false;
+      showBoxError(`Flows could not be read: ${opts.errorText(err)}`);
       throw err;
     } finally {
       render();
@@ -149,6 +182,57 @@ export function createFlows(opts: FlowsOptions): Flows {
     return li;
   }
 
+  function showBoxError(message: string | null) {
+    boxError.hidden = !message;
+    boxError.textContent = message ?? "";
+    boxEmpty.hidden = flows.some((f) => !f.archived) || !boxError.hidden;
+  }
+
+  /**
+   * A run under its flow in the toolbox: where it is and, when its tab is open, its
+   * step's outputs to go on by (for a running step too, in case no reply comes).
+   */
+  function runRow(run: Run): HTMLLIElement {
+    const li = document.createElement("li");
+    li.className = `run ${run.status}`;
+    const tab = opts.tabName(run.tabId);
+    const summary = document.createElement("div");
+    summary.className = "summary";
+    summary.textContent = `${tab ?? "closed tab"} · ${run.step} · ${STATUS_LABELS[run.status]}`;
+    summary.title = `${run.flowName}: ${run.steps} step${run.steps === 1 ? "" : "s"} since you last stepped in`;
+    if (tab !== null) summary.onclick = () => opts.onShowRun(run);
+    li.append(summary);
+    if (run.note) li.append(Object.assign(document.createElement("p"), { className: "note", textContent: run.note }));
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    if (tab !== null && run.outputs.length > 0) {
+      const note = document.createElement("input");
+      note.className = "run-note";
+      note.dataset.run = String(run.id);
+      note.placeholder = "Note for Claude (optional)";
+      note.setAttribute("aria-label", "Note for Claude");
+      const buttons = run.outputs.map((output) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "output";
+        b.textContent = output;
+        b.title = run.status === "running" ? `Claude is still on this step; go on as "${output}" anyway` : `Go on as "${output}"`;
+        b.onclick = async () => {
+          // Once: a second click would send the next step too.
+          for (const other of buttons) other.disabled = true;
+          await opts.onContinue(run, output, note.value);
+          for (const other of buttons) other.disabled = false;
+        };
+        return b;
+      });
+      actions.append(...buttons);
+      li.append(note);
+    }
+    actions.append(button("stop-run", "square", "Stop this run", () => opts.onStop(run)));
+    li.append(actions);
+    return li;
+  }
+
   function render() {
     const active = flows.filter((f) => !f.archived);
     const archived = flows.filter((f) => f.archived);
@@ -157,7 +241,18 @@ export function createFlows(opts: FlowsOptions): Flows {
         const li = document.createElement("li");
         li.title = `Edit ${flow.name}`;
         li.onclick = () => opts.onOpen(flow);
-        li.append(icon("workflow", 14), nameSpan(flow));
+        const run = button("run", "play", "Run in the active Claude tab", () => opts.onRun(flow));
+        run.addEventListener("click", (e) => e.stopPropagation());
+        li.append(icon("workflow", 14), nameSpan(flow), run);
+        const mine = runs.filter((r) => r.flowId === flow.id);
+        if (mine.length > 0) {
+          const list = document.createElement("ul");
+          list.className = "runs";
+          // Clicks in a run are about the run, not about opening the flow.
+          list.onclick = (e) => e.stopPropagation();
+          list.append(...mine.map(runRow));
+          li.append(list);
+        }
         return li;
       }),
     );
@@ -174,5 +269,25 @@ export function createFlows(opts: FlowsOptions): Flows {
     if (created) newName.value = "";
   };
 
-  return { reload };
+  return {
+    reload,
+    showBoxError,
+    showRuns(next: Run[]) {
+      if (JSON.stringify(next) === JSON.stringify(runs)) return;
+      // Notes being typed, and the focus, are carried over to the new rows.
+      const notes = new Map([...boxList.querySelectorAll<HTMLInputElement>("input.run-note")].map((i) => [i.dataset.run, i]));
+      const focused = document.activeElement instanceof HTMLInputElement ? document.activeElement.dataset.run : undefined;
+      runs = next;
+      render();
+      for (const input of boxList.querySelectorAll<HTMLInputElement>("input.run-note")) {
+        const old = notes.get(input.dataset.run);
+        if (!old) continue;
+        input.value = old.value;
+        if (input.dataset.run === focused) {
+          input.focus();
+          input.setSelectionRange(old.selectionStart, old.selectionEnd);
+        }
+      }
+    },
+  };
 }

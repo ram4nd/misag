@@ -8,6 +8,7 @@
 
 use crate::claude::SessionId;
 use crate::flows::{self, Graph};
+use crate::runs;
 use crate::layout::{Layout, Tab, TabId, TabKind};
 use crate::settings::Settings;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -77,6 +78,37 @@ const MIGRATIONS: &[&str] = &[r#"
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
     );
+"#, r#"
+    -- A flow being worked through in a tab (see runs.rs), with its own copy of the
+    -- flow's steps, so editing the flow does not change a run. Deleting a flow
+    -- deletes its runs, but never while one is active (see `delete_flow`).
+    CREATE TABLE flow_runs (
+        id         INTEGER PRIMARY KEY,
+        flow_id    INTEGER NOT NULL REFERENCES flows (id) ON DELETE CASCADE,
+        tab_id     TEXT NOT NULL,
+        graph      TEXT NOT NULL,
+        node_id    TEXT NOT NULL,
+        status     TEXT NOT NULL CHECK (status IN ('running', 'manual', 'attention', 'done', 'stopped')),
+        -- Steps taken since a person last stepped in; see runs::MAX_RUN_STEPS.
+        steps      INTEGER NOT NULL DEFAULT 0,
+        -- Why the run needs attention.
+        note       TEXT,
+        started_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    -- A tab has at most one active run.
+    CREATE UNIQUE INDEX one_active_run_per_tab ON flow_runs (tab_id)
+        WHERE status IN ('running', 'manual', 'attention');
+    CREATE INDEX flow_runs_by_flow ON flow_runs (flow_id);
+    -- The steps a run took: the step it left and the output it left by.
+    CREATE TABLE flow_run_events (
+        id      INTEGER PRIMARY KEY,
+        run_id  INTEGER NOT NULL REFERENCES flow_runs (id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        output  TEXT NOT NULL,
+        at      INTEGER NOT NULL
+    );
+    CREATE INDEX flow_run_events_by_run ON flow_run_events (run_id);
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -111,8 +143,15 @@ fn classify(what: &str, e: rusqlite::Error) -> OpenError {
     if corrupt { OpenError::Corrupt(message) } else { OpenError::Other(message) }
 }
 
+/// Runs are deleted with their flow by foreign keys, which SQLite enforces only
+/// when each connection asks.
+fn enforce_foreign_keys(conn: &Connection) -> Result<(), OpenError> {
+    conn.pragma_update(None, "foreign_keys", true).map_err(|e| classify("foreign keys", e))
+}
+
 fn configure(conn: &Connection, path: &Path) -> Result<(), OpenError> {
     conn.busy_timeout(BUSY_TIMEOUT).map_err(|e| classify("busy timeout", e))?;
+    enforce_foreign_keys(conn)?;
     let mode: String = conn
         .pragma_update_and_check(None, "journal_mode", "wal", |r| r.get(0))
         .map_err(|e| classify("journal mode", e))?;
@@ -145,16 +184,25 @@ pub fn connect(path: &Path) -> Result<Connection, OpenError> {
 /// migration, a new hook therefore refuses the old schema (and logs it) until the
 /// app has migrated: session changes in that window are not recorded.
 pub fn connect_existing(path: &Path) -> Result<Connection, String> {
+    let known = MIGRATIONS.len() as i64;
+    connect_if_current(path)?.ok_or_else(|| {
+        let found = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|conn| schema_version(&conn).ok())
+            .map_or_else(|| "?".to_string(), |v| v.to_string());
+        format!("schema {found} in {}, this binary knows {known}", path.display())
+    })
+}
+
+/// Like `connect_existing`, but None (no error) when the schema is not this
+/// binary's, for callers that have nothing to do across an upgrade.
+pub fn connect_if_current(path: &Path) -> Result<Option<Connection>, String> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     configure(&conn, path).map_err(|e| e.to_string())?;
     let found = schema_version(&conn).map_err(|e| e.to_string())?;
-    let known = MIGRATIONS.len() as i64;
-    if found != known {
-        return Err(format!("schema {found} in {}, this binary knows {known}", path.display()));
-    }
-    Ok(conn)
+    Ok((found == MIGRATIONS.len() as i64).then_some(conn))
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), OpenError> {
@@ -242,6 +290,7 @@ impl Db {
     fn in_memory(reason: String) -> Self {
         eprintln!("raterm: {reason}; tabs will not be saved this run");
         let mut conn = Connection::open_in_memory().expect("in-memory SQLite always opens");
+        enforce_foreign_keys(&conn).expect("in-memory SQLite has foreign keys");
         migrate(&mut conn).expect("migrations apply to an empty in-memory database");
         Self::with(Backing::Memory { reason }, conn)
     }
@@ -618,9 +667,55 @@ impl Db {
         one_flow(id, changed)
     }
 
+    /// Deletes a flow and its finished runs; refused while a tab is running it.
     pub fn delete_flow(&self, id: i64) -> Result<(), String> {
-        let changed = self.conn().execute("DELETE FROM flows WHERE id = ?1", [id]).map_err(sql)?;
+        let changed = self
+            .conn()
+            .execute(
+                &format!(
+                    "DELETE FROM flows WHERE id = ?1 AND NOT EXISTS (
+                         SELECT 1 FROM flow_runs WHERE flow_id = ?1 AND status IN {})",
+                    runs::ACTIVE
+                ),
+                [id],
+            )
+            .map_err(sql)?;
+        if changed == 0 && self.conn().query_row("SELECT 1 FROM flows WHERE id = ?1", [id], |_| Ok(())).optional().map_err(sql)?.is_some() {
+            return Err("the flow is running in a tab; stop that run first".into());
+        }
         one_flow(id, changed)
+    }
+
+    /// At startup: ends the runs of tabs that were not saved, and makes the running
+    /// ones wait (see `runs::after_restart`).
+    pub fn resume_runs(&self) -> Result<(), String> {
+        let mut conn = self.conn();
+        let tabs: Vec<TabId> = {
+            let mut stmt = conn.prepare("SELECT tab_id FROM tabs").map_err(sql)?;
+            let ids: Vec<String> = stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?;
+            ids.iter().filter_map(|id| TabId::parse(id).ok()).collect()
+        };
+        runs::after_restart(&mut conn, &tabs)
+    }
+
+    pub fn stop_tab_run(&self, tab_id: &TabId) -> Result<(), String> {
+        runs::stop_tab(&self.conn(), tab_id)
+    }
+
+    pub fn start_run(&self, flow_id: i64, tab_id: &TabId) -> Result<Option<String>, String> {
+        runs::start(&mut self.conn(), flow_id, tab_id)
+    }
+
+    pub fn proceed_run(&self, run_id: i64, output: &str, note: &str) -> Result<Option<String>, String> {
+        runs::proceed(&mut self.conn(), run_id, output, note)
+    }
+
+    pub fn stop_run(&self, run_id: i64) -> Result<(), String> {
+        runs::stop(&self.conn(), run_id)
+    }
+
+    pub fn active_runs(&self) -> Result<Vec<runs::Run>, String> {
+        runs::active(&self.conn())
     }
 }
 
@@ -1341,6 +1436,55 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn every_connection_enforces_foreign_keys() {
+        let path = temp_db("foreign-keys");
+        let db = Db::open(path.clone()).unwrap();
+        let on = |conn: &Connection| conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0)).unwrap();
+        assert!(on(&db.conn()));
+        assert!(on(&connect_existing(&path).unwrap()));
+        assert!(on(&Db::open_or_recover(Err("none".into())).conn()));
+    }
+
+    #[test]
+    fn upgrading_from_schema_6_keeps_the_flows_and_adds_runs() {
+        let path = temp_db("upgrade-v6");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(&MIGRATIONS[..6].concat()).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute("INSERT INTO flows (name, position, created_at, updated_at) VALUES ('Deploy', 0, 0, 0)", []).unwrap();
+        drop(conn);
+        let db = Db::open(path.clone()).unwrap();
+        assert_eq!(schema_version(&connect(&path).unwrap()).unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(flow_names(&db), names(&["Deploy"]));
+        assert!(crate::runs::active(&connect_existing(&path).unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_running_flow_is_not_deleted_and_a_finished_one_takes_its_runs_along() {
+        let path = temp_db("flows-delete-runs");
+        let db = Db::open(path.clone()).unwrap();
+        let mut runs = connect_existing(&path).unwrap();
+        let runnable = crate::flows::tests::runnable();
+        let ids: Vec<i64> = ["busy", "idle"].iter().map(|n| db.create_flow(n).unwrap().id).collect();
+        for (id, tab) in ids.iter().zip(["t1", "t2"]) {
+            db.save_flow_graph(*id, &runnable).unwrap();
+            crate::runs::start(&mut runs, *id, &tid(tab)).unwrap();
+        }
+        let idle_run = crate::runs::active(&runs).unwrap()[1].id;
+        crate::runs::stop(&runs, idle_run).unwrap();
+        for status in ["running", "manual", "attention"] {
+            runs.execute("UPDATE flow_runs SET status = ?1 WHERE tab_id = 't1'", [status]).unwrap();
+            let err = db.delete_flow(ids[0]).unwrap_err();
+            assert!(err.contains("running"), "{status}: {err}");
+        }
+        db.delete_flow(ids[1]).unwrap();
+        assert!(db.delete_flow(ids[1]).unwrap_err().contains("no flow"));
+        let left: i64 = runs.query_row("SELECT COUNT(*) FROM flow_runs", [], |r| r.get(0)).unwrap();
+        let events: i64 = runs.query_row("SELECT COUNT(*) FROM flow_run_events", [], |r| r.get(0)).unwrap();
+        assert_eq!((left, events), (1, 1), "only the busy flow's run and its first step remain");
+    }
+
+    #[test]
     fn upgrading_from_schema_5_keeps_the_settings_and_adds_flows() {
         let path = temp_db("upgrade-v5");
         let conn = Connection::open(&path).unwrap();
@@ -1349,7 +1493,7 @@ pub(crate) mod tests {
         conn.execute("UPDATE settings SET disable_auto_memory = 1", []).unwrap();
         drop(conn);
         let db = Db::open(path.clone()).unwrap();
-        assert_eq!(schema_version(&connect(&path).unwrap()).unwrap(), 6);
+        assert_eq!(schema_version(&connect(&path).unwrap()).unwrap(), MIGRATIONS.len() as i64);
         assert!(db.load_settings().unwrap().disable_auto_memory);
         assert!(db.list_flows().unwrap().is_empty());
         db.create_flow("Deploy").unwrap();
