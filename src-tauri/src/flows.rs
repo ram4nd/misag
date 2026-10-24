@@ -1,0 +1,427 @@
+//! Flows: graphs of steps that send prompts to Claude or wait for a person. A
+//! flow's graph is stored as JSON in `flows.graph` and edited on its editor tab.
+//!
+//! `check` is what every stored graph satisfies; a graph being edited may still
+//! be incomplete, and `problems` says what keeps it from running.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+pub const MAX_STEPS: usize = 200;
+pub const MAX_OUTPUTS: usize = 8;
+const MAX_TITLE: usize = 200;
+const MAX_TEXT: usize = 20_000;
+const MAX_ID: usize = 40;
+const MAX_OUTPUT: usize = 24;
+/// The output a Start step leads on by.
+pub const START_OUTPUT: &str = "next";
+/// Reserved for the flow runner, which reads it as "needs a person" in place of
+/// an output, so no step may use it as one.
+pub const ATTENTION: &str = "attention";
+
+/// The graph format this raterm writes; `check` refuses newer ones, which it
+/// could misread.
+pub const GRAPH_VERSION: u32 = 1;
+
+/// Mirrored by `Graph` in src/flowEditor.ts.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Graph {
+    /// Graphs stored before versions were added are version 1.
+    #[serde(default = "first_version")]
+    pub version: u32,
+    pub nodes: Vec<Node>,
+    pub edges: Vec<Edge>,
+}
+
+fn first_version() -> u32 {
+    1
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Start,
+    /// Sends `text` to Claude.
+    Prompt,
+    /// Waits for a person, who picks one of the outputs.
+    Manual,
+    End,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Node {
+    pub id: String,
+    pub kind: Kind,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub text: String,
+    /// The ways the step can end, each leading to at most one next step.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    pub x: f64,
+    pub y: f64,
+}
+
+/// From `from`'s output `output` to the step `to`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Edge {
+    pub from: String,
+    pub output: String,
+    pub to: String,
+}
+
+impl Default for Graph {
+    /// A new flow: only its Start step.
+    fn default() -> Self {
+        let start = Node {
+            id: "start".into(),
+            kind: Kind::Start,
+            title: "Start".into(),
+            text: String::new(),
+            outputs: vec![START_OUTPUT.into()],
+            x: 40.0,
+            y: 40.0,
+        };
+        Graph { version: GRAPH_VERSION, nodes: vec![start], edges: Vec::new() }
+    }
+}
+
+impl Node {
+    /// The step as the user knows it: its title, or what kind of step it is.
+    fn name(&self) -> &str {
+        match (self.title.trim(), self.kind) {
+            ("", Kind::Start) => "Start",
+            ("", Kind::Prompt) => "Prompt step",
+            ("", Kind::Manual) => "Manual step",
+            ("", Kind::End) => "End",
+            (title, _) => title,
+        }
+    }
+}
+
+fn plain_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_ID && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// An output is a short lowercase word, so Claude can end its reply with it.
+fn plain_output(output: &str) -> bool {
+    let mut bytes = output.bytes();
+    output.len() <= MAX_OUTPUT
+        && bytes.next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+fn check_outputs(node: &Node) -> Result<(), String> {
+    let name = node.name();
+    match node.kind {
+        Kind::Start if node.outputs != [START_OUTPUT] => {
+            return Err(format!("Start must have the one output \"{START_OUTPUT}\""));
+        }
+        Kind::End if !node.outputs.is_empty() => return Err(format!("End step \"{name}\" cannot have outputs")),
+        Kind::Start | Kind::End => return Ok(()),
+        Kind::Prompt | Kind::Manual => {}
+    }
+    if node.outputs.is_empty() || node.outputs.len() > MAX_OUTPUTS {
+        return Err(format!("\"{name}\" needs between 1 and at most {MAX_OUTPUTS} outputs"));
+    }
+    let mut seen = HashSet::new();
+    for output in &node.outputs {
+        if !plain_output(output) || output == ATTENTION {
+            return Err(format!(
+                "\"{name}\" has the output {output:?}; outputs are short lowercase words (letters, digits, - and _), and \"{ATTENTION}\" is reserved"
+            ));
+        }
+        if !seen.insert(output.as_str()) {
+            return Err(format!("\"{name}\" has the output \"{output}\" twice"));
+        }
+    }
+    Ok(())
+}
+
+fn check_node(node: &Node) -> Result<(), String> {
+    if !plain_id(&node.id) {
+        return Err(format!("bad step id {:?}: a step id is 1 to {MAX_ID} letters, digits, - or _", node.id));
+    }
+    if node.title.chars().count() > MAX_TITLE || node.text.chars().count() > MAX_TEXT {
+        return Err(format!("\"{}\" has a title or text that is too long", node.name()));
+    }
+    if !node.x.is_finite() || !node.y.is_finite() {
+        return Err(format!("\"{}\" has no valid position", node.name()));
+    }
+    check_outputs(node)
+}
+
+/// Ok if `graph` is well formed enough to store (see the module docs), else why not.
+pub fn check(graph: &Graph) -> Result<(), String> {
+    if graph.version > GRAPH_VERSION {
+        return Err(format!(
+            "this flow was saved by a newer raterm (format {}, this one knows {GRAPH_VERSION})",
+            graph.version
+        ));
+    }
+    if graph.nodes.len() > MAX_STEPS {
+        return Err(format!("a flow has at most {MAX_STEPS} steps"));
+    }
+    let mut nodes = HashMap::new();
+    for node in &graph.nodes {
+        check_node(node)?;
+        if nodes.insert(node.id.as_str(), node).is_some() {
+            return Err(format!("there is more than one step with the id {:?}", node.id));
+        }
+    }
+    // Only a flow stored before it had steps has none; it loads as a new flow.
+    let starts = graph.nodes.iter().filter(|n| n.kind == Kind::Start).count();
+    if !graph.nodes.is_empty() && starts != 1 {
+        return Err("a flow has exactly one Start step".into());
+    }
+    let mut used = HashSet::new();
+    for edge in &graph.edges {
+        let from = nodes.get(edge.from.as_str()).ok_or_else(|| format!("a connection comes from the missing step {:?}", edge.from))?;
+        let to = nodes.get(edge.to.as_str()).ok_or_else(|| format!("a connection goes to the missing step {:?}", edge.to))?;
+        if from.kind == Kind::End {
+            return Err(format!("End step \"{}\" cannot lead anywhere", from.name()));
+        }
+        if to.kind == Kind::Start {
+            return Err("no step can lead back to Start".into());
+        }
+        if !from.outputs.contains(&edge.output) {
+            return Err(format!("\"{}\" has no output {:?}", from.name(), edge.output));
+        }
+        if !used.insert((edge.from.as_str(), edge.output.as_str())) {
+            return Err(format!("\"{}\" has more than one next step for \"{}\"", from.name(), edge.output));
+        }
+    }
+    Ok(())
+}
+
+/// What keeps a stored graph from running, in the order the steps are listed.
+pub fn problems(graph: &Graph) -> Vec<String> {
+    let Some(start) = graph.nodes.iter().find(|n| n.kind == Kind::Start) else {
+        return vec!["The flow needs a Start step.".into()];
+    };
+    // Every step Start leads to, directly or not.
+    let mut reached = HashSet::from([start.id.as_str()]);
+    let mut queue = vec![start.id.as_str()];
+    while let Some(id) = queue.pop() {
+        for edge in graph.edges.iter().filter(|e| e.from == id) {
+            if reached.insert(edge.to.as_str()) {
+                queue.push(edge.to.as_str());
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    for node in &graph.nodes {
+        let name = node.name();
+        if node.kind == Kind::Prompt && node.text.trim().is_empty() {
+            problems.push(format!("\"{name}\" has no prompt."));
+        }
+        for output in &node.outputs {
+            if !graph.edges.iter().any(|e| e.from == node.id && &e.output == output) {
+                problems.push(match node.kind {
+                    Kind::Start => "Start is not connected to a step.".into(),
+                    _ => format!("\"{name}\" has no next step for \"{output}\"."),
+                });
+            }
+        }
+        if !reached.contains(node.id.as_str()) {
+            problems.push(format!("\"{name}\" cannot be reached from Start."));
+        }
+    }
+    problems
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn node(id: &str, kind: Kind, outputs: &[&str]) -> Node {
+        Node {
+            id: id.into(),
+            kind,
+            title: id.to_uppercase(),
+            text: if kind == Kind::Prompt { format!("do {id}") } else { String::new() },
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            x: 0.0,
+            y: 0.0,
+        }
+    }
+
+    pub(crate) fn edge(from: &str, output: &str, to: &str) -> Edge {
+        Edge { from: from.into(), output: output.into(), to: to.into() }
+    }
+
+    /// Start → a prompt that passes to an end, or fails back to itself.
+    pub(crate) fn runnable() -> Graph {
+        Graph {
+            nodes: vec![
+                node("start", Kind::Start, &["next"]),
+                node("p", Kind::Prompt, &["pass", "fail"]),
+                node("e", Kind::End, &[]),
+            ],
+            edges: vec![edge("start", "next", "p"), edge("p", "pass", "e"), edge("p", "fail", "p")],
+            version: 1,
+        }
+    }
+
+    fn rejected(graph: &Graph, why: &str) {
+        let err = check(graph).expect_err(why);
+        assert!(err.contains(why), "{err:?} should mention {why:?}");
+    }
+
+    #[test]
+    fn a_new_flow_is_a_lone_start() {
+        let graph = Graph::default();
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!((graph.nodes[0].kind, graph.nodes[0].outputs.clone()), (Kind::Start, vec!["next".to_string()]));
+        assert!(graph.edges.is_empty());
+        check(&graph).unwrap();
+        assert_eq!(problems(&graph), vec!["Start is not connected to a step."]);
+    }
+
+    #[test]
+    fn a_complete_flow_has_no_problems() {
+        check(&runnable()).unwrap();
+        assert!(problems(&runnable()).is_empty());
+    }
+
+    #[test]
+    fn the_json_shape_matches_the_frontend() {
+        let json = serde_json::to_value(runnable()).unwrap();
+        assert_eq!(json["nodes"][1]["kind"], "prompt");
+        assert_eq!(json["nodes"][1]["outputs"], serde_json::json!(["pass", "fail"]));
+        assert_eq!(json["edges"][0], serde_json::json!({ "from": "start", "output": "next", "to": "p" }));
+        assert_eq!(json["version"], 1);
+        // Title, text and outputs may be left out.
+        let parsed: Graph = serde_json::from_value(serde_json::json!({
+            "nodes": [{ "id": "e", "kind": "end", "x": 1, "y": 2 }], "edges": []
+        }))
+        .unwrap();
+        assert_eq!(parsed.nodes[0].title, "");
+        assert_eq!(parsed.version, 1, "graphs stored before versions are version 1");
+        let newer = serde_json::json!({ "version": 2, "nodes": [], "edges": [] });
+        assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer raterm"));
+    }
+
+    #[test]
+    fn limits_count_characters_not_bytes() {
+        let mut g = runnable();
+        g.nodes[1].title = "ä".repeat(200);
+        check(&g).unwrap();
+        let mut g = Graph::default();
+        g.nodes.extend((1..200).map(|i| node(&format!("n{i}"), Kind::End, &[])));
+        check(&g).unwrap();
+    }
+
+    #[test]
+    fn step_ids_are_unique_and_plain() {
+        let mut g = runnable();
+        g.nodes[2].id = "p".into();
+        rejected(&g, "more than one step with the id");
+        for bad in ["", "a b", "x\n", &"n".repeat(41)] {
+            let mut g = runnable();
+            g.nodes[2].id = bad.into();
+            g.edges[1].to = bad.into();
+            rejected(&g, "step id");
+        }
+    }
+
+    #[test]
+    fn there_is_at_most_one_start_and_it_has_one_output() {
+        let mut g = runnable();
+        g.nodes.push(node("s2", Kind::Start, &["next"]));
+        rejected(&g, "exactly one Start");
+        let mut g = runnable();
+        g.nodes.remove(0);
+        g.edges.remove(0);
+        rejected(&g, "exactly one Start");
+        check(&Graph { version: 1, nodes: vec![], edges: vec![] }).unwrap();
+        let mut g = runnable();
+        g.nodes[0].outputs = vec!["go".into()];
+        g.edges[0].output = "go".into();
+        rejected(&g, "Start");
+        let mut g = runnable();
+        g.nodes[2].outputs = vec!["again".into()];
+        rejected(&g, "End");
+    }
+
+    #[test]
+    fn outputs_are_short_lowercase_words() {
+        for bad in [vec![], vec!["Pass"], vec!["a b"], vec![""], vec!["ok", "ok"], vec!["attention"], vec!["x".repeat(25).as_str()]] {
+            let mut g = runnable();
+            g.nodes[1].outputs = bad.iter().map(|o| o.to_string()).collect();
+            g.edges.retain(|e| e.from != "p");
+            assert!(check(&g).is_err(), "{bad:?}");
+        }
+        let mut g = runnable();
+        g.nodes[1].outputs = (0..9).map(|i| format!("o{i}")).collect();
+        g.edges.retain(|e| e.from != "p");
+        rejected(&g, "at most 8");
+        let mut g = runnable();
+        g.nodes[1].outputs = vec!["done".into(), "needs-fix".into(), "retry_2".into()];
+        g.edges.retain(|e| e.from != "p");
+        check(&g).unwrap();
+    }
+
+    #[test]
+    fn edges_join_existing_outputs_and_steps() {
+        let mut g = runnable();
+        g.edges.push(edge("ghost", "next", "p"));
+        rejected(&g, "ghost");
+        let mut g = runnable();
+        g.edges[1].to = "ghost".into();
+        rejected(&g, "ghost");
+        let mut g = runnable();
+        g.edges[1].output = "maybe".into();
+        rejected(&g, "maybe");
+        let mut g = runnable();
+        g.edges.push(edge("p", "pass", "p"));
+        rejected(&g, "more than one next step");
+        let mut g = runnable();
+        g.edges.push(edge("e", "next", "p"));
+        rejected(&g, "End");
+        let mut g = runnable();
+        g.edges[2].to = "start".into();
+        rejected(&g, "Start");
+    }
+
+    #[test]
+    fn sizes_and_positions_are_bounded() {
+        let mut g = runnable();
+        g.nodes[1].text = "x".repeat(20_001);
+        rejected(&g, "too long");
+        let mut g = runnable();
+        g.nodes[1].title = "x".repeat(201);
+        rejected(&g, "too long");
+        let mut g = runnable();
+        g.nodes[1].x = f64::NAN;
+        rejected(&g, "position");
+        let mut g = Graph::default();
+        g.nodes.extend((0..200).map(|i| node(&format!("n{i}"), Kind::End, &[])));
+        rejected(&g, "at most 200");
+    }
+
+    #[test]
+    fn problems_name_the_steps_in_order() {
+        let mut g = runnable();
+        g.nodes[1].text = "  ".into();
+        g.edges.retain(|e| e.output != "fail");
+        g.nodes.push(Node { title: String::new(), ..node("m", Kind::Manual, &["done"]) });
+        assert_eq!(
+            problems(&g),
+            vec![
+                "\"P\" has no prompt.",
+                "\"P\" has no next step for \"fail\".",
+                "\"Manual step\" has no next step for \"done\".",
+                "\"Manual step\" cannot be reached from Start.",
+            ]
+        );
+        let mut g = runnable();
+        g.nodes.remove(0);
+        g.edges.remove(0);
+        assert_eq!(problems(&g)[0], "The flow needs a Start step.");
+    }
+}

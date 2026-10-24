@@ -4,6 +4,7 @@
 
 use crate::claude::{self, HookProblem, SessionId};
 use crate::db::{Db, FlowSummary, StoreStatus};
+use crate::flows::{self, Graph};
 use crate::layout::{Layout, TabId};
 use crate::session::{self, Launch, SpawnError, Sessions, SpawnRequest};
 use crate::settings::{skips_permissions, Settings};
@@ -491,6 +492,31 @@ pub fn flows_reorder(db: State<'_, Db>, ids: Vec<i64>) -> Result<(), CommandErro
     Ok(db.reorder_flows(&ids)?)
 }
 
+/// A flow with its steps, for its editor tab. Mirrored by `FlowDetail` in src/flowEditor.ts.
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FlowDetail {
+    #[serde(flatten)]
+    flow: FlowSummary,
+    graph: Graph,
+    /// What keeps it from running; see `flows::problems`.
+    problems: Vec<String>,
+}
+
+#[tauri::command(async)]
+pub fn flow_load(db: State<'_, Db>, id: i64) -> Result<FlowDetail, CommandError> {
+    let (flow, graph) = db.load_flow(id)?;
+    let problems = flows::problems(&graph);
+    Ok(FlowDetail { flow, graph, problems })
+}
+
+/// Stores a flow's steps and returns what keeps them from running.
+#[tauri::command(async)]
+pub fn flow_save_graph(db: State<'_, Db>, id: i64, graph: Graph) -> Result<Vec<String>, CommandError> {
+    db.save_flow_graph(id, &graph)?;
+    Ok(flows::problems(&graph))
+}
+
 #[tauri::command(async)]
 pub fn flow_delete(db: State<'_, Db>, id: i64) -> Result<(), CommandError> {
     Ok(db.delete_flow(id)?)
@@ -548,6 +574,16 @@ mod tests {
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
     const LATER: &str = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
     const EXE: &str = "/bin/raterm";
+
+    #[test]
+    fn a_loaded_flow_is_one_flat_object() {
+        let flow = FlowSummary { id: 3, name: "Deploy".into(), archived: false };
+        let detail = FlowDetail { flow, graph: Graph::default(), problems: vec!["x".into()] };
+        let json = serde_json::to_value(detail).unwrap();
+        let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["archived", "graph", "id", "name", "problems"]);
+    }
 
     fn session() -> SessionId {
         SessionId::parse(ID).unwrap()

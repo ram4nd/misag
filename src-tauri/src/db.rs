@@ -7,6 +7,7 @@
 //! schema it does not know exactly.
 
 use crate::claude::SessionId;
+use crate::flows::{self, Graph};
 use crate::layout::{Layout, Tab, TabId, TabKind};
 use crate::settings::Settings;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -508,6 +509,10 @@ fn flow_name(name: &str) -> Result<&str, String> {
     }
 }
 
+fn graph_json(graph: &Graph) -> Result<String, String> {
+    serde_json::to_string(graph).map_err(|e| format!("the steps could not be stored ({e})"))
+}
+
 fn now_secs() -> i64 {
     i64::try_from(unix_secs(SystemTime::now())).unwrap_or(i64::MAX)
 }
@@ -530,15 +535,16 @@ impl Db {
         flows
     }
 
-    /// Adds a flow with no steps after the others.
+    /// Adds a flow after the others, with only its Start step.
     pub fn create_flow(&self, name: &str) -> Result<FlowSummary, String> {
         let name = flow_name(name)?;
+        let graph = graph_json(&Graph::default())?;
         let conn = self.conn();
         let now = now_secs();
         conn.execute(
-            "INSERT INTO flows (name, position, created_at, updated_at)
-             VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM flows), ?2, ?2)",
-            params![name, now],
+            "INSERT INTO flows (name, position, graph, created_at, updated_at)
+             VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM flows), ?3, ?2, ?2)",
+            params![name, now, graph],
         )
         .map_err(sql)?;
         Ok(FlowSummary { id: conn.last_insert_rowid(), name: name.into(), archived: false })
@@ -582,6 +588,34 @@ impl Db {
             tx.execute("UPDATE flows SET position = ?2 WHERE id = ?1", params![id, position as i64]).map_err(sql)?;
         }
         tx.commit().map_err(sql)
+    }
+
+    /// The flow and its steps; one stored without any steps (the column's default)
+    /// loads as a new flow.
+    pub fn load_flow(&self, id: i64) -> Result<(FlowSummary, Graph), String> {
+        let (name, archived, graph): (String, bool, String) = self
+            .conn()
+            .query_row("SELECT name, archived, graph FROM flows WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()
+            .map_err(sql)?
+            .ok_or_else(|| format!("there is no flow {id}"))?;
+        let graph: Graph = serde_json::from_str(&graph)
+            .map_err(|e| format!("the steps of \"{name}\" cannot be read ({e})"))?;
+        let graph = if graph.nodes.is_empty() && graph.edges.is_empty() { Graph::default() } else { graph };
+        Ok((FlowSummary { id, name, archived }, graph))
+    }
+
+    /// Stores the flow's steps if they pass `flows::check`.
+    pub fn save_flow_graph(&self, id: i64, graph: &Graph) -> Result<(), String> {
+        flows::check(graph)?;
+        let graph = graph_json(graph)?;
+        let changed = self
+            .conn()
+            .execute("UPDATE flows SET graph = ?2, updated_at = ?3 WHERE id = ?1", params![id, graph, now_secs()])
+            .map_err(sql)?;
+        one_flow(id, changed)
     }
 
     pub fn delete_flow(&self, id: i64) -> Result<(), String> {
@@ -679,6 +713,7 @@ pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Resul
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::flows::Graph;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1269,6 +1304,40 @@ pub(crate) mod tests {
             [],
         );
         assert!(blank.is_err());
+    }
+
+    #[test]
+    fn a_new_flow_starts_with_its_start_step_and_its_graph_round_trips() {
+        let db = Db::open(temp_db("flows-graph")).unwrap();
+        let id = db.create_flow("Deploy").unwrap().id;
+        let (flow, graph) = db.load_flow(id).unwrap();
+        assert_eq!(flow.name, "Deploy");
+        assert_eq!(graph, Graph::default());
+        let runnable = crate::flows::tests::runnable();
+        db.save_flow_graph(id, &runnable).unwrap();
+        assert_eq!(db.load_flow(id).unwrap().1, runnable);
+        assert!(db.load_flow(id + 100).unwrap_err().contains("no flow"));
+        assert!(db.save_flow_graph(id + 100, &runnable).unwrap_err().contains("no flow"));
+    }
+
+    #[test]
+    fn a_graph_that_fails_its_check_is_not_saved() {
+        let db = Db::open(temp_db("flows-bad-graph")).unwrap();
+        let id = db.create_flow("Deploy").unwrap().id;
+        let mut bad = crate::flows::tests::runnable();
+        bad.edges[0].to = "ghost".into();
+        assert!(db.save_flow_graph(id, &bad).unwrap_err().contains("ghost"));
+        assert_eq!(db.load_flow(id).unwrap().1, Graph::default());
+    }
+
+    #[test]
+    fn a_flow_stored_without_steps_loads_as_a_new_one() {
+        let db = Db::open(temp_db("flows-empty-graph")).unwrap();
+        let id = db.create_flow("Deploy").unwrap().id;
+        db.conn().execute("UPDATE flows SET graph = '{\"nodes\":[],\"edges\":[]}'", []).unwrap();
+        assert_eq!(db.load_flow(id).unwrap().1, Graph::default());
+        db.conn().execute("UPDATE flows SET graph = 'not json'", []).unwrap();
+        assert!(db.load_flow(id).unwrap_err().contains("cannot be read"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ pub mod claude;
 mod commands;
 pub mod db;
 pub mod files;
+pub mod flows;
 pub mod layout;
 pub mod session;
 pub mod settings;
@@ -165,6 +166,8 @@ pub fn run() {
             commands::flow_set_archived,
             commands::flows_reorder,
             commands::flow_delete,
+            commands::flow_load,
+            commands::flow_save_graph,
         ])
         .build(tauri::generate_context!())
         .expect("error while building raterm")

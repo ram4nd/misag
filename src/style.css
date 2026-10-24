@@ -230,3 +230,60 @@ svg.lucide { display: block; flex: none; }
 #flows-settings details { margin-top: 20px; color: var(--muted); }
 #flows-settings details ul { margin-top: 8px; color: var(--fg); }
 #flows-settings details li .name { padding: 6px 0; }
+#flows-box .flows li { cursor: pointer; }
+#flows-box .flows li:hover { background: var(--hover); }
+
+/* ---------- flow editor (see src/flowEditor.ts and src/canvas.ts) ---------- */
+.page.flow-editor { padding: 0; }
+.page.flow-editor.active { display: flex; }
+.flow-editor form { max-width: none; flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.flow-editor > form > fieldset { flex: 1; min-height: 0; gap: 0; }
+.flow-editor .toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--press); }
+.flow-editor .status { margin-left: auto; color: var(--muted); }
+.flow-editor .workspace { flex: 1; display: flex; min-height: 0; }
+.flow-editor .canvas {
+  flex: 1; position: relative; overflow: hidden; outline: none;
+  background: var(--strip) radial-gradient(var(--line) 1px, transparent 1px) 0 0 / 20px 20px;
+}
+.flow-editor .side {
+  width: 300px; flex: none; overflow: auto; padding: 12px; border-left: 1px solid var(--press);
+  display: flex; flex-direction: column; gap: 16px;
+}
+.flow-editor .panel { display: flex; flex-direction: column; gap: 10px; }
+.flow-editor .panel[hidden], .flow-editor .panel label[hidden], .flow-editor .panel button[hidden] { display: none; }
+.flow-editor textarea {
+  font: inherit; color: var(--fg); background: var(--surface); resize: vertical;
+  border: 1px solid var(--press); border-radius: 6px; padding: 6px 8px; outline: none;
+}
+.flow-editor textarea:focus { border-color: var(--accent); }
+.flow-editor .invalid, .flow-editor > form > .error { margin: 0; color: #b3261e; }
+.flow-editor > form > .error { padding: 8px 12px; }
+.flow-editor .delete-step { align-self: flex-start; }
+.flow-editor .problems { color: var(--muted); }
+.flow-editor .problems p { margin: 0 0 4px; }
+.flow-editor .problems ul { margin: 0; padding-left: 18px; }
+
+/* Drawflow's own stylesheet lays the canvas out; these give the steps raterm's look. */
+.flow-editor .drawflow .drawflow-node {
+  width: 180px; min-height: 0; padding: 8px 12px; border-radius: 8px;
+  background: var(--surface); color: var(--fg); border: 1px solid var(--line);
+}
+.flow-editor .drawflow .drawflow-node.selected { border-color: var(--accent); background: var(--surface); box-shadow: 0 0 0 2px var(--accent); }
+.flow-editor .drawflow .drawflow-node .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.flow-editor .drawflow .drawflow-node .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flow-editor .drawflow .drawflow-node.start { border-left: 4px solid #1e8e3e; }
+.flow-editor .drawflow .drawflow-node.prompt { border-left: 4px solid #d97757; }
+.flow-editor .drawflow .drawflow-node.manual { border-left: 4px solid var(--accent); }
+.flow-editor .drawflow .drawflow-node.end { border-left: 4px solid var(--muted); }
+.flow-editor .drawflow .drawflow-node .input, .flow-editor .drawflow .drawflow-node .output {
+  width: 14px; height: 14px; border: 2px solid var(--muted); background: var(--surface);
+}
+.flow-editor .drawflow .drawflow-node .outputs .output { position: relative; }
+.flow-editor .drawflow .drawflow-node .output::after {
+  content: attr(data-label); position: absolute; left: 18px; top: -3px;
+  font-size: 11px; color: var(--muted); white-space: nowrap; pointer-events: none;
+}
+/* Start cannot be deleted, so Drawflow's delete cross is never shown on it. */
+.flow-editor .drawflow .drawflow-node.start .drawflow-delete { display: none; }
+.flow-editor .drawflow .connection .main-path { stroke: var(--muted); stroke-width: 3px; }
+.flow-editor .drawflow .connection .main-path:hover, .flow-editor .drawflow .connection .main-path.selected { stroke: var(--accent); }

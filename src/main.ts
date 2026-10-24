@@ -10,7 +10,8 @@ import "@xterm/xterm/css/xterm.css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
-import { createFlows } from "./flows";
+import { createFlows, type Flow } from "./flows";
+import { createFlowEditor, type FlowEditor } from "./flowEditor";
 
 /**
  * What a tab runs, tagged by `kind`; each kind has only its own fields.
@@ -206,13 +207,19 @@ interface Page {
   tabEl: HTMLElement | null;
   /** Fills the page when its tab opens, enabling its form; by default from the stored settings (`loadPage`). */
   load?: () => Promise<void>;
+  /** Called whenever the pages are redrawn with this one shown. */
+  shown?: () => void;
 }
-type PageId = "settings" | "workspace" | "flows";
+/** The fixed pages, plus one editor page per open flow. */
+type StaticPageId = "settings" | "workspace" | "flows";
+type EditorPageId = `flow:${number}`;
+type PageId = StaticPageId | EditorPageId;
+const isEditorPage = (id: PageId): id is EditorPageId => id.startsWith("flow:");
 function page(title: string, icon: IconName, unreadable: string, sel: string): Page {
   const el = $<HTMLElement>(sel);
   return { title, icon, unreadable, el, form: el.querySelector("form")!, tabEl: null };
 }
-const pages: Record<PageId, Page> = {
+const pages: Record<StaticPageId, Page> = {
   settings: page("Settings", "settings", "so Claude tabs start with permission prompts and auto memory off, and settings cannot be changed.", "#settings"),
   workspace: page(
     "Workspace settings",
@@ -222,7 +229,16 @@ const pages: Record<PageId, Page> = {
   ),
   flows: page("Flows", "workflow", "", "#flows-settings"),
 };
-const pageIds = Object.keys(pages) as PageId[];
+const pageIds = Object.keys(pages) as StaticPageId[];
+/** The open flows' editor pages, created when opened and removed when closed. */
+const editorPages = new Map<EditorPageId, { page: Page; editor: FlowEditor }>();
+function pageOf(id: PageId): Page {
+  if (!isEditorPage(id)) return pages[id];
+  const editor = editorPages.get(id);
+  // Editor pages leave the map only after their tab has closed.
+  if (!editor) throw new Error(`raterm: no editor page ${id}`);
+  return editor.page;
+}
 const settingsForm = pages.settings.form;
 
 const sessions: Session[] = [];
@@ -471,10 +487,11 @@ function showActive() {
     o.el.classList.toggle("active", !shown && o === active);
     tabsEl.children[i]?.classList.toggle("active", !shown && o === active);
   });
-  for (const id of pageIds) {
-    pages[id].el.classList.toggle("active", id === shownPage);
-    pages[id].tabEl?.classList.toggle("active", id === shownPage);
+  for (const id of [...pageIds, ...editorPages.keys()]) {
+    pageOf(id).el.classList.toggle("active", id === shownPage);
+    pageOf(id).tabEl?.classList.toggle("active", id === shownPage);
   }
+  if (shownPage !== null) pageOf(shownPage).shown?.();
 }
 
 function close(s: Session) {
@@ -564,8 +581,8 @@ function renderSessions() {
     }),
   );
   for (const id of openPages) {
-    pages[id].tabEl = renderPageTab(id);
-    tabsEl.append(pages[id].tabEl!);
+    pageOf(id).tabEl = renderPageTab(id);
+    tabsEl.append(pageOf(id).tabEl!);
   }
 }
 
@@ -660,16 +677,17 @@ async function pollTabs() {
 }
 
 function renderPageTab(id: PageId): HTMLElement {
+  const p = pageOf(id);
   const tab = document.createElement("div");
   tab.className = "tab page-tab";
-  tab.title = pages[id].title;
+  tab.title = p.title;
   tab.classList.toggle("active", shownPage === id);
   const mark = document.createElement("span");
   mark.className = "icon";
-  mark.append(icon(pages[id].icon));
+  mark.append(icon(p.icon));
   const name = document.createElement("span");
   name.className = "name";
-  name.textContent = pages[id].title;
+  name.textContent = p.title;
   const x = document.createElement("button");
   x.className = "x";
   x.append(icon("x", 12));
@@ -763,7 +781,7 @@ for (const id of pageIds) pages[id].form.onsubmit = (e) => e.preventDefault();
 
 /** Opens the page's tab (loading the stored settings into it) and shows it. */
 function openPage(id: PageId) {
-  const p = pages[id];
+  const p = pageOf(id);
   if (!openPages.includes(id)) {
     openPages.push(id);
     // Disabled now, not when the load starts, so nothing can change before it.
@@ -778,11 +796,29 @@ function openPage(id: PageId) {
   p.el.focus();
 }
 
+/**
+ * Closes the page's tab. A flow editor's waiting changes are saved first, and if
+ * they cannot be, its tab stays open showing why.
+ */
 function closePage(id: PageId) {
+  const editor = isEditorPage(id) ? editorPages.get(id) : undefined;
+  if (!editor) return removePage(id);
+  editor.editor.flush().then((saved) => {
+    if (saved) removePage(id);
+    else if (openPages.includes(id)) openPage(id);
+  });
+}
+
+/** Closes the page's tab right away; a flow editor's page goes with it. */
+function removePage(id: PageId) {
   const i = openPages.indexOf(id);
   if (i < 0) return;
   openPages.splice(i, 1);
-  pages[id].tabEl = null;
+  pageOf(id).tabEl = null;
+  if (isEditorPage(id)) {
+    editorPages.get(id)!.page.el.remove();
+    editorPages.delete(id);
+  }
   const wasShown = shownPage === id;
   if (wasShown) shownPage = null;
   renderSessions();
@@ -1190,7 +1226,47 @@ const flows = createFlows({
   page: pages.flows.el,
   errorText,
   showError: (message) => showPageError(pages.flows, message),
+  onOpen: openFlowEditor,
+  onChange: followFlows,
 });
+
+/** Opens the flow's editor tab, creating it the first time. */
+function openFlowEditor(flow: Flow) {
+  const id: EditorPageId = `flow:${flow.id}`;
+  if (!editorPages.has(id)) {
+    const editor = createFlowEditor(flow.id, { errorText });
+    termsEl.append(editor.el);
+    const page: Page = {
+      title: flow.name,
+      icon: "workflow",
+      unreadable: "",
+      el: editor.el,
+      form: editor.el.querySelector("form")!,
+      tabEl: null,
+      load: async () => {
+        if (await editor.load()) enablePage(page, true);
+      },
+      shown: editor.shown,
+    };
+    editorPages.set(id, { page, editor });
+  }
+  openPage(id);
+}
+
+/** Keeps editor tabs in step with the stored flows: renamed ones are retitled, deleted ones closed. */
+function followFlows(stored: Flow[]) {
+  for (const [id, { page }] of editorPages) {
+    const flow = stored.find((f) => `flow:${f.id}` === id);
+    if (flow) {
+      page.title = flow.name;
+      continue;
+    }
+    // The flow is gone: a change still waiting has nowhere to go.
+    editorPages.get(id)!.editor.discard();
+    removePage(id);
+  }
+  renderSessions();
+}
 // The page stays disabled if the flows cannot be read, so nothing is changed blindly.
 pages.flows.load = async () => {
   try {
@@ -1226,7 +1302,15 @@ pages.workspace.el.querySelector<HTMLButtonElement>(".home-workspace")!.onclick 
  */
 async function watchWindowClose() {
   let warned = false;
+  let warnedFlows = false;
   await getCurrentWindow().onCloseRequested(async (event) => {
+    const flowsSaved = await Promise.all([...editorPages.values()].map(({ editor }) => editor.flush()));
+    if (flowsSaved.includes(false) && !warnedFlows) {
+      warnedFlows = true;
+      event.preventDefault();
+      setNotice("flows", "Some flow changes are not saved; their tabs say why. Close the window again to quit without them.", false);
+      return;
+    }
     try {
       await saveLayout();
       warned = false;

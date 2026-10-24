@@ -17,6 +17,10 @@ export interface FlowsOptions {
   errorText(err: unknown): string;
   /** Shows (or clears, with null) an error on the settings page. */
   showError(message: string | null): void;
+  /** Opens a flow's editor. */
+  onOpen(flow: Flow): void;
+  /** Called with the flows each time they have been read. */
+  onChange(flows: Flow[]): void;
 }
 
 export interface Flows {
@@ -42,6 +46,7 @@ export function createFlows(opts: FlowsOptions): Flows {
     try {
       flows = await invoke<Flow[]>("flows_list");
       boxError.hidden = true;
+      opts.onChange(flows);
     } catch (err) {
       console.error("raterm: could not read the flows", err);
       boxError.textContent = `Flows could not be read: ${opts.errorText(err)}`;
@@ -130,7 +135,8 @@ export function createFlows(opts: FlowsOptions): Flows {
     const archive = button("archive", "archive", "Archive (hide from the sidebar)", () =>
       change(`archive "${flow.name}"`, () => invoke("flow_set_archived", { id: flow.id, archived: true })),
     );
-    li.append(name, up, down, archive, button("delete", "trash-2", "Delete", () => remove(flow)));
+    const edit = button("edit", "pencil", "Edit the steps", () => opts.onOpen(flow));
+    li.append(name, edit, up, down, archive, button("delete", "trash-2", "Delete", () => remove(flow)));
     return li;
   }
 
@@ -148,9 +154,9 @@ export function createFlows(opts: FlowsOptions): Flows {
     const archived = flows.filter((f) => f.archived);
     boxList.replaceChildren(
       ...active.map((flow) => {
-        // Not clickable yet: the flow editor comes with the next phase.
         const li = document.createElement("li");
-        li.title = flow.name;
+        li.title = `Edit ${flow.name}`;
+        li.onclick = () => opts.onOpen(flow);
         li.append(icon("workflow", 14), nameSpan(flow));
         return li;
       }),

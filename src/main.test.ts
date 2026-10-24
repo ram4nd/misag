@@ -174,6 +174,13 @@ type Flow = { id: number; name: string; archived: boolean };
 let storedFlows: Flow[];
 /** Flows that flow_delete refuses, as the runner will for running ones. */
 let busyFlows: Set<number>;
+type Step = { id: string; kind: string; title: string; text: string; outputs: string[]; x: number; y: number };
+type Graph = { nodes: Step[]; edges: { from: string; output: string; to: string }[] };
+const START: Step = { id: "start", kind: "start", title: "Start", text: "", outputs: ["next"], x: 40, y: 40 };
+/** Each flow's stored graph; a flow without one has only its Start step. */
+let storedGraphs: Record<number, Graph>;
+/** What flow_load and flow_save_graph report as keeping the flow from running. */
+let flowProblems: string[];
 
 const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
@@ -265,6 +272,13 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
       storedFlows = ids.map(find);
       return null;
     }
+    case "flow_load": {
+      const flow = find(args.id);
+      return { ...flow, graph: structuredClone(storedGraphs[flow.id] ?? { nodes: [START], edges: [] }), problems: flowProblems };
+    }
+    case "flow_save_graph":
+      storedGraphs[find(args.id).id] = structuredClone(args.graph as Graph);
+      return flowProblems;
     case "flow_delete":
       find(args.id);
       if (busyFlows.has(args.id as number)) throw { code: "failed", message: "the flow is running in a tab" };
@@ -300,6 +314,8 @@ beforeEach(() => {
   settingsLoadGate = Promise.resolve();
   storedFlows = [];
   busyFlows = new Set();
+  storedGraphs = {};
+  flowProblems = [];
   fsTree = { "~": [{ name: "work", dir: true }] };
   picker.picked = null;
   picker.fails = false;
@@ -393,6 +409,8 @@ beforeEach(() => {
 
 afterEach(() => {
   clearMocks();
+  // Spies (such as the layout getters a test stubs) do not restore themselves.
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -2319,5 +2337,391 @@ describe("flows", () => {
     await settle();
     expect(pageError().hidden).toBe(true);
     expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
+  });
+});
+
+describe("flow editor", () => {
+  const SAVE_MS = 400;
+  const flows = (...names: string[]) => names.map((name, i) => ({ id: i + 1, name, archived: false }));
+  const step = (id: string, kind: string, title: string, outputs: string[], text = ""): Step => ({ id, kind, title, text, outputs, x: 0, y: 0 });
+  /** Start → P, whose pass goes to E and fail back to P. */
+  const runnable = (): Graph => ({
+    nodes: [START, step("p", "prompt", "P", ["pass", "fail"], "do it"), step("e", "end", "E", [])],
+    edges: [{ from: "start", output: "next", to: "p" }, { from: "p", output: "pass", to: "e" }, { from: "p", output: "fail", to: "p" }],
+  });
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) await flush();
+  };
+  const editor = () => document.querySelector<HTMLElement>(".page.flow-editor.active")!;
+  const editors = () => [...document.querySelectorAll<HTMLElement>(".page.flow-editor")];
+  const nodes = () => [...editor().querySelectorAll<HTMLElement>(".drawflow-node")];
+  const titles = () => nodes().map((n) => n.querySelector(".title")!.textContent);
+  const node = (title: string) => nodes().find((n) => n.querySelector(".title")!.textContent === title)!;
+  const connections = () => editor().querySelectorAll("svg.connection").length;
+  const panel = () => editor().querySelector<HTMLElement>(".panel")!;
+  const field = (name: string) => panel().querySelector<HTMLInputElement | HTMLTextAreaElement>(`[name=${name}]`)!;
+  const tool = (cls: string) => editor().querySelector<HTMLButtonElement>(`button.${cls}`)!;
+  const saved = () => callsOf("flow_save_graph").at(-1)?.args.graph as Graph | undefined;
+  const mouse = (el: Element, type: string, x = 0, y = 0) =>
+    el.dispatchEvent(new MouseEvent(type, { bubbles: true, clientX: x, clientY: y, button: 0 }));
+  async function openFromBox(name: string) {
+    [...document.querySelectorAll<HTMLElement>("#flows-box .flows li")].find((li) => li.textContent === name)!.click();
+    await settle();
+  }
+  /** Drags from `from`'s output number `output` (1-based) to `to`'s input, as a user connects them. */
+  async function connect(from: string, output: number, to: string) {
+    const target = node(to).querySelector(".input_1")!;
+    mouse(node(from).querySelector(`.output_${output}`)!, "mousedown");
+    mouse(target, "mousemove", 50, 0);
+    mouse(target, "mouseup", 50, 0);
+    await settle();
+  }
+  async function select(title: string) {
+    const content = node(title).querySelector(".drawflow_content_node")!;
+    mouse(content, "mousedown");
+    mouse(content, "mouseup");
+    await settle();
+  }
+  async function edit(name: string, value: string) {
+    field(name).value = value;
+    field(name).dispatchEvent(new Event("input", { bubbles: true }));
+    field(name).dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+  }
+  async function afterSave() {
+    await vi.advanceTimersByTimeAsync(SAVE_MS);
+    await settle();
+  }
+
+  test("clicking a flow in the toolbox opens its editor, one tab per flow", async () => {
+    storedFlows = flows("Deploy", "Review");
+    await boot();
+    await openClaudeTabs(1);
+    await openFromBox("Deploy");
+    expect(tabNames()).toEqual(["work", "Deploy"]);
+    expect(callsOf("flow_load").map((c) => c.args)).toEqual([{ id: 1 }]);
+    await openFromBox("Deploy");
+    await openFromBox("Review");
+    expect(tabNames()).toEqual(["work", "Deploy", "Review"]);
+    expect(editors()).toHaveLength(2);
+    expect(editor().dataset.flow).toBe("2");
+    await win.closeRequested!();
+    expect(lastSaved()!.tabs.map((t) => t.name)).toEqual(["Claude 1"]);
+    tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
+    await settle();
+    expect(tabNames()).toEqual(["work", "Review"]);
+    expect(editors()).toHaveLength(1);
+  });
+
+  test("the Flows page opens the editor too", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    document.querySelector<HTMLButtonElement>("#flows-box .configure")!.click();
+    await settle();
+    document.querySelector<HTMLButtonElement>("#flows-settings .flow-list li button.edit")!.click();
+    await settle();
+    expect(tabNames()).toEqual(["Flows", "Deploy"]);
+    expect(editor().dataset.flow).toBe("1");
+  });
+
+  test("the canvas shows the steps, their outputs and their connections", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    expect(titles()).toEqual(["Start", "P", "E"]);
+    expect(nodes().map((n) => ["start", "prompt", "end"].find((k) => n.classList.contains(k)))).toEqual(["start", "prompt", "end"]);
+    expect([...node("P").querySelectorAll<HTMLElement>(".output")].map((o) => o.dataset.label)).toEqual(["pass", "fail"]);
+    expect(node("Start").querySelector(".input")).toBeNull();
+    expect(node("E").querySelector(".output")).toBeNull();
+    expect(connections()).toBe(3);
+    expect(callsOf("flow_save_graph")).toHaveLength(0);
+  });
+
+  test("an added step is saved after a short pause", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    tool("add-prompt").click();
+    tool("add-manual").click();
+    tool("add-end").click();
+    await settle();
+    expect(titles()).toEqual(["Start", "Prompt", "Manual step", "End"]);
+    expect(callsOf("flow_save_graph")).toHaveLength(0);
+    await afterSave();
+    expect(callsOf("flow_save_graph")).toHaveLength(1);
+    const graph = saved()!;
+    expect(graph.nodes.map((n) => [n.kind, n.outputs])).toEqual([
+      ["start", ["next"]],
+      ["prompt", ["done"]],
+      ["manual", ["done"]],
+      ["end", []],
+    ]);
+    expect(new Set(graph.nodes.map((n) => n.id)).size).toBe(4);
+    expect(editor().querySelector(".status")!.textContent).toBe("Saved");
+  });
+
+  test("connecting an output saves it, replacing where that output went before", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = { nodes: [START, step("a", "prompt", "A", ["done"], "x"), step("b", "end", "B", [])], edges: [] };
+    await boot();
+    await openFromBox("Deploy");
+    await connect("Start", 1, "A");
+    await connect("A", 1, "B");
+    await connect("Start", 1, "B");
+    await afterSave();
+    expect(saved()!.edges).toEqual([
+      { from: "a", output: "done", to: "b" },
+      { from: "start", output: "next", to: "b" },
+    ]);
+    expect(connections()).toBe(2);
+  });
+
+  test("a selected step's fields are shown and saved, and its outputs become ports", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    expect(panel().hidden).toBe(true);
+    await select("P");
+    expect(panel().hidden).toBe(false);
+    expect(field("title").value).toBe("P");
+    expect(field("text").value).toBe("do it");
+    expect(field("outputs").value).toBe("pass, fail");
+    await edit("title", "Fix tests");
+    await edit("text", "Run the tests and fix them.");
+    await edit("outputs", "Pass, retry");
+    await afterSave();
+    const p = saved()!.nodes.find((n) => n.id === "p")!;
+    expect([p.title, p.text, p.outputs]).toEqual(["Fix tests", "Run the tests and fix them.", ["pass", "retry"]]);
+    // The fail output is gone, and with it its connection.
+    expect(saved()!.edges).toEqual([{ from: "start", output: "next", to: "p" }, { from: "p", output: "pass", to: "e" }]);
+    expect([...node("Fix tests").querySelectorAll<HTMLElement>(".output")].map((o) => o.dataset.label)).toEqual(["pass", "retry"]);
+    expect(connections()).toBe(2);
+  });
+
+  test("outputs that are not short words are refused in place", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("P");
+    await edit("outputs", "ok, needs work");
+    expect(panel().querySelector(".invalid")!.textContent).toContain("needs work");
+    await edit("outputs", " ");
+    expect(panel().querySelector(".invalid")!.textContent).toContain("at least one");
+    await edit("outputs", "a, b, c, d, e, f, g, h, i");
+    expect(panel().querySelector(".invalid")!.textContent).toContain("at most 8");
+    await afterSave();
+    expect(callsOf("flow_save_graph")).toHaveLength(0);
+    expect(field("title").maxLength).toBe(200);
+    expect(field("text").maxLength).toBe(20000);
+  });
+
+  test("an outputs edit is kept when another step is selected before it is committed", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("P");
+    field("outputs").value = "pass, fail, skip";
+    await select("E");
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "p")!.outputs).toEqual(["pass", "fail", "skip"]);
+  });
+
+  test("a new step never takes the id of a deleted one", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    tool("add-end").click();
+    await afterSave();
+    const first = saved()!.nodes[1].id;
+    await select("End");
+    panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
+    tool("add-end").click();
+    await afterSave();
+    expect(saved()!.nodes[1].id).not.toBe(first);
+  });
+
+  test("Start and End have no fields for prompts or outputs, and Start cannot be deleted", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("Start");
+    expect(field("text").closest("label")!.hidden).toBe(true);
+    expect(field("outputs").closest("label")!.hidden).toBe(true);
+    expect(panel().querySelector<HTMLButtonElement>("button.delete-step")!.hidden).toBe(true);
+    editor().querySelector(".canvas")!.firstElementChild!.dispatchEvent(new KeyboardEvent("keydown", { key: "Delete", bubbles: true }));
+    await settle();
+    expect(titles()).toEqual(["Start", "P", "E"]);
+    expect(connections()).toBe(3);
+    // Right-clicking Start offers no delete either.
+    mouse(node("Start"), "contextmenu");
+    const cross = node("Start").querySelector(".drawflow-delete");
+    if (cross) mouse(cross, "mousedown");
+    await settle();
+    expect(titles()).toEqual(["Start", "P", "E"]);
+    expect(connections()).toBe(3);
+    // Other steps are deleted by the same key.
+    await select("E");
+    expect(field("text").closest("label")!.hidden).toBe(true);
+    expect(panel().querySelector<HTMLButtonElement>("button.delete-step")!.hidden).toBe(false);
+    editor().querySelector(".canvas")!.firstElementChild!.dispatchEvent(new KeyboardEvent("keydown", { key: "Delete", bubbles: true }));
+    await afterSave();
+    expect(titles()).toEqual(["Start", "P"]);
+    expect(saved()!.edges).toEqual([{ from: "start", output: "next", to: "p" }, { from: "p", output: "fail", to: "p" }]);
+  });
+
+  test("deleting a step takes its connections with it", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("P");
+    panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
+    await afterSave();
+    expect(saved()!.nodes.map((n) => n.id)).toEqual(["start", "e"]);
+    expect(saved()!.edges).toEqual([]);
+    expect(panel().hidden).toBe(true);
+  });
+
+  test("a moved step is saved where it was dropped", async () => {
+    // jsdom has no layout; Drawflow positions steps by their inline left and top.
+    for (const [prop, style] of [["offsetLeft", "left"], ["offsetTop", "top"]] as const) {
+      vi.spyOn(HTMLElement.prototype, prop, "get").mockImplementation(function (this: HTMLElement) {
+        return parseFloat(this.style[style]) || 0;
+      });
+    }
+    for (const prop of ["clientWidth", "clientHeight"] as const) vi.spyOn(HTMLElement.prototype, prop, "get").mockReturnValue(1000);
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    const content = node("E").querySelector(".drawflow_content_node")!;
+    mouse(content, "mousedown", 0, 0);
+    mouse(content, "mousemove", 30, 40);
+    mouse(content, "mouseup", 30, 40);
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "e")).toMatchObject({ x: 30, y: 40 });
+  });
+
+  test("what keeps the flow from running is listed until it is ready", async () => {
+    storedFlows = flows("Deploy");
+    flowProblems = ["Start is not connected to a step."];
+    await boot();
+    await openFromBox("Deploy");
+    const problems = () => [...editor().querySelectorAll(".problems li")].map((li) => li.textContent);
+    expect(problems()).toEqual(["Start is not connected to a step."]);
+    flowProblems = [];
+    tool("add-end").click();
+    await afterSave();
+    expect(problems()).toEqual([]);
+    expect(editor().querySelector(".problems")!.textContent).toContain("Ready to run");
+  });
+
+  test("a failed save says why, and the next change tries again", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    failing.add("flow_save_graph");
+    tool("add-end").click();
+    await afterSave();
+    expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(false);
+    expect(editor().querySelector(".error")!.textContent).toContain("flow_save_graph failed");
+    failing.delete("flow_save_graph");
+    tool("add-end").click();
+    await afterSave();
+    expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
+    expect(storedGraphs[1].nodes).toHaveLength(3);
+  });
+
+  test("closing the tab saves a change still waiting", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    tool("add-end").click();
+    await settle();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    await settle();
+    expect(storedGraphs[1].nodes.map((n) => n.kind)).toEqual(["start", "end"]);
+    expect(tabs()).toHaveLength(0);
+  });
+
+  test("a tab whose changes cannot be saved stays open and says so", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    failing.add("flow_save_graph");
+    tool("add-end").click();
+    await settle();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    await settle();
+    expect(tabNames()).toEqual(["Deploy"]);
+    expect(editor().querySelector(".error")!.textContent).toContain("Not saved");
+    // Once saving works again, closing saves and closes.
+    failing.delete("flow_save_graph");
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    await settle();
+    expect(tabs()).toHaveLength(0);
+    expect(storedGraphs[1].nodes).toHaveLength(2);
+  });
+
+  test("quitting saves the open editors' waiting changes", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    tool("add-end").click();
+    await settle();
+    await win.closeRequested!();
+    expect(win.prevented).toBe(false);
+    expect(storedGraphs[1].nodes).toHaveLength(2);
+  });
+
+  test("quitting with unsavable editor changes warns once", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    failing.add("flow_save_graph");
+    tool("add-end").click();
+    await settle();
+    await win.closeRequested!();
+    expect(win.prevented).toBe(true);
+    expect(noticeText()).toContain("not saved");
+    await win.closeRequested!();
+    expect(win.prevented).toBe(false);
+  });
+
+  test("a flow that cannot be loaded says so and cannot be edited", async () => {
+    storedFlows = flows("Deploy");
+    failing.add("flow_load");
+    await boot();
+    await openFromBox("Deploy");
+    expect(editor().querySelector(".error")!.textContent).toContain("could not be loaded");
+    expect(tool("add-prompt").matches(":disabled")).toBe(true);
+  });
+
+  test("renaming a flow retitles its tab, and deleting it closes the tab", async () => {
+    storedFlows = flows("Deploy", "Review");
+    picker.answer = true;
+    await boot();
+    await openFromBox("Deploy");
+    document.querySelector<HTMLButtonElement>("#flows-box .configure")!.click();
+    await settle();
+    const rows = () => [...document.querySelectorAll<HTMLElement>("#flows-settings .flow-list li")];
+    const name = rows()[0].querySelector<HTMLInputElement>("input.name")!;
+    name.value = "Ship";
+    name.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(tabNames()).toEqual(["Ship", "Flows"]);
+    // A change still waiting is dropped with the flow, not saved into nothing.
+    document.querySelector<HTMLElement>(".page.flow-editor button.add-end")!.click();
+    rows()[0].querySelector<HTMLButtonElement>("button.delete")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(SAVE_MS);
+    expect(tabNames()).toEqual(["Flows"]);
+    expect(editors()).toHaveLength(0);
+    expect(callsOf("flow_save_graph")).toHaveLength(0);
   });
 });
