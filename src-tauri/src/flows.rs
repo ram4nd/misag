@@ -238,16 +238,12 @@ pub fn parse_marker(reply: &str) -> Option<String> {
     (label.trim().eq_ignore_ascii_case("flow") && word).then_some(value)
 }
 
-/// What is sent to Claude for a prompt step: an optional note from the person,
-/// the step's text, and how to end the reply so the runner knows which output.
+/// What is sent to Claude for a prompt step: the step's text and how to end the
+/// reply so the runner knows which output.
 /// Control characters (other than newlines and tabs) are dropped: the prompt may be
 /// typed into a terminal, where they would act as keys or end the paste early.
-pub fn prompt_text(node: &Node, note: Option<&str>) -> String {
-    let mut text = String::new();
-    if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
-        text.push_str(&format!("A note from the person running this flow: {note}\n\n"));
-    }
-    text.push_str(node.text.trim_end());
+pub fn prompt_text(node: &Node) -> String {
+    let mut text = node.text.trim_end().to_owned();
     let outputs: Vec<String> = node.outputs.iter().map(|o| format!("`FLOW: {o}`")).collect();
     text.push_str(&format!(
         "\n\nWhen you have finished, end your reply with a last line that is exactly {}, whichever fits. \
@@ -549,18 +545,15 @@ pub(crate) mod tests {
     #[test]
     fn a_prompt_asks_for_a_flow_line_naming_its_outputs() {
         let g = runnable();
-        let text = prompt_text(&g.nodes[1], None);
+        let text = prompt_text(&g.nodes[1]);
         assert!(text.starts_with("do p"), "{text}");
         for part in ["FLOW: pass", "FLOW: fail", "FLOW: attention", "last line"] {
             assert!(text.contains(part), "{part:?} in {text}");
         }
-        let noted = prompt_text(&g.nodes[1], Some("  The CI is flaky.  "));
-        assert!(noted.starts_with("A note from the person running this flow: The CI is flaky.\n\ndo p"), "{noted}");
-        assert_eq!(prompt_text(&g.nodes[1], Some("  ")), text, "a blank note is no note");
         // Control characters could end the paste the prompt is typed as, or act as keys.
         let mut odd = g.nodes[1].clone();
         odd.text = "a\u{1b}[201~b\tc\u{7}d\ne".into();
-        assert!(prompt_text(&odd, Some("x\u{1b}y")).starts_with("A note from the person running this flow: xy\n\na[201~b\tcd\ne"));
+        assert!(prompt_text(&odd).starts_with("a[201~b\tcd\ne"));
     }
 
     #[test]

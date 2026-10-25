@@ -790,8 +790,8 @@ impl Db {
         runs::start(&mut self.conn(), flow_id, tab_id)
     }
 
-    pub fn proceed_run(&self, run_id: i64, output: &str, note: &str) -> Result<Option<String>, String> {
-        runs::proceed(&mut self.conn(), run_id, output, note)
+    pub fn proceed_run(&self, run_id: i64, output: &str) -> Result<Option<String>, String> {
+        runs::proceed(&mut self.conn(), run_id, output)
     }
 
     pub fn stop_run(&self, run_id: i64) -> Result<(), String> {

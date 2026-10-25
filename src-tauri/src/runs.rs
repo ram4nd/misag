@@ -171,7 +171,7 @@ fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
 /// prompt step. The run instead waits at `from` for the person when going on
 /// would pass `MAX_RUN_STEPS` (into a prompt step) or, for `By::Flow` only, when
 /// the next step has already run its `max_runs`.
-fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, note: Option<&str>, by: By) -> Result<Option<String>, String> {
+fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by: By) -> Result<Option<String>, String> {
     let next = flows::next_step(&run.graph, &from.id, output);
     let wait = |why: String| set(tx, run.id, &from.id, Status::Attention, steps, Some(&why)).map(|()| None);
     if next.is_some_and(|n| n.kind == Kind::Prompt) && steps >= MAX_RUN_STEPS {
@@ -197,7 +197,7 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, not
     match next.kind {
         Kind::Prompt => {
             set(tx, run.id, &next.id, Status::Running, steps + 1, None)?;
-            Ok(Some(flows::prompt_text(next, note)))
+            Ok(Some(flows::prompt_text(next)))
         }
         Kind::Manual => set(tx, run.id, &next.id, Status::Manual, steps, None).map(|()| None),
         Kind::End | Kind::Start => set(tx, run.id, &next.id, Status::Done, steps, None).map(|()| None),
@@ -233,7 +233,7 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Opti
         other => other.map_err(sql)?,
     };
     let run = Stored { id: tx.last_insert_rowid(), graph, node_id: start.id.clone(), status: Status::Running, steps: 0 };
-    let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, None, By::Flow)?;
+    let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, By::Flow)?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
 }
@@ -275,25 +275,24 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
             "Claude ended with \"FLOW: {m}\", which is not an output of \"{}\".",
             node.name()
         )),
-        Some(m) => go(&tx, &run, &node, &m, run.steps, None, By::Flow),
+        Some(m) => go(&tx, &run, &node, &m, run.steps, By::Flow),
     }?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
 }
 
-/// The person picked `output` for the run's current step, with an optional note
-/// for Claude; returns the next prompt to send, if any. Usually the run waits
+/// The person picked `output` for the run's current step; returns the next prompt to send, if any. Usually the run waits
 /// (manual or needs attention), but a running step can be moved on too, for when
 /// Claude was interrupted and no reply will come. The person stepping in restarts
 /// the count toward `MAX_RUN_STEPS`.
-pub fn proceed(conn: &mut Connection, run_id: i64, output: &str, note: &str) -> Result<Option<String>, String> {
+pub fn proceed(conn: &mut Connection, run_id: i64, output: &str) -> Result<Option<String>, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
     let node = run.node()?.clone();
     if !node.outputs.iter().any(|o| o == output) {
         return Err(format!("\"{}\" has no output {output:?}", node.name()));
     }
-    let prompt = go(&tx, &run, &node, output, 0, Some(note), By::Person)?;
+    let prompt = go(&tx, &run, &node, output, 0, By::Person)?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
 }
@@ -427,15 +426,15 @@ mod tests {
         runs.into_iter().next().unwrap()
     }
 
-    fn prompt_of(graph: &Graph, id: &str, note: Option<&str>) -> Option<String> {
-        Some(flows::prompt_text(graph.nodes.iter().find(|n| n.id == id).unwrap(), note))
+    fn prompt_of(graph: &Graph, id: &str) -> Option<String> {
+        Some(flows::prompt_text(graph.nodes.iter().find(|n| n.id == id).unwrap()))
     }
 
     #[test]
     fn a_run_starts_with_the_first_prompt() {
         let g = runnable();
         let (_db, mut conn, flow) = setup("runs-start", &g);
-        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap(), prompt_of(&g, "p", None));
+        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap(), prompt_of(&g, "p"));
         let run = only_run(&conn);
         assert_eq!(
             (run.flow_name.as_str(), run.tab_id.as_str(), run.step.as_str(), run.status, run.steps),
@@ -472,7 +471,7 @@ mod tests {
         let (_db, mut conn, flow) = setup("runs-follow", &g);
         start(&mut conn, flow, &tab("t1")).unwrap();
         // fail loops back to the same prompt.
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Broken.\nFLOW: fail")).unwrap(), prompt_of(&g, "p", None));
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Broken.\nFLOW: fail")).unwrap(), prompt_of(&g, "p"));
         assert_eq!(only_run(&conn).steps, 2);
         // pass leads to End, which finishes the run.
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("All good.\nFLOW: pass")).unwrap(), None);
@@ -510,7 +509,7 @@ mod tests {
             assert!(run.note.as_deref().unwrap_or("").contains(why), "{:?} should mention {why:?}", run.note);
         }
         // The person answers Claude in the terminal; its next reply moves the run on.
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Used SQLite.\nFLOW: fail")).unwrap(), prompt_of(&g, "p", None));
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Used SQLite.\nFLOW: fail")).unwrap(), prompt_of(&g, "p"));
         let run = only_run(&conn);
         assert_eq!((run.status, run.note), (Status::Running, None));
     }
@@ -525,10 +524,10 @@ mod tests {
         // Claude ending a turn (the person chatting) does not move a manual step.
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: ok")).unwrap(), None);
         assert_eq!(only_run(&conn).status, Status::Manual);
-        assert!(proceed(&mut conn, run.id, "maybe", "").unwrap_err().contains("maybe"));
-        assert_eq!(proceed(&mut conn, run.id, "redo", "").unwrap(), None);
+        assert!(proceed(&mut conn, run.id, "maybe").unwrap_err().contains("maybe"));
+        assert_eq!(proceed(&mut conn, run.id, "redo").unwrap(), None);
         assert_eq!(only_run(&conn).status, Status::Manual);
-        assert_eq!(proceed(&mut conn, run.id, "ok", "Looks good").unwrap(), prompt_of(&g, "p", Some("Looks good")));
+        assert_eq!(proceed(&mut conn, run.id, "ok").unwrap(), prompt_of(&g, "p"));
         assert_eq!(only_run(&conn).status, Status::Running);
     }
 
@@ -539,8 +538,8 @@ mod tests {
         let (_db, mut conn, flow) = setup("runs-take-over", &g);
         start(&mut conn, flow, &tab("t1")).unwrap();
         let run = only_run(&conn);
-        assert_eq!(proceed(&mut conn, run.id, "fail", "").unwrap(), prompt_of(&g, "p", None));
-        assert_eq!(proceed(&mut conn, run.id, "pass", "").unwrap(), None);
+        assert_eq!(proceed(&mut conn, run.id, "fail").unwrap(), prompt_of(&g, "p"));
+        assert_eq!(proceed(&mut conn, run.id, "pass").unwrap(), None);
         assert!(active(&conn).unwrap().is_empty());
     }
 
@@ -641,7 +640,7 @@ mod tests {
         start(&mut conn, flow, &tab("t1")).unwrap();
         on_stop(&mut conn, &tab("t1"), Some("Hmm.")).unwrap();
         let run = only_run(&conn);
-        assert_eq!(proceed(&mut conn, run.id, "fail", "Try the other fix").unwrap(), prompt_of(&g, "p", Some("Try the other fix")));
+        assert_eq!(proceed(&mut conn, run.id, "fail").unwrap(), prompt_of(&g, "p"));
     }
 
     #[test]
@@ -657,7 +656,7 @@ mod tests {
         assert_eq!((run.status, run.step_id.as_str()), (Status::Attention, "p"));
         assert!(run.note.unwrap().contains(&MAX_RUN_STEPS.to_string()));
         // Stepping in sends the next prompt and starts the count over.
-        assert!(proceed(&mut conn, run.id, "fail", "").unwrap().is_some());
+        assert!(proceed(&mut conn, run.id, "fail").unwrap().is_some());
         assert_eq!(only_run(&conn).steps, 1);
     }
 
@@ -676,10 +675,10 @@ mod tests {
         let g = review_loop();
         let (_db, mut conn, flow) = setup("runs-max", &g);
         let t = tab("t1");
-        assert_eq!(start(&mut conn, flow, &t).unwrap(), prompt_of(&g, "review", None));
-        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix", None));
-        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), prompt_of(&g, "review", None));
-        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix", None));
+        assert_eq!(start(&mut conn, flow, &t).unwrap(), prompt_of(&g, "review"));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix"));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), prompt_of(&g, "review"));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix"));
         // A third review would be one too many: the run waits after the fix.
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), None);
         let run = only_run(&conn);
@@ -687,11 +686,11 @@ mod tests {
         let note = run.note.unwrap();
         assert!(note.contains("REVIEW") && note.contains("already run 2 times"), "{note}");
         // The person can send it round once more; the next round waits again.
-        assert_eq!(proceed(&mut conn, run.id, "done", "").unwrap(), prompt_of(&g, "review", None));
-        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix", None));
+        assert_eq!(proceed(&mut conn, run.id, "done").unwrap(), prompt_of(&g, "review"));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix"));
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), None);
         assert_eq!(only_run(&conn).status, Status::Attention);
-        assert_eq!(proceed(&mut conn, run.id, "done", "").unwrap(), prompt_of(&g, "review", None));
+        assert_eq!(proceed(&mut conn, run.id, "done").unwrap(), prompt_of(&g, "review"));
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: clean")).unwrap(), None);
         assert!(active(&conn).unwrap().is_empty());
     }
@@ -728,7 +727,7 @@ mod tests {
         let mut edited = g.clone();
         edited.nodes[1].text = "something else".into();
         db.save_flow_graph(flow, &edited).unwrap();
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), prompt_of(&g, "p", None));
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), prompt_of(&g, "p"));
     }
 
     #[test]
@@ -739,7 +738,7 @@ mod tests {
         let run = only_run(&conn).id;
         stop(&conn, run).unwrap();
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), None);
-        assert!(proceed(&mut conn, run, "fail", "").unwrap_err().contains("no active run"));
+        assert!(proceed(&mut conn, run, "fail").unwrap_err().contains("no active run"));
     }
 
     #[test]

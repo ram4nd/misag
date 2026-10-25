@@ -531,8 +531,8 @@ pub fn flow_start(db: State<'_, Db>, flow_id: i64, tab_id: TabId) -> Result<Opti
 }
 
 #[tauri::command(async)]
-pub fn flow_continue(db: State<'_, Db>, run_id: i64, output: String, note: String) -> Result<Option<String>, CommandError> {
-    Ok(db.proceed_run(run_id, &output, &note)?)
+pub fn flow_continue(db: State<'_, Db>, run_id: i64, output: String) -> Result<Option<String>, CommandError> {
+    Ok(db.proceed_run(run_id, &output)?)
 }
 
 #[tauri::command(async)]

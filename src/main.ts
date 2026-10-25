@@ -1306,7 +1306,7 @@ async function startFlow(flow: Flow) {
   await pollRuns();
 }
 
-async function continueRun(run: Run, output: string, note: string) {
+async function continueRun(run: Run, output: string) {
   const s = sessions.find((s) => s.tabId === run.tabId);
   if (!s || !(await claudeLive(s))) {
     flows.showBoxError(`Claude is not running in ${s ? tabLabel(s) : "the run's tab"}; start it there first, or stop the run.`);
@@ -1314,7 +1314,7 @@ async function continueRun(run: Run, output: string, note: string) {
     return;
   }
   try {
-    const prompt = await invoke<string | null>("flow_continue", { runId: run.id, output, note });
+    const prompt = await invoke<string | null>("flow_continue", { runId: run.id, output });
     flows.showBoxError(null);
     if (prompt !== null) typePrompt(s, prompt);
   } catch (err) {

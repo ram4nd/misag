@@ -213,7 +213,7 @@ fn a_stop_moves_the_tabs_flow_run_on_and_sends_the_next_prompt() {
     // fail loops back: the hook hands Claude the prompt again, as hook context.
     let out: serde_json::Value = serde_json::from_str(&run_stop_hook(&env, "Still broken.\nFLOW: fail")).unwrap();
     assert_eq!(out["hookSpecificOutput"]["hookEventName"], "Stop");
-    assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::prompt_text(&graph.nodes[1], None));
+    assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::prompt_text(&graph.nodes[1]));
     // pass has no next step: the run ends and Claude is left to stop.
     assert_eq!(run_stop_hook(&env, "Fixed.\nFLOW: pass"), "");
     assert!(runs::active(&conn).unwrap().is_empty());

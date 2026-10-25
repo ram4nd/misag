@@ -42,8 +42,8 @@ export interface FlowsOptions {
   onChange(flows: Flow[]): void;
   /** Starts the flow (the ▶ button). */
   onRun(flow: Flow): void;
-  /** The person picked `output` for a waiting run, with a note for Claude. */
-  onContinue(run: Run, output: string, note: string): Promise<void>;
+  /** The person picked `output` for a waiting run. */
+  onContinue(run: Run, output: string): Promise<void>;
   /** Stops the run (its Stop button). */
   onStop(run: Run): void;
   /** Shows the run's tab. */
@@ -206,11 +206,6 @@ export function createFlows(opts: FlowsOptions): Flows {
     const actions = document.createElement("div");
     actions.className = "actions";
     if (tab !== null && run.outputs.length > 0) {
-      const note = document.createElement("input");
-      note.className = "run-note";
-      note.dataset.run = String(run.id);
-      note.placeholder = "Note for Claude (optional)";
-      note.setAttribute("aria-label", "Note for Claude");
       const buttons = run.outputs.map((output) => {
         const b = document.createElement("button");
         b.type = "button";
@@ -220,13 +215,12 @@ export function createFlows(opts: FlowsOptions): Flows {
         b.onclick = async () => {
           // Once: a second click would send the next step too.
           for (const other of buttons) other.disabled = true;
-          await opts.onContinue(run, output, note.value);
+          await opts.onContinue(run, output);
           for (const other of buttons) other.disabled = false;
         };
         return b;
       });
       actions.append(...buttons);
-      li.append(note);
     }
     actions.append(button("stop-run", "square", "Stop this run", () => opts.onStop(run)));
     li.append(actions);
@@ -274,20 +268,8 @@ export function createFlows(opts: FlowsOptions): Flows {
     showBoxError,
     showRuns(next: Run[]) {
       if (JSON.stringify(next) === JSON.stringify(runs)) return;
-      // Notes being typed, and the focus, are carried over to the new rows.
-      const notes = new Map([...boxList.querySelectorAll<HTMLInputElement>("input.run-note")].map((i) => [i.dataset.run, i]));
-      const focused = document.activeElement instanceof HTMLInputElement ? document.activeElement.dataset.run : undefined;
       runs = next;
       render();
-      for (const input of boxList.querySelectorAll<HTMLInputElement>("input.run-note")) {
-        const old = notes.get(input.dataset.run);
-        if (!old) continue;
-        input.value = old.value;
-        if (input.dataset.run === focused) {
-          input.focus();
-          input.setSelectionRange(old.selectionStart, old.selectionEnd);
-        }
-      }
     },
   };
 }

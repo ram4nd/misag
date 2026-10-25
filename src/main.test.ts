@@ -3125,11 +3125,11 @@ describe("flow runs", () => {
     const row = runRows()[0];
     expect(row.querySelector(".note")!.textContent).toBe("Claude asked for a person.");
     expect([...row.querySelectorAll<HTMLButtonElement>("button.output")].map((b) => b.textContent)).toEqual(["pass", "fail"]);
-    row.querySelector<HTMLInputElement>("input.run-note")!.value = "Use staging";
+    expect(row.querySelector("input")).toBeNull();
     row.querySelector<HTMLButtonElement>("button.output")!.click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "pass", note: "Use staging" }]);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "pass" }]);
     // Typed into the run's tab, which is not the active one.
     expect(callsOf("pty_write").map((c) => c.args.id)).toEqual([1, 1]);
     expect(typed()).toEqual(["\x1b[200~Deploy it.\x1b[201~", "\r"]);
@@ -3230,21 +3230,16 @@ describe("flow runs and Claude's state", () => {
     expect(callsOf("flow_stop_tab").map((c) => c.args)).toEqual([{ tabId }]);
   });
 
-  test("a note being typed survives other runs moving on", async () => {
+  test("a run that moves on is shown again", async () => {
     await boot();
-    await openClaudeTabs(2);
-    const [a, b] = spawns().map((c) => c.tabId);
-    activeRuns = [run({ tabId: a }), run({ id: 6, tabId: b, status: "running", steps: 1 })];
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId, status: "running", steps: 1 })];
     await poll();
-    const note = runRows()[0].querySelector<HTMLInputElement>("input.run-note")!;
-    note.focus();
-    note.value = "Half a thou";
-    activeRuns = [run({ tabId: a }), run({ id: 6, tabId: b, status: "running", steps: 2 })];
+    expect(runRows()[0].querySelector(".summary")!.getAttribute("title")).toMatch(/1 step since/);
+    activeRuns = [run({ tabId, status: "running", steps: 2 })];
     await poll();
-    const after = runRows()[0].querySelector<HTMLInputElement>("input.run-note")!;
-    expect(after.value).toBe("Half a thou");
-    expect(document.activeElement).toBe(after);
-    expect(runRows()[1].querySelector(".summary")!.getAttribute("title")).toContain("2 steps");
+    expect(runRows()[0].querySelector(".summary")!.getAttribute("title")).toContain("2 steps since");
   });
 
   test("runs that cannot be read are reported in the box until they can", async () => {

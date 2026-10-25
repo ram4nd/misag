@@ -21,7 +21,7 @@ How every part of Mischief of Agents (`misag`) behaves. For an overview, buildin
 | Manage flows | Flows box in the sidebar: its gear opens the Flows tab, to add, rename, reorder, archive and delete flows |
 | Edit a flow's steps | Click the flow in the Flows box, or its pencil on the Flows tab; it opens the flow's editor tab |
 | Run a flow | Select a Claude tab (or a terminal tab running `claude`), hover the flow in the Flows box and click ▶ |
-| Answer a waiting run | Under its flow in the Flows box: optionally type a note for Claude, then click the output to go on by (the run's tab must be open with Claude running in it; the note goes to Claude with the next prompt step) |
+| Answer a waiting run | Under its flow in the Flows box, click the output to go on by (the run's tab must be open with Claude running in it) |
 | Stop a run | The square button on the run in the Flows box; closing its tab stops it too |
 | Resume an earlier Claude conversation | Session history box in the sidebar: click a session to resume it in a new Claude tab in its folder; its pin button keeps it at the top |
 | Settings | Click Settings at the bottom of the sidebar; it opens a Settings tab |
