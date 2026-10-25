@@ -1,12 +1,10 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { Terminal } from "@xterm/xterm";
+import { WTerm } from "@wterm/dom";
 import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
-import { FitAddon } from "@xterm/addon-fit";
-import { WebLinksAddon } from "@xterm/addon-web-links";
-import "@xterm/xterm/css/xterm.css";
+import "@wterm/dom/css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
@@ -55,8 +53,7 @@ interface Session {
   cwd?: string;
   /** The process's current directory, last time it was checked. */
   liveCwd?: string;
-  term: Terminal;
-  fit: FitAddon;
+  term: WTerm;
   el: HTMLDivElement;
   exited: boolean;
   closing: boolean;
@@ -178,20 +175,6 @@ const SAVE_DELAY_MS = 300;
 const SAVE_RETRY_MS = 5_000;
 
 
-
-// xfce4-terminal defaults.
-const THEME = {
-  background: "#000000",
-  foreground: "#ffffff",
-  cursor: "#ffffff",
-  selectionBackground: "#555555",
-  black: "#000000", red: "#aa0000", green: "#00aa00", yellow: "#aa5500",
-  blue: "#0000aa", magenta: "#aa00aa", cyan: "#00aaaa", white: "#aaaaaa",
-  brightBlack: "#555555", brightRed: "#ff5555", brightGreen: "#55ff55",
-  brightYellow: "#ffff55", brightBlue: "#5555ff", brightMagenta: "#ff55ff",
-  brightCyan: "#55ffff", brightWhite: "#ffffff",
-};
-
 function $<T extends HTMLElement>(sel: string): T {
   const el = document.querySelector<T>(sel);
   if (!el) throw new Error(`misag: missing element ${sel}`);
@@ -262,33 +245,24 @@ const encoder = new TextEncoder();
 
 // ---------- sessions ----------
 
-/** A terminal view in a new pane; the pane is removed again if the view cannot be built. */
-function createView(): { el: HTMLDivElement; term: Terminal; fit: FitAddon } {
+/**
+ * A terminal view in a new pane; its colors and font are set in style.css. It paints only
+ * while shown (see `showActive`), and is sized by the app's own observer, not wterm's.
+ */
+function createView(): { el: HTMLDivElement; term: WTerm } {
   const el = document.createElement("div");
   el.className = "term";
   termsEl.append(el);
-  try {
-    const term = new Terminal({
-      fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
-      fontSize: 14,
-      cursorBlink: true,
-      scrollback: 10000,
-      theme: THEME,
-    });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.loadAddon(
-      new WebLinksAddon((_e, uri) => {
-        openUrl(uri).catch((err) => console.error("misag: could not open link", uri, err));
-      }),
-    );
-    term.open(el);
-    return { el, term, fit };
-  } catch (err) {
-    el.remove();
-    setNotice("view", `A tab could not be opened: ${errorText(err)}.`);
-    throw err;
-  }
+  const term = new WTerm(el, { cursorBlink: true, autoResize: false, renderingPaused: true });
+  // Added after wterm's own listener, which keeps a plain click on a link in the terminal and
+  // lets Ctrl+click or the keyboard through. Left to the webview, those would open the link in it.
+  el.addEventListener("click", (e) => {
+    const link = e.target instanceof Element ? e.target.closest<HTMLAnchorElement>("a.term-link") : null;
+    if (!link || e.defaultPrevented) return;
+    e.preventDefault();
+    openUrl(link.href).catch((err) => console.error("misag: could not open link", link.href, err));
+  });
+  return { el, term };
 }
 
 /** Claude titles the terminal `✳ <task>` while idle, and with a spinner frame (`◐ <task>`, `⠂ <task>`) while working. */
@@ -296,7 +270,7 @@ const BUSY_TITLE = /^[\u25D0-\u25D3\u2801-\u28FF] /;
 
 /** Opens a tab and starts its process. */
 async function spawn(opts: SpawnOptions) {
-  const { el, term, fit } = createView();
+  const { el, term } = createView();
 
   const run: RunningKind =
     opts.run.kind === "claude"
@@ -306,40 +280,58 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, fit, el, exited: false, closing: false, busy: false, skipsPermissions: false, inClaude: false,
+    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, skipsPermissions: false, inClaude: false,
     claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
     name: opts.name || defaultName,
   };
+  const before = { tab: active, page: shownPage };
   sessions.push(s);
   renderSessions();
   activate(s);
+  try {
+    // Output written before this resolves would be dropped.
+    await term.init();
+  } catch (err) {
+    // Closing the tab already cleaned up after it.
+    if (s.closing) return;
+    sessions.splice(sessions.indexOf(s), 1);
+    el.remove();
+    renderSessions();
+    if (active === s) showInstead(before.tab, before.page);
+    setNotice("view", `A tab could not be opened: ${errorText(err)}.`);
+    throw err;
+  }
+  // wterm resolves without an error for a view destroyed while it loaded.
+  if (s.closing) return;
   // The pane must be visible and sized before the PTY is opened with its dimensions.
-  fit.fit();
+  term.fit();
+  // Focus from `activate` did not reach a terminal that was still loading.
+  if (active === s && shownPage === null) term.focus();
 
-  term.onData((data) => {
+  term.onData = (data) => {
     if (s.exited) {
       if (data === "\r") restart(s);
       return;
     }
     write(s, encoder.encode(data));
-  });
-  term.onBinary((data) => write(s, Uint8Array.from(data, (c) => c.charCodeAt(0) & 0xff)));
-  term.onResize(({ cols, rows }) => {
+  };
+  term.onBinary = (data) => write(s, data);
+  term.onResize = (cols, rows) => {
     if (s.id === null || s.exited) return;
     invoke("pty_resize", { id: s.id, cols, rows }).catch((err) =>
       console.error("misag: resize failed", err),
     );
-  });
-  term.onTitleChange((title) => {
+  };
+  term.onTitle = (title) => {
     s.busy = BUSY_TITLE.test(title);
     tabsEl.children[sessions.indexOf(s)]?.classList.toggle("busy", showsBusy(s));
     if (!title || s.renamed || title === s.name) return;
     s.name = title;
     updateTab(s);
     scheduleSave();
-  });
+  };
 
   await start(s, opts.fallbackToHome ?? false);
 }
@@ -352,7 +344,7 @@ async function start(s: Session, fallbackToHome: boolean) {
   const { term } = s;
   const startNo = ++s.starts;
   const onData = new Channel<ArrayBuffer>();
-  onData.onmessage = (buf) => term.write(new Uint8Array(buf));
+  onData.onmessage = (buf) => show(s, new Uint8Array(buf));
   // Attached before pty_spawn runs, so an immediate exit is not missed.
   const onExit = new Channel<number>();
   onExit.onmessage = (code) =>
@@ -372,7 +364,7 @@ async function start(s: Session, fallbackToHome: boolean) {
     if (started.fellBackToHome) {
       const message = `${s.cwd} no longer exists, so “${s.name}” started in the home directory.`;
       // Claude redraws its screen at once, so the terminal line alone is easy to miss.
-      term.write(`\x1b[2m[${message}]\x1b[0m\r\n`);
+      show(s, `\x1b[2m[${message}]\x1b[0m\r\n`);
       setNotice(tabTopic(s, "fallback"), message);
       s.cwd = undefined;
     }
@@ -412,7 +404,8 @@ function restart(s: Session) {
   if (s.closing || !s.exited) return;
   s.exited = false;
   s.id = null;
-  s.term.reset();
+  // A full reset (RIS) clears the screen and modes the last process left behind.
+  show(s, "\x1bc");
   renderSessions();
   start(s, true).catch((err) => console.error("misag: could not restart tab", err));
 }
@@ -459,6 +452,15 @@ function errorText(err: unknown): string {
   return typeof err === "object" && err !== null && "message" in err ? String(err.message) : String(err);
 }
 
+/** Writes to a tab's terminal. wterm rethrows what its callbacks threw while it wrote; the output itself is written. */
+function show(s: Session, data: string | Uint8Array) {
+  try {
+    s.term.write(data);
+  } catch (err) {
+    console.error("misag: a terminal callback failed", err);
+  }
+}
+
 function write(s: Session, data: Uint8Array) {
   if (s.id === null || s.exited) return;
   invoke("pty_write", { id: s.id, data: Array.from(data) }).catch((err) =>
@@ -474,7 +476,7 @@ function markExited(s: Session, message: string, error = false) {
     s.inClaude = false;
     s.skipsPermissions = false;
   }
-  s.term.write(`\r\n\x1b[${error ? "31" : "2"}m[${message}; press Enter to restart]\x1b[0m\r\n`);
+  show(s, `\r\n\x1b[${error ? "31" : "2"}m[${message}; press Enter to restart]\x1b[0m\r\n`);
   renderSessions();
 }
 
@@ -485,7 +487,7 @@ function activate(s: Session) {
   showActive();
   showHistory();
   requestAnimationFrame(() => {
-    s.fit.fit();
+    s.term.fit();
     s.term.focus();
   });
 }
@@ -499,6 +501,8 @@ function showActive() {
   const shown = shownPage !== null;
   sessions.forEach((o, i) => {
     o.el.classList.toggle("active", !shown && o === active);
+    // A hidden terminal still takes in its output, but painting it would be wasted work.
+    o.term.setRenderingPaused(shown || o !== active);
     tabsEl.children[i]?.classList.toggle("active", !shown && o === active);
   });
   for (const id of [...pageIds, ...editorPages.keys()]) {
@@ -506,6 +510,16 @@ function showActive() {
     pageOf(id).tabEl?.classList.toggle("active", id === shownPage);
   }
   if (shownPage !== null) pageOf(shownPage).shown?.();
+}
+
+/** Shows the given tab or page again (as they were before a tab that could not be opened), or nothing. */
+function showInstead(tab: Session | null, page: PageId | null) {
+  active = null;
+  if (!tab || !sessions.includes(tab)) return showActive();
+  if (page === null) return activate(tab);
+  active = tab;
+  shownPage = page;
+  showActive();
 }
 
 function close(s: Session) {
@@ -519,7 +533,7 @@ function close(s: Session) {
   if (s.id !== null) {
     invoke("pty_kill", { id: s.id }).catch((err) => console.error("misag: kill failed", err));
   }
-  s.term.dispose();
+  s.term.destroy();
   s.el.remove();
   clearTabNotices(s);
 
@@ -1206,7 +1220,7 @@ for (const el of document.querySelectorAll(".claude-icon")) el.innerHTML = CLAUD
 $<HTMLButtonElement>("#open-settings").onclick = () => openPage("settings");
 // A hidden terminal has no size to fit to; it is fitted when shown again.
 new ResizeObserver(() => {
-  if (shownPage === null) active?.fit.fit();
+  if (shownPage === null) active?.term.fit();
 }).observe(termsEl);
 
 const SIDEBAR_KEY = "misag.sidebarCollapsed";

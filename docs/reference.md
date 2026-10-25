@@ -12,7 +12,7 @@ How every part of Mischief of Agents (`misag`) behaves. For an overview, buildin
 | Rename a tab | Double-click it |
 | Close a tab | Click ✕ or middle-click the tab |
 | Restart a tab whose process exited or failed to start | Press Enter in it |
-| Open a link | Click a URL in the terminal (opens in the system browser) |
+| Open a link | Ctrl+click a link a program marks as one (OSC 8 hyperlinks, as Claude Code and `ls --hyperlink` print); it opens in the system browser. Plain URLs in the output are not clickable |
 | Toggle the sidebar | Burger button at the left of the tab bar |
 | Reorder the sidebar's toolboxes | Drag a toolbox by its header, or press Alt+Up or Alt+Down on it; Reset sidebar on the Settings tab puts them back |
 | Browse your workspace | Workspace box in the sidebar: click a folder to open it; the reload button refreshes it; the gear opens the Workspace settings tab |

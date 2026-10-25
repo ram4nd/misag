@@ -1,66 +1,82 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import type { Channel } from "@tauri-apps/api/core";
+import type { WTerm } from "@wterm/dom";
 import indexHtml from "../index.html?raw";
 import capabilities from "../src-tauri/capabilities/default.json?raw";
+import tauriConfig from "../src-tauri/tauri.conf.json?raw";
 import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
 
-// xterm needs a real canvas and layout, so the tests drive a stand-in that
-// records writes and exposes the handlers main.ts registers.
+// wterm needs WASM and real layout, so the tests drive a stand-in that
+// records writes and exposes the callbacks main.ts assigns.
 const fakes = vi.hoisted(() => {
-  type Handler = (...args: any[]) => void;
-  class FakeTerminal {
+  type Used = "cols" | "rows" | "element" | "onData" | "onBinary" | "onTitle" | "onResize" | "write" | "fit" | "focus" | "destroy" | "setRenderingPaused";
+  class FakeTerminal implements Pick<WTerm, Used> {
     static all: FakeTerminal[] = [];
-    /** Makes the next terminal's open() throw, as a broken view would. */
+    /** Makes the next terminal's init() fail, as a broken view would. */
     static failOnce = false;
+    /** Keeps each init() waiting until the test settles it through `loading`. */
+    static hold = false;
     cols = 80;
     rows = 24;
     written: string[] = [];
-    handlers: Record<string, Handler> = {};
-    disposed = false;
+    destroyed = false;
+    paused: boolean;
+    /** Focus calls that reached the terminal's input, which exists only once it has loaded. */
+    focused = 0;
+    loaded = false;
+    loading: { resolve(): void; reject(err: Error): void } | null = null;
     options: Record<string, unknown>;
-    constructor(options: Record<string, unknown> = {}) {
+    onData: ((data: string) => void) | null = null;
+    onBinary: ((data: Uint8Array) => void) | null = null;
+    onTitle: ((title: string) => void) | null = null;
+    onResize: ((cols: number, rows: number) => void) | null = null;
+    constructor(public element: HTMLElement, options: Record<string, unknown> = {}) {
       this.options = { ...options };
+      this.paused = Boolean(options.renderingPaused);
+      // Like wterm: a plain click on a link stays terminal interaction; Ctrl+click or the keyboard opens it.
+      element.addEventListener("click", (e) => {
+        const onLink = e.target instanceof Element && e.target.closest(".term-link");
+        if (onLink && !e.ctrlKey && !e.metaKey && e.detail !== 0) e.preventDefault();
+      });
       FakeTerminal.all.push(this);
     }
     get output() {
       return this.written.join("");
     }
-    write(data: string | Uint8Array) {
-      this.written.push(typeof data === "string" ? data : new TextDecoder().decode(data));
-    }
-    private on(name: string) {
-      return (h: Handler) => {
-        this.handlers[name] = h;
-        return { dispose() {} };
-      };
-    }
-    onData = this.on("data");
-    onBinary = this.on("binary");
-    onResize = this.on("resize");
-    onTitleChange = this.on("title");
-    loadAddon() {}
-    open() {
-      if (FakeTerminal.failOnce) {
-        FakeTerminal.failOnce = false;
-        throw new Error("no canvas");
+    async init() {
+      try {
+        if (FakeTerminal.hold) await new Promise<void>((resolve, reject) => (this.loading = { resolve, reject }));
+        if (FakeTerminal.failOnce) {
+          FakeTerminal.failOnce = false;
+          throw new Error("no wasm");
+        }
+      } catch (err) {
+        // Like wterm: a failed load cleans up after itself.
+        this.destroy();
+        throw new Error(`wterm: failed to initialize: ${(err as Error).message}`);
       }
+      // Like wterm: a terminal destroyed while loading resolves without an error.
+      if (!this.destroyed) this.loaded = true;
+      return this;
     }
-    focus() {}
-    reset() {
-      this.written = [];
+    write(data: string | Uint8Array) {
+      // A full reset (RIS) clears the screen.
+      if (data === "\x1bc") this.written = [];
+      else this.written.push(typeof data === "string" ? data : new TextDecoder().decode(data));
     }
-    dispose() {
-      this.disposed = true;
+    fit() {}
+    focus() {
+      if (this.loaded) this.focused++;
+    }
+    setRenderingPaused(paused: boolean) {
+      this.paused = paused;
+    }
+    destroy() {
+      this.destroyed = true;
     }
   }
-  class FakeWebLinksAddon {
-    static all: FakeWebLinksAddon[] = [];
-    constructor(public handler: (e: unknown, uri: string) => void) {
-      FakeWebLinksAddon.all.push(this);
-    }
-  }
-  return { FakeTerminal, FakeWebLinksAddon };
+  return { FakeTerminal };
 });
 
 // The window is faked directly: the IPC mocks cannot deliver window events.
@@ -102,10 +118,8 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   },
 }));
 
-vi.mock("@xterm/xterm/css/xterm.css", () => ({}));
-vi.mock("@xterm/xterm", () => ({ Terminal: fakes.FakeTerminal }));
-vi.mock("@xterm/addon-fit", () => ({ FitAddon: class { fit() {} } }));
-vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: fakes.FakeWebLinksAddon }));
+vi.mock("@wterm/dom/src/terminal.css", () => ({}));
+vi.mock("@wterm/dom", () => ({ WTerm: fakes.FakeTerminal }));
 
 type Call = { cmd: string; args: Record<string, unknown> };
 type SpawnCall = {
@@ -327,7 +341,7 @@ beforeEach(() => {
   vi.resetModules();
   fakes.FakeTerminal.all = [];
   fakes.FakeTerminal.failOnce = false;
-  fakes.FakeWebLinksAddon.all = [];
+  fakes.FakeTerminal.hold = false;
   calls = [];
   let nextId = 0;
   spawnBehaviour = (_args, id) => id;
@@ -541,7 +555,7 @@ describe("tabs", () => {
     x.click();
     expect(callsOf("pty_kill").map((c) => c.args.id)).toEqual([2]);
     expect(tabNames()).toEqual(["work", "work"]);
-    expect(terms()[1].disposed).toBe(true);
+    expect(terms()[1].destroyed).toBe(true);
   });
 
   test("middle-click closes a tab", async () => {
@@ -563,11 +577,11 @@ describe("tabs", () => {
   test("titles show in the tooltip until the user renames the tab", async () => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.title("✳ Fix the build");
+    terms()[0].onTitle!("✳ Fix the build");
     expect(tabs()[0].title).toContain("✳ Fix the build");
     renameTab(0, "build");
     expect(tabNames()).toEqual(["build"]);
-    terms()[0].handlers.title("✳ Something else");
+    terms()[0].onTitle!("✳ Something else");
     expect(tabNames()).toEqual(["build"]);
     expect(tabs()[0].title).not.toContain("Something else");
   });
@@ -603,7 +617,7 @@ describe("tab labels", () => {
   test("the terminal title and the full directory are in the tooltip", async () => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.title("✳ Fix the build");
+    terms()[0].onTitle!("✳ Fix the build");
     expect(tabNames()).toEqual(["work"]);
     expect(tooltip(0)).toContain("✳ Fix the build");
     expect(tooltip(0)).toContain("/home/me/work");
@@ -612,7 +626,7 @@ describe("tab labels", () => {
   test("the rename box starts with what the tab shows", async () => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.title("✳ Fix the build");
+    terms()[0].onTitle!("✳ Fix the build");
     tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     expect(tabs()[0].querySelector("input")!.value).toBe("work");
   });
@@ -695,13 +709,13 @@ describe("tab icons", () => {
   test("a tab shows Claude working while its title has a spinner", async () => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.title("✳ Claude Code");
+    terms()[0].onTitle!("✳ Claude Code");
     expect(busy()).toEqual([false]);
-    terms()[0].handlers.title("◐ Claude Code");
+    terms()[0].onTitle!("◐ Claude Code");
     expect(busy()).toEqual([true]);
-    terms()[0].handlers.title("◑ Greeting reply");
+    terms()[0].onTitle!("◑ Greeting reply");
     expect(busy()).toEqual([true]);
-    terms()[0].handlers.title("✳ Greeting reply");
+    terms()[0].onTitle!("✳ Greeting reply");
     expect(busy()).toEqual([false]);
   });
 
@@ -717,7 +731,7 @@ describe("tab icons", () => {
   ])("the title %j shows Claude working: %s", async (title, working) => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.title(title);
+    terms()[0].onTitle!(title);
     expect(busy()).toEqual([working]);
   });
 
@@ -725,11 +739,11 @@ describe("tab icons", () => {
     await boot();
     await clickTerminal();
     // Another tool's spinner in a plain shell.
-    terms()[0].handlers.title("⠂ Installing");
+    terms()[0].onTitle!("⠂ Installing");
     expect(busy()).toEqual([false]);
     openClaudes[1] = SESSION;
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    terms()[0].handlers.title("◐ Fix the build");
+    terms()[0].onTitle!("◐ Fix the build");
     expect(busy()).toEqual([true]);
     // Claude quit mid-turn and the shell set no title.
     delete openClaudes[1];
@@ -744,7 +758,7 @@ describe("tab icons", () => {
     await boot();
     await clickClaude();
     renameTab(0, "build");
-    terms()[0].handlers.title("◐ Claude Code");
+    terms()[0].onTitle!("◐ Claude Code");
     expect(tabs()[0].classList.contains("busy")).toBe(true);
     spawns()[0].onExit.onmessage(0);
     expect(tabs()[0].classList.contains("busy")).toBe(false);
@@ -855,7 +869,7 @@ describe("process lifecycle", () => {
     spawns()[0].onExit.onmessage(3);
     expect(terms()[0].output).toContain("process exited with code 3");
     expect(tabs()[0].classList.contains("exited")).toBe(true);
-    terms()[0].handlers.data("hi\r");
+    terms()[0].onData!("hi\r");
     expect(callsOf("pty_write")).toHaveLength(0);
   });
 
@@ -864,17 +878,17 @@ describe("process lifecycle", () => {
     await clickClaude();
     spawns()[0].onExit.onmessage(1);
     expect(terms()[0].output).toContain("press Enter to restart");
-    terms()[0].handlers.data("x");
+    terms()[0].onData!("x");
     expect(spawns()).toHaveLength(1);
-    terms()[0].handlers.data("\r");
-    terms()[0].handlers.data("\r");
+    terms()[0].onData!("\r");
+    terms()[0].onData!("\r");
     await flush();
     expect(spawns()).toHaveLength(2);
     const [first, again] = spawns();
     expect(again).toMatchObject({ tabId: first.tabId, claudeSession: first.claudeSession, fallbackToHome: true });
     expect(tabs()[0].classList.contains("exited")).toBe(false);
     expect(tabs()).toHaveLength(1);
-    terms()[0].handlers.data("hi");
+    terms()[0].onData!("hi");
     expect(callsOf("pty_write").at(-1)?.args).toMatchObject({ id: 2 });
   });
 
@@ -888,7 +902,7 @@ describe("process lifecycle", () => {
     await clickClaude();
     expect(tabs()[0].classList.contains("exited")).toBe(true);
     fail = false;
-    terms()[0].handlers.data("\r");
+    terms()[0].onData!("\r");
     await flush();
     expect(tabs()[0].classList.contains("exited")).toBe(false);
   });
@@ -897,7 +911,7 @@ describe("process lifecycle", () => {
     await boot();
     await clickClaude();
     spawns()[0].onExit.onmessage(0);
-    terms()[0].handlers.data("\r");
+    terms()[0].onData!("\r");
     await flush();
     await vi.advanceTimersByTimeAsync(61_000);
     expect(callsOf("claude_reported")).toHaveLength(1);
@@ -919,24 +933,50 @@ describe("input", () => {
   test("text is sent as UTF-8 and binary input as raw bytes", async () => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.data("é");
-    terms()[0].handlers.binary("\x80\x01");
+    terms()[0].onData!("é");
+    terms()[0].onBinary!(Uint8Array.of(0x80, 0x01));
     expect(callsOf("pty_write").map((c) => c.args.data)).toEqual([[0xc3, 0xa9], [0x80, 0x01]]);
   });
 
   test("resizes are forwarded to the PTY", async () => {
     await boot();
     await clickClaude();
-    terms()[0].handlers.resize({ cols: 100, rows: 30 });
+    terms()[0].onResize!(100, 30);
     expect(callsOf("pty_resize")[0].args).toMatchObject({ id: 1, cols: 100, rows: 30 });
   });
 
-  test("links open through the opener plugin", async () => {
+  /** Clicks a link in the first terminal, as `detail` 1 (a mouse click) or 0 (the keyboard), and returns the event. */
+  async function clickLink(init: MouseEventInit) {
+    const link = document.createElement("a");
+    link.className = "term-link";
+    link.href = "https://tauri.app/";
+    terms()[0].element.append(link);
+    const click = new MouseEvent("click", { bubbles: true, cancelable: true, ...init });
+    link.dispatchEvent(click);
+    await flush();
+    return click;
+  }
+
+  test("Ctrl+click opens a link through the opener plugin, not in the app's window", async () => {
     await boot();
     await clickClaude();
-    fakes.FakeWebLinksAddon.all[0].handler(new MouseEvent("click"), "https://tauri.app");
-    await flush();
-    expect(callsOf("plugin:opener|open_url")[0].args).toMatchObject({ url: "https://tauri.app" });
+    const click = await clickLink({ ctrlKey: true, detail: 1 });
+    expect(click.defaultPrevented).toBe(true);
+    expect(callsOf("plugin:opener|open_url")[0].args).toMatchObject({ url: "https://tauri.app/" });
+  });
+
+  test("a link activated from the keyboard opens", async () => {
+    await boot();
+    await clickClaude();
+    await clickLink({ detail: 0 });
+    expect(callsOf("plugin:opener|open_url")).toHaveLength(1);
+  });
+
+  test("a plain click on a link stays in the terminal", async () => {
+    await boot();
+    await clickClaude();
+    await clickLink({ detail: 1 });
+    expect(callsOf("plugin:opener|open_url")).toHaveLength(0);
   });
 });
 
@@ -1034,8 +1074,8 @@ describe("restoring tabs", () => {
   test("restored user names survive titles; others follow them", async () => {
     savedLayout = layout;
     await boot();
-    terms()[0].handlers.title("✳ x");
-    terms()[1].handlers.title("✳ y");
+    terms()[0].onTitle!("✳ x");
+    terms()[1].onTitle!("✳ y");
     expect(tabNames()).toEqual(["agent", "✳ y", "logs", "app"]);
   });
 
@@ -1096,7 +1136,7 @@ describe("saving tabs", () => {
     };
     await boot();
     spawns()[0].onExit.onmessage(0);
-    terms()[0].handlers.data("\r");
+    terms()[0].onData!("\r");
     await flush();
     expect(spawns().map((s) => s.claudeSession)).toEqual([SESSION, null]);
   });
@@ -1429,11 +1469,11 @@ describe("settings", () => {
     expect(tabs()[0].querySelector(".badge")).toBeNull();
     expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
     storedSettings = { ...DEFAULTS };
-    terms()[0].handlers.title?.("busy");
+    terms()[0].onTitle?.("busy");
     expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
     // The restart picks up the current setting.
     spawns()[0].onExit.onmessage(0);
-    terms()[0].handlers.data("\r");
+    terms()[0].onData!("\r");
     for (let i = 0; i < 3; i++) await flush();
     expect(tabs()[0].title).not.toContain("--dangerously-skip-permissions");
   });
@@ -2003,10 +2043,92 @@ describe("failures", () => {
     spawnBehaviour = () => new Promise(() => {});
     await boot();
     await clickClaude();
-    terms()[0].handlers.data("early");
-    terms()[0].handlers.resize({ cols: 90, rows: 20 });
+    terms()[0].onData!("early");
+    terms()[0].onResize!(90, 20);
     expect(callsOf("pty_write")).toHaveLength(0);
     expect(callsOf("pty_resize")).toHaveLength(0);
+  });
+});
+
+describe("terminal views", () => {
+  test("a tab closed while its terminal loads starts no process", async () => {
+    fakes.FakeTerminal.hold = true;
+    await boot();
+    await clickClaude();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    terms()[0].loading!.resolve();
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_spawn")).toHaveLength(0);
+    expect(tabs()).toHaveLength(0);
+  });
+
+  test("a terminal that fails to load after its tab was closed leaves the other tabs alone", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickClaude();
+    fakes.FakeTerminal.hold = true;
+    await clickClaude();
+    tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
+    terms()[1].loading!.reject(new Error("no wasm"));
+    for (let i = 0; i < 3; i++) await flush();
+    expect(tabs()).toHaveLength(1);
+    expect(terms()[0].destroyed).toBe(false);
+    expect(noticeText()).not.toContain("could not be opened");
+    error.mockRestore();
+  });
+
+  test("a tab that cannot be opened gives the screen back to the tab shown before", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickClaude();
+    fakes.FakeTerminal.failOnce = true;
+    await clickClaude();
+    expect(tabs()).toHaveLength(1);
+    expect(tabs()[0].classList.contains("active")).toBe(true);
+    expect(terms()[0].element.classList.contains("active")).toBe(true);
+    expect(noticeText()).toContain("A tab could not be opened");
+    error.mockRestore();
+  });
+
+  test("a new tab's terminal is focused once it has loaded", async () => {
+    fakes.FakeTerminal.hold = true;
+    await boot();
+    await clickClaude();
+    terms()[0].loading!.resolve();
+    for (let i = 0; i < 3; i++) await flush();
+    expect(terms()[0].focused).toBeGreaterThan(0);
+  });
+
+  test("only the shown tab's terminal paints", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    expect(terms().map((t) => t.paused)).toEqual([true, false]);
+    tabs()[0].click();
+    expect(terms().map((t) => t.paused)).toEqual([false, true]);
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    expect(terms().map((t) => t.paused)).toEqual([true, true]);
+  });
+
+  test("an error thrown while writing to a terminal does not stop a restart", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickClaude();
+    spawns()[0].onExit.onmessage(0);
+    vi.spyOn(terms()[0], "write").mockImplementation(() => {
+      throw new Error("callback failed");
+    });
+    terms()[0].onData!("\r");
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_spawn")).toHaveLength(2);
+    expect(tabs()[0].classList.contains("exited")).toBe(false);
+    error.mockRestore();
+  });
+
+  test("the window's CSP lets the terminal compile its WebAssembly, and nothing else is eval'd", () => {
+    const csp: string = JSON.parse(tauriConfig).app.security.csp;
+    const scriptSrc = csp.split(";").find((d) => d.trim().startsWith("script-src"))!;
+    expect(scriptSrc).toContain("'wasm-unsafe-eval'");
+    expect(scriptSrc).not.toContain("'unsafe-eval'");
   });
 });
 
@@ -2016,7 +2138,7 @@ describe("edge cases", () => {
     await clickClaude();
     await vi.advanceTimersByTimeAsync(1000);
     const saves = callsOf("layout_save").length;
-    terms()[0].handlers.title("Claude 1");
+    terms()[0].onTitle!("Claude 1");
     await vi.advanceTimersByTimeAsync(1000);
     await win.closeRequested!();
     expect(callsOf("layout_save")).toHaveLength(saves);
@@ -2060,7 +2182,7 @@ describe("edge cases", () => {
     await boot();
     expect(tabNames()).toEqual(["b"]);
     expect(document.querySelectorAll(".term")).toHaveLength(1);
-    expect(noticeText()).toContain("A tab could not be opened: no canvas.");
+    expect(noticeText()).toContain("A tab could not be opened: wterm: failed to initialize: no wasm.");
     expect(noticeText()).toContain("1 saved tab(s) could not be reopened");
     await win.closeRequested!();
     expect(callsOf("layout_save")).toHaveLength(0);
@@ -2126,10 +2248,10 @@ describe("edge cases", () => {
     await vi.advanceTimersByTimeAsync(61_000);
     expect(noticeText()).toContain("has not reported");
     dismissButton().click();
-    terms()[0].handlers.title("✳ Fix the build");
+    terms()[0].onTitle!("✳ Fix the build");
     await vi.advanceTimersByTimeAsync(31_000);
     expect(noticeVisible()).toBe(false);
-    terms()[0].handlers.title("✳ Something else");
+    terms()[0].onTitle!("✳ Something else");
     await vi.advanceTimersByTimeAsync(31_000);
     expect(noticeVisible()).toBe(false);
   });

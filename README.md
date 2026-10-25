@@ -17,9 +17,9 @@ The name and logo come from the same idea. A *mischief* is a group of rats, a no
 - **Tabs that remember Claude.** Claude tabs and terminal tabs reopen after a restart, and Claude comes back in the conversation it was last in, including after `/clear` and `/resume`. A `claude` started at a terminal tab's prompt is tracked too.
 - **Session history.** See every Claude conversation you have saved, in any folder, resume one in a new tab, and pin the ones you keep coming back to.
 - **Workspace browser.** Browse a folder tree and click a file to type its path into the active tab.
-- Chrome-style tabs that follow your `cd`, clickable links, and one window at a time.
+- Chrome-style tabs that follow your `cd`, Ctrl+clickable links, and one window at a time.
 
-Built with Tauri 2, a Rust PTY backend (`portable-pty`), xterm.js and SQLite.
+Built with Tauri 2, a Rust PTY backend (`portable-pty`), wterm and SQLite.
 
 ## Install
 
