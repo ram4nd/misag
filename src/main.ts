@@ -513,6 +513,7 @@ function showActive() {
     pageOf(id).tabEl?.classList.toggle("active", id === shownPage);
   }
   if (shownPage !== null) pageOf(shownPage).shown?.();
+  showTabRuns();
 }
 
 /** Shows the given tab or page again (as they were before a tab that could not be opened), or nothing. */
@@ -530,6 +531,8 @@ function close(s: Session) {
   s.closing = true;
   // Its run can never be answered again: the tab's id is not reused.
   invoke("flow_stop_tab", { tabId: s.tabId }).catch((err) => console.error("misag: could not end the tab's flow run", err));
+  // Not one of a closed tab while the stop is on its way; if it fails, the next poll shows it as one.
+  runs = runs.filter((r) => r.tabId !== s.tabId);
   const i = sessions.indexOf(s);
   sessions.splice(i, 1);
   // A missing session (already exited) is a no-op on the backend.
@@ -549,6 +552,7 @@ function close(s: Session) {
     else active = next;
   }
   showHistory();
+  showTabRuns();
   scheduleSave();
 }
 
@@ -1250,22 +1254,28 @@ const flows = createFlows({
   onOpen: openFlowEditor,
   onChange: followFlows,
   onRun: startFlow,
-  onContinue: continueRun,
   onStop: stopRun,
-  onShowRun: (run) => {
-    const s = sessions.find((s) => s.tabId === run.tabId);
-    if (s) activate(s);
-  },
-  tabName: (tabId) => {
-    const s = sessions.find((s) => s.tabId === tabId);
-    return s ? tabLabel(s) : null;
-  },
 });
 
 /** How long after pasting a prompt Claude gets the Enter that sends it, so the paste is not taken as typing. */
 const PASTE_SUBMIT_MS = 150;
 /** Tabs whose flow run waits for the person, marked in the tab bar. */
 const waitingTabs = new Set<string>();
+/** The active runs, as last read. */
+let runs: Run[] = [];
+/** Until the saved tabs are back, a run's tab may just not be open yet. */
+let tabsRestored = false;
+
+/**
+ * Shows the active tab's runs, their flows marked in the toolbox and their steps in
+ * the editors, and in the toolbox the runs whose tab is gone, so they can be stopped.
+ */
+function showTabRuns() {
+  const here = runs.filter((r) => r.tabId === active?.tabId);
+  const orphans = tabsRestored ? runs.filter((r) => !sessions.some((s) => s.tabId === r.tabId)) : [];
+  flows.showRuns(here, orphans);
+  for (const [id, { editor }] of editorPages) editor.showRun(here.find((r) => `flow:${r.flowId}` === id) ?? null);
+}
 
 /**
  * Types `text` into the tab as one paste and sends it, as if the person had. The
@@ -1306,22 +1316,23 @@ async function startFlow(flow: Flow) {
   await pollRuns();
 }
 
-async function continueRun(run: Run, output: string) {
+/** Goes on as `output`; resolves to why it could not, for the run bar it was picked in, or null. */
+async function continueRun(run: Run, output: string): Promise<string | null> {
   const s = sessions.find((s) => s.tabId === run.tabId);
+  let error: string | null = null;
   if (!s || !(await claudeLive(s))) {
-    flows.showBoxError(`Claude is not running in ${s ? tabLabel(s) : "the run's tab"}; start it there first, or stop the run.`);
-    await pollRuns();
-    return;
-  }
-  try {
-    const prompt = await invoke<string | null>("flow_continue", { runId: run.id, output });
-    flows.showBoxError(null);
-    if (prompt !== null) typePrompt(s, prompt);
-  } catch (err) {
-    console.error("misag: could not continue the run", err);
-    flows.showBoxError(`Could not go on: ${errorText(err)}`);
+    error = `Claude is not running in ${s ? tabLabel(s) : "the run's tab"}; start it there first, or stop the run.`;
+  } else {
+    try {
+      const prompt = await invoke<string | null>("flow_continue", { runId: run.id, output });
+      if (prompt !== null) typePrompt(s, prompt);
+    } catch (err) {
+      console.error("misag: could not continue the run", err);
+      error = `Could not go on: ${errorText(err)}`;
+    }
   }
   await pollRuns();
+  return error;
 }
 
 async function stopRun(run: Run) {
@@ -1338,13 +1349,13 @@ async function stopRun(run: Run) {
 /** The error pollRuns shows, so a later good poll clears only its own. */
 let runsError: string | null = null;
 
-/** Shows the active runs, and marks the tabs whose run waits for the person. */
+/** Shows the active tab's runs, and marks the tabs whose run waits for the person. */
 async function pollRuns() {
   try {
-    const runs = await invoke<Run[]>("flow_runs");
+    runs = await invoke<Run[]>("flow_runs");
     if (runsError !== null) flows.showBoxError(null);
     runsError = null;
-    flows.showRuns(runs);
+    showTabRuns();
     waitingTabs.clear();
     for (const run of runs) {
       if (run.status !== "running") waitingTabs.add(run.tabId);
@@ -1361,7 +1372,7 @@ async function pollRuns() {
 function openFlowEditor(flow: Flow) {
   const id: EditorPageId = `flow:${flow.id}`;
   if (!editorPages.has(id)) {
-    const editor = createFlowEditor(flow.id, { errorText });
+    const editor = createFlowEditor(flow.id, { errorText, onContinue: continueRun });
     termsEl.append(editor.el);
     const page: Page = {
       title: flow.name,
@@ -1376,6 +1387,7 @@ function openFlowEditor(flow: Flow) {
       shown: editor.shown,
     };
     editorPages.set(id, { page, editor });
+    showTabRuns();
   }
   openPage(id);
 }
@@ -1562,8 +1574,13 @@ setInterval(checkStore, STORE_POLL_MS);
 setInterval(pollTabs, TAB_POLL_MS);
 setInterval(pollRuns, TAB_POLL_MS);
 setInterval(reloadHistoryIfShown, HISTORY_POLL_MS);
-restore().catch((err) => {
-  console.error("misag: restore failed", err);
-  canSave = false;
-  setNotice("load", "Saved tabs could not be restored, so changes are not saved this session.", false);
-});
+restore()
+  .catch((err) => {
+    console.error("misag: restore failed", err);
+    canSave = false;
+    setNotice("load", "Saved tabs could not be restored, so changes are not saved this session.", false);
+  })
+  .finally(() => {
+    tabsRestored = true;
+    showTabRuns();
+  });

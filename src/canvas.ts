@@ -19,6 +19,8 @@ export interface Canvas {
   retitle(id: string, title: string): void;
   /** Redraws the connections, which are measured from the steps: needed once the canvas is visible. */
   refresh(): void;
+  /** Marks the step a run is at (none with null), through redraws too. */
+  mark(id: string | null): void;
 }
 
 const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Manual", end: "End" };
@@ -35,6 +37,7 @@ export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
   const drawnAs = new Map<string, number>();
   // Drawflow reports what `render` itself draws as if the user did it.
   let rendering = false;
+  let marked: string | null = null;
 
   const step = (dfId: number | string) => stepOf.get(String(dfId));
   /** Resolves a connection event to its from step, output and to step; null if any is unknown. */
@@ -123,6 +126,7 @@ export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
         if (a !== undefined && b !== undefined && output > 0) df.addConnection(a, b, `output_${output}`, "input_1");
         else dropped("connection to draw", e);
       }
+      mark(marked);
     } finally {
       rendering = false;
     }
@@ -138,5 +142,10 @@ export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
     if (node) node.textContent = title;
   }
 
-  return { render, retitle, refresh };
+  function mark(id: string | null) {
+    marked = id;
+    for (const [stepId, drawn] of drawnAs) el.querySelector(`#node-${drawn}`)?.classList.toggle("current", stepId === id);
+  }
+
+  return { render, retitle, refresh, mark };
 }

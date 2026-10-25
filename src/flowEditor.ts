@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvas } from "./canvas";
+import { STATUS_LABELS, type Run } from "./flows";
 
 /** Mirrors `flows::Kind` in src-tauri/src/flows.rs. */
 export type StepKind = "start" | "prompt" | "manual" | "end";
@@ -49,6 +50,8 @@ const NEW_STEPS: Record<"prompt" | "manual", { title: string; outputs: string[] 
 
 export interface FlowEditorOptions {
   errorText(err: unknown): string;
+  /** The person picked `output` for the shown run's step; resolves to why it could not go on, or null. */
+  onContinue(run: Run, output: string): Promise<string | null>;
 }
 
 export interface FlowEditor {
@@ -62,6 +65,8 @@ export interface FlowEditor {
   flush(): Promise<boolean>;
   /** Drops any change still waiting, for a flow that is gone. */
   discard(): void;
+  /** Shows where the active tab's run of this flow is (nothing with null), and its outputs to go on by. */
+  showRun(run: Run | null): void;
 }
 
 function editorMarkup(): string {
@@ -72,6 +77,12 @@ function editorMarkup(): string {
           <button type="button" class="add-prompt">+ Prompt</button>
           <button type="button" class="add-manual">+ Manual step</button>
           <span class="status" role="status"></span>
+        </div>
+        <div class="run-bar" hidden>
+          <span class="where"></span>
+          <span class="actions"></span>
+          <p class="note"></p>
+          <p class="run-error" role="alert" hidden></p>
         </div>
         <div class="workspace">
           <div class="canvas"></div>
@@ -200,6 +211,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   /** Records a change to the graph: redraws the canvas if what it shows changed, and saves soon. */
   function changed(redraw: boolean) {
     if (redraw) canvas.render(graph);
+    showWhere();
     status.textContent = "Saving…";
     if (timer !== null) clearTimeout(timer);
     timer = setTimeout(() => void save(), SAVE_DELAY_MS);
@@ -324,6 +336,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       const flow = await invoke<FlowDetail>("flow_load", { id: flowId });
       graph = flow.graph;
       canvas.render(graph);
+      showWhere();
       showProblems(flow.problems);
       showError(null);
       return true;
@@ -346,10 +359,69 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     return saved;
   }
 
+  const runBar = $<HTMLElement>(".run-bar");
+  const runError = $<HTMLElement>(".run-bar .run-error");
+  let run: Run | null = null;
+  /** JSON.stringify(null): the bar starts hidden, as for no run. */
+  let shownRun = "null";
+
+  function showRunError(message: string | null) {
+    runError.hidden = !message;
+    runError.textContent = message ?? "";
+  }
+
+  /** Where the run is; its step may be gone from the flow, as the run follows the flow it started on. */
+  function showWhere() {
+    if (!run) return;
+    const gone = graph.nodes.some((s) => s.id === run!.stepId) ? "" : " (no longer in this flow)";
+    $(".run-bar .where").textContent = `${STATUS_LABELS[run.status]}: ${run.step}${gone}`;
+  }
+
+  /**
+   * Shows where the run is, and offers its step's outputs (as the flow was when the
+   * run started), for a running step too, in case Claude was interrupted and no reply comes.
+   */
+  function showRun(next: Run | null) {
+    // Polled often: redrawn only on a change, so a click is not lost to a redraw.
+    if (JSON.stringify(next) === shownRun) return;
+    shownRun = JSON.stringify(next);
+    run = next;
+    canvas.mark(run?.stepId ?? null);
+    showRunError(null);
+    runBar.hidden = !run;
+    runBar.classList.remove("running", "manual", "attention");
+    if (!run) return;
+    runBar.classList.add(run.status);
+    showWhere();
+    const note = $<HTMLElement>(".run-bar .note");
+    note.hidden = !run.note;
+    note.textContent = run.note ?? "";
+    const shown = run;
+    const buttons = shown.outputs.map((output) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "output";
+      b.textContent = output;
+      b.title = shown.status === "running" ? `Claude is still on this step; go on as "${output}" anyway` : `Go on as "${output}"`;
+      b.onclick = async () => {
+        // Once: a second click would send the next step too.
+        for (const other of buttons) other.disabled = true;
+        showRunError(null);
+        try {
+          showRunError(await opts.onContinue(shown, output));
+        } finally {
+          for (const other of buttons) other.disabled = false;
+        }
+      };
+      return b;
+    });
+    $(".run-bar .actions").replaceChildren(...buttons);
+  }
+
   function discard() {
     if (timer !== null) clearTimeout(timer);
     timer = null;
   }
 
-  return { el, load, shown: () => canvas.refresh(), flush, discard };
+  return { el, load, shown: () => canvas.refresh(), flush, discard, showRun };
 }

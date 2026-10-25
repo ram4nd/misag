@@ -3041,7 +3041,13 @@ describe("flow runs", () => {
   const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
   const box = () => document.querySelector<HTMLElement>("#flows-box")!;
   const flowRow = (name: string) => [...box().querySelectorAll<HTMLElement>(".flows > li")].find((li) => li.querySelector(".name")!.textContent === name)!;
-  const runRows = () => [...box().querySelectorAll<HTMLElement>(".runs li")];
+  const running = () => [...box().querySelectorAll<HTMLElement>(".flows > li.running")].map((li) => li.querySelector(".name")!.textContent);
+  // One editor per test: found whether or not it is the page shown.
+  const editor = () => document.querySelector<HTMLElement>(".page.flow-editor")!;
+  const runBar = () => editor().querySelector<HTMLElement>(".run-bar")!;
+  const outputs = () => [...runBar().querySelectorAll<HTMLButtonElement>("button.output")];
+  const current = () => [...editor().querySelectorAll<HTMLElement>(".drawflow-node.current")].map((n) => n.querySelector(".title")!.textContent);
+  const step = (id: string, kind: Step["kind"], title: string, outputs: string[]): Step => ({ id, kind, title, text: "x", outputs, x: 0, y: 0 });
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
     status: "running", note: null, outputs: ["pass", "fail"], steps: 1, ...over,
@@ -3056,9 +3062,17 @@ describe("flow runs", () => {
     // The Enter that submits a typed prompt follows the paste.
     await vi.advanceTimersByTimeAsync(200);
   }
+  async function open(name: string) {
+    flowRow(name).querySelector<HTMLElement>(".name")!.click();
+    await settle();
+  }
 
   beforeEach(() => {
-    storedFlows = [{ id: 1, name: "Deploy", archived: false }];
+    storedFlows = [{ id: 1, name: "Deploy", archived: false }, { id: 2, name: "Review", archived: false }];
+    storedGraphs[1] = {
+      nodes: [START, step("p", "prompt", "Fix the tests", ["pass", "fail"]), step("m", "manual", "Check the form", ["ok"])],
+      edges: [{ from: "start", output: "next", to: "p" }, { from: "p", output: "pass", to: "m" }],
+    };
   });
 
   test("▶ starts a flow in the active Claude tab and types its first prompt", async () => {
@@ -3098,72 +3112,160 @@ describe("flow runs", () => {
     expect(typed()).toEqual([]);
   });
 
-  test("active runs show under their flow, and a tab that waits for you is marked", async () => {
+  test("only a flow running in the active tab is marked, with ■ in place of ▶", async () => {
     await boot();
     await openClaudeTabs(2);
     const [a, b] = spawns().map((c) => c.tabId);
-    activeRuns = [run({ tabId: a }), run({ id: 6, tabId: b, status: "manual", step: "Check the form", outputs: ["ok"] })];
+    activeRuns = [run({ tabId: a }), run({ id: 6, flowId: 2, tabId: b, status: "manual" })];
     await poll();
-    expect(runRows().map((li) => li.querySelector(".summary")!.textContent)).toEqual([
-      "work · Fix the tests · Running",
-      "work · Check the form · Waiting for you",
-    ]);
+    // The second tab is active.
+    expect(running()).toEqual(["Review"]);
+    expect(flowRow("Review").querySelector("button.run")).toBeNull();
+    expect(flowRow("Review").querySelector("button.stop-run")).not.toBeNull();
+    expect(flowRow("Deploy").querySelector("button.run")).not.toBeNull();
+    expect(box().querySelector(".runs")).toBeNull();
+    tabs()[0].click();
+    expect(running()).toEqual(["Deploy"]);
     expect(tabs().map((t) => t.classList.contains("needs-you"))).toEqual([false, true]);
     activeRuns = [];
     await poll();
-    expect(runRows()).toHaveLength(0);
+    expect(running()).toEqual([]);
     expect(tabs().map((t) => t.classList.contains("needs-you"))).toEqual([false, false]);
   });
 
-  test("a waiting run offers its outputs, and the pick sends the next prompt to its tab", async () => {
-    runPrompt = "Deploy it.";
-    await boot();
-    await openClaudeTabs(2);
-    const tabId = spawns()[0].tabId;
-    activeRuns = [run({ tabId, status: "attention", note: "Claude asked for a person.", outputs: ["pass", "fail"] })];
-    await poll();
-    const row = runRows()[0];
-    expect(row.querySelector(".note")!.textContent).toBe("Claude asked for a person.");
-    expect([...row.querySelectorAll<HTMLButtonElement>("button.output")].map((b) => b.textContent)).toEqual(["pass", "fail"]);
-    expect(row.querySelector("input")).toBeNull();
-    row.querySelector<HTMLButtonElement>("button.output")!.click();
-    await settle();
-    await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "pass" }]);
-    // Typed into the run's tab, which is not the active one.
-    expect(callsOf("pty_write").map((c) => c.args.id)).toEqual([1, 1]);
-    expect(typed()).toEqual(["\x1b[200~Deploy it.\x1b[201~", "\r"]);
-  });
-
-  test("a running run can be moved on by hand, or stopped", async () => {
+  test("■ stops the run", async () => {
     await boot();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
-    // In case Claude was interrupted or crashed, and no reply will come.
-    expect([...runRows()[0].querySelectorAll("button.output")].map((b) => b.textContent)).toEqual(["pass", "fail"]);
-    runRows()[0].querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
     await settle();
     expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
-    expect(runRows()).toHaveLength(0);
+    expect(callsOf("flow_load")).toHaveLength(0);
+    expect(running()).toEqual([]);
   });
 
-  test("clicking a run shows its tab", async () => {
+  test("a running flow's editor shows its current step, and the outputs to go on by", async () => {
+    runPrompt = "Deploy it.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person." })];
+    await poll();
+    await open("Deploy");
+    expect(current()).toEqual(["Fix the tests"]);
+    expect(runBar().hidden).toBe(false);
+    expect(runBar().textContent).toContain("Needs attention");
+    expect(runBar().textContent).toContain("Claude asked for a person.");
+    expect(outputs().map((b) => b.textContent)).toEqual(["pass", "fail"]);
+    outputs()[0].click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "pass" }]);
+    expect(typed()).toEqual(["\x1b[200~Deploy it.\x1b[201~", "\r"]);
+  });
+
+  test("the editor follows the run as it moves on, and ends", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId })];
+    await poll();
+    await open("Deploy");
+    expect(current()).toEqual(["Fix the tests"]);
+    activeRuns = [run({ tabId, stepId: "m", step: "Check the form", status: "manual", outputs: ["ok"], steps: 2 })];
+    await poll();
+    expect(current()).toEqual(["Check the form"]);
+    expect(outputs().map((b) => b.textContent)).toEqual(["ok"]);
+    activeRuns = [];
+    await poll();
+    expect(current()).toEqual([]);
+    expect(runBar().hidden).toBe(true);
+  });
+
+  test("a run whose tab is gone shows on its flow, and ■ stops it", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: "gone" })];
+    await poll();
+    expect(running()).toEqual(["Deploy"]);
+    expect(flowRow("Deploy").classList.contains("orphan")).toBe(true);
+    expect(flowRow("Deploy").title).toContain("closed tab");
+    // It cannot be answered, so the editor does not offer it.
+    await open("Deploy");
+    expect(runBar().hidden).toBe(true);
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    await settle();
+    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
+  });
+
+  test("closing a tab does not leave its run showing as one of a closed tab", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    await flush();
+    expect(running()).toEqual([]);
+  });
+
+  test("while the active tab runs a flow, ▶ on the others is off", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    const play = flowRow("Review").querySelector<HTMLButtonElement>("button.run")!;
+    expect(play.disabled).toBe(true);
+    expect(play.title).toContain("one flow at a time");
+    activeRuns = [];
+    await poll();
+    expect(flowRow("Review").querySelector<HTMLButtonElement>("button.run")!.disabled).toBe(false);
+  });
+
+  test("the editor says when the run's step is no longer in the flow", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, stepId: "old", step: "Old step" })];
+    await poll();
+    await open("Deploy");
+    expect(current()).toEqual([]);
+    expect(runBar().textContent).toContain("Old step");
+    expect(runBar().textContent).toContain("no longer in this flow");
+  });
+
+  test("an open editor follows the active tab", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    tabs()[0].click();
+    await poll();
+    await open("Deploy");
+    expect(current()).toEqual(["Fix the tests"]);
+    tabs()[1].click();
+    expect(current()).toEqual([]);
+    expect(runBar().hidden).toBe(true);
+    tabs()[0].click();
+    expect(current()).toEqual(["Fix the tests"]);
+  });
+
+  test("the run's step stays marked while the flow is edited", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    await open("Deploy");
+    editor().querySelector<HTMLButtonElement>("button.add-prompt")!.click();
+    await settle();
+    expect(current()).toEqual(["Fix the tests"]);
+  });
+
+  test("an editor shows only the active tab's run of its flow", async () => {
     await boot();
     await openClaudeTabs(2);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
-    runRows()[0].querySelector<HTMLElement>(".summary")!.click();
-    expect(tabs().map((t) => t.classList.contains("active"))).toEqual([true, false]);
-  });
-
-  test("a run whose tab is gone can only be stopped", async () => {
-    await boot();
-    activeRuns = [run({ tabId: "gone", status: "manual", outputs: ["ok"] })];
-    await poll();
-    expect(runRows()[0].querySelector(".summary")!.textContent).toBe("closed tab · Fix the tests · Waiting for you");
-    expect(runRows()[0].querySelectorAll("button.output")).toHaveLength(0);
-    expect(runRows()[0].querySelector("button.stop-run")).not.toBeNull();
+    await open("Deploy");
+    expect(current()).toEqual([]);
+    expect(runBar().hidden).toBe(true);
   });
 });
 
@@ -3172,14 +3274,19 @@ describe("flow runs and Claude's state", () => {
     for (let i = 0; i < 6; i++) await flush();
   };
   const box = () => document.querySelector<HTMLElement>("#flows-box")!;
-  const runRows = () => [...box().querySelectorAll<HTMLElement>(".runs li")];
   const boxError = () => box().querySelector<HTMLElement>(".error")!;
+  const output = () => document.querySelector<HTMLButtonElement>(".page.flow-editor.active .run-bar button.output")!;
+  const runError = () => document.querySelector<HTMLElement>(".page.flow-editor.active .run-bar .run-error")!;
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
     status: "manual", note: null, outputs: ["ok"], steps: 1, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+  }
+  async function open() {
+    box().querySelector<HTMLElement>(".flows > li .name")!.click();
     await settle();
   }
 
@@ -3195,18 +3302,22 @@ describe("flow runs and Claude's state", () => {
     openClaudes = { 1: SESSION };
     activeRuns = [run({ tabId })];
     await poll();
+    await open();
     // Claude has quit since the last check: the prompt would go to the shell.
     openClaudes = {};
-    runRows()[0].querySelector<HTMLButtonElement>("button.output")!.click();
+    output().click();
     await settle();
     expect(callsOf("flow_continue")).toHaveLength(0);
     expect(callsOf("pty_write")).toHaveLength(0);
-    expect(boxError().textContent).toContain("Claude is not running");
+    // Said where it was clicked.
+    expect(runError().textContent).toContain("Claude is not running");
+    expect(runError().hidden).toBe(false);
     // With Claude back, it goes on.
     openClaudes = { 1: SESSION };
-    runRows()[0].querySelector<HTMLButtonElement>("button.output")!.click();
+    output().click();
     await settle();
     expect(callsOf("flow_continue")).toHaveLength(1);
+    expect(runError().hidden).toBe(true);
   });
 
   test("▶ checks a terminal tab's Claude right before starting", async () => {
@@ -3230,18 +3341,6 @@ describe("flow runs and Claude's state", () => {
     expect(callsOf("flow_stop_tab").map((c) => c.args)).toEqual([{ tabId }]);
   });
 
-  test("a run that moves on is shown again", async () => {
-    await boot();
-    await openClaudeTabs(1);
-    const tabId = spawns()[0].tabId;
-    activeRuns = [run({ tabId, status: "running", steps: 1 })];
-    await poll();
-    expect(runRows()[0].querySelector(".summary")!.getAttribute("title")).toMatch(/1 step since/);
-    activeRuns = [run({ tabId, status: "running", steps: 2 })];
-    await poll();
-    expect(runRows()[0].querySelector(".summary")!.getAttribute("title")).toContain("2 steps since");
-  });
-
   test("runs that cannot be read are reported in the box until they can", async () => {
     await boot();
     failing.add("flow_runs");
@@ -3252,13 +3351,27 @@ describe("flow runs and Claude's state", () => {
     expect(boxError().hidden).toBe(true);
   });
 
+  test("a refused output says why in the run bar", async () => {
+    runRefusal = "the run has moved on";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    await open();
+    output().click();
+    await settle();
+    expect(runError().textContent).toContain("the run has moved on");
+    expect(output().disabled).toBe(false);
+  });
+
   test("an output is sent once, however often it is clicked", async () => {
     runPrompt = "Next.";
     await boot();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
-    const ok = runRows()[0].querySelector<HTMLButtonElement>("button.output")!;
+    await open();
+    const ok = output();
     ok.click();
     ok.click();
     await settle();

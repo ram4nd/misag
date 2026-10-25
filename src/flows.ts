@@ -19,7 +19,7 @@ export interface Run {
   steps: number;
 }
 
-const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
+export const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
 
 /** Mirrors `db::FlowSummary` in src-tauri/src/db.rs. */
 export interface Flow {
@@ -42,21 +42,18 @@ export interface FlowsOptions {
   onChange(flows: Flow[]): void;
   /** Starts the flow (the ▶ button). */
   onRun(flow: Flow): void;
-  /** The person picked `output` for a waiting run. */
-  onContinue(run: Run, output: string): Promise<void>;
-  /** Stops the run (its Stop button). */
+  /** Stops the run (the ■ button that takes ▶'s place). */
   onStop(run: Run): void;
-  /** Shows the run's tab. */
-  onShowRun(run: Run): void;
-  /** The label of the tab with this id; null when no such tab is open. */
-  tabName(tabId: string): string | null;
 }
 
 export interface Flows {
   /** Reads the flows again and shows them in the toolbox and on the page. */
   reload(): Promise<void>;
-  /** Shows the active runs under their flows in the toolbox. */
-  showRuns(runs: Run[]): void;
+  /**
+   * Marks the flows of the active tab's runs, waiting or not, and of runs whose tab
+   * is gone (which can only be stopped); ▶ is off on the rest while the tab runs one.
+   */
+  showRuns(here: Run[], orphans: Run[]): void;
   /** Shows (or clears, with null) an error in the toolbox. */
   showBoxError(message: string | null): void;
 }
@@ -72,7 +69,8 @@ export function createFlows(opts: FlowsOptions): Flows {
   const newForm = opts.page.querySelector<HTMLFormElement>("form.new-flow")!;
   const newName = newForm.elements.namedItem("name") as HTMLInputElement;
   let flows: Flow[] = [];
-  let runs: Run[] = [];
+  let here: Run[] = [];
+  let orphans: Run[] = [];
   /** Changes run one after another, each on the flows the previous one left. */
   let queue = Promise.resolve();
 
@@ -188,65 +186,32 @@ export function createFlows(opts: FlowsOptions): Flows {
     boxEmpty.hidden = flows.some((f) => !f.archived) || !boxError.hidden;
   }
 
-  /**
-   * A run under its flow in the toolbox: where it is and, when its tab is open, its
-   * step's outputs to go on by (for a running step too, in case no reply comes).
-   */
-  function runRow(run: Run): HTMLLIElement {
-    const li = document.createElement("li");
-    li.className = `run ${run.status}`;
-    const tab = opts.tabName(run.tabId);
-    const summary = document.createElement("div");
-    summary.className = "summary";
-    summary.textContent = `${tab ?? "closed tab"} · ${run.step} · ${STATUS_LABELS[run.status]}`;
-    summary.title = `${run.flowName}: ${run.steps} step${run.steps === 1 ? "" : "s"} since you last stepped in`;
-    if (tab !== null) summary.onclick = () => opts.onShowRun(run);
-    li.append(summary);
-    if (run.note) li.append(Object.assign(document.createElement("p"), { className: "note", textContent: run.note }));
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    if (tab !== null && run.outputs.length > 0) {
-      const buttons = run.outputs.map((output) => {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "output";
-        b.textContent = output;
-        b.title = run.status === "running" ? `Claude is still on this step; go on as "${output}" anyway` : `Go on as "${output}"`;
-        b.onclick = async () => {
-          // Once: a second click would send the next step too.
-          for (const other of buttons) other.disabled = true;
-          await opts.onContinue(run, output);
-          for (const other of buttons) other.disabled = false;
-        };
-        return b;
-      });
-      actions.append(...buttons);
-    }
-    actions.append(button("stop-run", "square", "Stop this run", () => opts.onStop(run)));
-    li.append(actions);
-    return li;
-  }
-
   function render() {
     const active = flows.filter((f) => !f.archived);
     const archived = flows.filter((f) => f.archived);
     boxList.replaceChildren(
       ...active.map((flow) => {
         const li = document.createElement("li");
-        li.title = `Edit ${flow.name}`;
+        const mine = here.find((r) => r.flowId === flow.id);
+        const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
+        const run = mine ?? orphan;
+        li.title = mine
+          ? `${flow.name}: ${STATUS_LABELS[mine.status].toLowerCase()} at ${mine.step}`
+          : orphan
+            ? `${flow.name}: running in a closed tab; ■ stops it`
+            : `Edit ${flow.name}`;
         li.onclick = () => opts.onOpen(flow);
-        const run = button("run", "play", "Run in the active Claude tab", () => opts.onRun(flow));
-        run.addEventListener("click", (e) => e.stopPropagation());
-        li.append(icon("workflow", 14), nameSpan(flow), run);
-        const mine = runs.filter((r) => r.flowId === flow.id);
-        if (mine.length > 0) {
-          const list = document.createElement("ul");
-          list.className = "runs";
-          // Clicks in a run are about the run, not about opening the flow.
-          list.onclick = (e) => e.stopPropagation();
-          list.append(...mine.map(runRow));
-          li.append(list);
+        const action = run
+          ? button("stop-run", "square", "Stop this run", () => opts.onStop(run))
+          : button("run", "play", "Run in the active Claude tab", () => opts.onRun(flow));
+        action.addEventListener("click", (e) => e.stopPropagation());
+        if (!run && here.length > 0) {
+          // The backend would refuse it.
+          action.disabled = true;
+          action.title = `This tab runs ${here[0].flowName}; a tab runs one flow at a time`;
         }
+        if (run) li.classList.add("running", orphan ? "orphan" : run.status);
+        li.append(icon("workflow", 14), nameSpan(flow), action);
         return li;
       }),
     );
@@ -266,9 +231,9 @@ export function createFlows(opts: FlowsOptions): Flows {
   return {
     reload,
     showBoxError,
-    showRuns(next: Run[]) {
-      if (JSON.stringify(next) === JSON.stringify(runs)) return;
-      runs = next;
+    showRuns(nextHere: Run[], nextOrphans: Run[]) {
+      if (JSON.stringify([nextHere, nextOrphans]) === JSON.stringify([here, orphans])) return;
+      [here, orphans] = [nextHere, nextOrphans];
       render();
     },
   };

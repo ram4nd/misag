@@ -325,20 +325,30 @@ svg.lucide { display: block; flex: none; }
 .flow-editor .drawflow .connection .main-path { stroke: var(--muted); stroke-width: 3px; }
 .flow-editor .drawflow .connection .main-path:hover, .flow-editor .drawflow .connection .main-path.selected { stroke: var(--accent); }
 
-/* ---------- flow runs (see src/flows.ts) ---------- */
-#flows-box .flows > li { flex-wrap: wrap; }
+/* ---------- flow runs (see src/flows.ts and src/flowEditor.ts) ---------- */
 #flows-box .flows > li .name { flex: 1; }
-#flows-box .flows > li > button.run { padding: 2px; background: none; visibility: hidden; }
+#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run { padding: 2px; background: none; }
+#flows-box .flows > li > button.run { visibility: hidden; }
 #flows-box .flows > li:hover > button.run, #flows-box .flows > li > button.run:focus-visible { visibility: visible; }
-#flows-box .runs { list-style: none; margin: 2px 0 4px 20px; padding: 0; width: 100%; cursor: default; }
-#flows-box .runs li { display: flex; flex-direction: column; gap: 4px; padding: 4px 6px; border-left: 2px solid var(--line); }
-#flows-box .runs li.manual, #flows-box .runs li.attention { border-left-color: #e8710a; }
-#flows-box .runs .summary { cursor: pointer; color: var(--muted); }
-#flows-box .runs .summary:hover { color: var(--fg); }
-#flows-box .runs .note { margin: 0; color: var(--fg); }
-#flows-box .runs .actions { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-#flows-box .runs .actions button { padding: 2px 8px; }
-#flows-box .runs .actions .stop-run { padding: 2px; background: none; margin-left: auto; }
+/* A flow running in the active tab. */
+#flows-box .flows > li.running { font-weight: 600; }
+#flows-box .flows > li.running > svg:first-child { color: var(--accent); }
+#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child { color: #e8710a; }
+/* A run whose tab is gone: it can only be stopped. */
+#flows-box .flows > li.orphan { font-weight: normal; font-style: italic; }
+#flows-box .flows > li.orphan > svg:first-child { color: var(--muted); }
+#flows-box .flows > li > button.run:disabled { opacity: 0.4; cursor: default; }
+/* Where the active tab's run of this flow is. */
+.flow-editor .run-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--press); border-left: 3px solid var(--accent); }
+.flow-editor .run-bar.manual, .flow-editor .run-bar.attention { border-left-color: #e8710a; }
+.flow-editor .run-bar[hidden], .flow-editor .run-bar .note[hidden] { display: none; }
+.flow-editor .run-bar .actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.flow-editor .run-bar .actions button { padding: 2px 8px; }
+.flow-editor .run-bar .note { flex-basis: 100%; margin: 0; color: var(--muted); }
+.flow-editor .run-bar .run-error { flex-basis: 100%; margin: 0; color: #b3261e; }
+.flow-editor .run-bar .run-error[hidden] { display: none; }
+.flow-editor .drawflow .drawflow-node.current { box-shadow: 0 0 0 3px var(--accent); }
+.flow-editor .run-bar.manual ~ .workspace .drawflow-node.current, .flow-editor .run-bar.attention ~ .workspace .drawflow-node.current { box-shadow: 0 0 0 3px #e8710a; }
 /* A tab whose flow run waits for the person. */
 .tab.needs-you .name::after { content: ""; display: inline-block; width: 7px; height: 7px; margin-left: 6px; border-radius: 50%; background: #e8710a; vertical-align: middle; }
 
