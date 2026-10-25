@@ -17,7 +17,7 @@ export interface Page {
   sessions: Past[];
   /** There are older ones. */
   more: boolean;
-  /** Transcripts left out because they could not be read. */
+  /** Transcripts and folders left out because they could not be read. */
   unreadable: number;
 }
 
@@ -104,8 +104,12 @@ export function createHistory(opts: HistoryOptions): History {
     pin.onclick = async () => {
       // One request at a time; after a failure the row stays as it was.
       pin.disabled = true;
-      const done = await opts.pin(past.id, !past.pinned);
-      pin.disabled = false;
+      let done = false;
+      try {
+        done = await opts.pin(past.id, !past.pinned);
+      } finally {
+        pin.disabled = false;
+      }
       if (done) await reload();
     };
     li.classList.toggle("pinned", past.pinned);
@@ -121,7 +125,7 @@ export function createHistory(opts: HistoryOptions): History {
     list.replaceChildren(...sessions.map(row));
     loadMore.hidden = !more;
     unreadable.hidden = !shown.unreadable;
-    unreadable.textContent = `${shown.unreadable} session${shown.unreadable === 1 ? "" : "s"} could not be read; the Mischief of Agents log says why.`;
+    unreadable.textContent = `${shown.unreadable} session${shown.unreadable === 1 ? "" : "s"} could not be read; started from a terminal, Mischief of Agents prints why.`;
     error.hidden = !message;
     error.textContent = message ?? "";
     hint.hidden = sessions.length > 0 || !error.hidden;
@@ -136,22 +140,30 @@ export function createHistory(opts: HistoryOptions): History {
     const read = ++reads;
     try {
       const next = await opts.list(limit);
+      if (read !== reads) return true;
       logged = null;
-      if (read === reads) render((page = next), (failure = null));
+      render((page = next), (failure = null));
       return true;
     } catch (err) {
       const message = `Sessions could not be read: ${opts.errorText(err)}. The reload button tries again.`;
+      if (read !== reads) return false;
       if (message !== logged) console.error("misag: could not read the Claude sessions", err);
       logged = message;
-      if (read === reads) render(page, (failure = message));
+      render(page, (failure = message));
       return false;
     }
   }
 
   loadMore.onclick = async () => {
+    // One page at a time, so a failed read takes back only its own.
+    loadMore.disabled = true;
     limit += PAGE_SIZE;
-    // A failed read asks for the same page next time.
-    if (!(await reload())) limit = Math.max(PAGE_SIZE, limit - PAGE_SIZE);
+    try {
+      // A failed read asks for the same page next time.
+      if (!(await reload())) limit = Math.max(PAGE_SIZE, limit - PAGE_SIZE);
+    } finally {
+      loadMore.disabled = false;
+    }
   };
   render(NONE, null);
   void reload();

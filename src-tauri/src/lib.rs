@@ -270,6 +270,17 @@ mod tests {
     }
 
     #[test]
+    fn the_raterm_data_dir_follows_the_configured_identifiers() {
+        for (file, raterm) in [("tauri.conf.json", "com.tag1.raterm"), ("tauri.dev.conf.json", "com.tag1.raterm.dev")] {
+            let config = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+            let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+            let identifier = config["identifier"].as_str().unwrap();
+            let dir = std::path::Path::new("/d").join(identifier);
+            assert_eq!(raterm_data_dir(&dir), Some(PathBuf::from("/d").join(raterm)), "{file}");
+        }
+    }
+
+    #[test]
     fn a_store_without_a_directory_still_works() {
         let store = open_store(Err("no data dir".into()), None);
         assert!(matches!(store.status(), db::StoreStatus::NotSaving { .. }));

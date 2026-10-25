@@ -33,6 +33,8 @@ pub const DB_ENV: &str = "MISAG_DB";
 /// Set on terminal tabs: the wrapper directory misag put first on their PATH, so
 /// a misag started from such a tab can take it off again.
 pub const WRAPPER_ENV: &str = "MISAG_WRAPPER";
+/// The same, set by raterm (misag's old name) in its tabs.
+pub const RATERM_WRAPPER_ENV: &str = "RATERM_WRAPPER";
 /// Claude Code sets this for the commands and hooks it runs (seen in 2.1): its
 /// own process, recorded with the session.
 pub const PID_ENV: &str = "CLAUDE_PID";

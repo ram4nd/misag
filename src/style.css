@@ -99,7 +99,7 @@ body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
 .toolbox:not(.collapsed) { flex: 1 1 0; }
 .toolbox + .toolbox { border-top: 1px solid var(--line); }
 .toolbox header { cursor: grab; }
-/* The dragged toolbox is lifted above the others, which slide past under it (see setupToolboxOrder). */
+/* The dragged toolbox is lifted above the others, which slide past under it (see setupToolboxes in src/toolbox.ts). */
 #sidebar { position: relative; }
 .toolbox { background: var(--panel); transition: box-shadow .15s; }
 .toolbox.dragging { position: relative; z-index: 2; box-shadow: 0 6px 20px rgb(0 0 0 / .18), 0 0 0 1px var(--line); border-radius: 4px; }

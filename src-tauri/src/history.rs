@@ -272,13 +272,17 @@ impl Cache {
     pub fn list(&self, projects: &Path, limit: usize, pinned: &[SessionId]) -> Result<Page, String> {
         let started = std::time::Instant::now();
         let found_projects = project_dirs(projects)?;
-        let complete = found_projects.is_some();
+        let mut complete = found_projects.is_some();
         let (dirs, mut unreadable) = found_projects.unwrap_or_default();
         let mut files = Vec::new();
         for dir in &dirs {
             let entries = match std::fs::read_dir(dir) {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                // Gone since it was listed, or renamed: its transcripts may be elsewhere now.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    complete = false;
+                    continue;
+                }
                 // One unreadable folder should not hide the others.
                 Err(e) => {
                     eprintln!("misag: cannot read {}: {e}", dir.display());

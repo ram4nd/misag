@@ -1455,10 +1455,10 @@ function showHistory() {
 /** The Claude session each tab's hook last reported, by tab id, as last read. */
 let reportedSessions: Record<string, string> = {};
 
-/** Reads which session each tab is in; if that fails, the last answer is kept. */
 /** The failure last logged by `readTabSessions`, so one that lasts is logged once. */
 let tabSessionsFailure: string | null = null;
 
+/** Reads which session each tab is in; if that fails, the last answer is kept. */
 async function readTabSessions() {
   try {
     reportedSessions = await invoke<Record<string, string>>("claude_tab_sessions");

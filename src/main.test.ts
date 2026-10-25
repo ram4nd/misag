@@ -3466,6 +3466,24 @@ describe("session history", () => {
     expect(box().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
   });
 
+  test("Load more waits for its page before it can be clicked again", async () => {
+    pastSessions = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    const more = () => box().querySelector<HTMLButtonElement>("button.load-more")!;
+    let open!: () => void;
+    historyGates.push(new Promise((resolve) => (open = resolve)));
+    more().click();
+    expect(more().disabled).toBe(true);
+    more().click();
+    open();
+    await settle();
+    expect(callsOf("claude_history").at(-1)!.args).toEqual({ limit: 20 });
+    expect(rows()).toHaveLength(20);
+    expect(more().disabled).toBe(false);
+  });
+
   test("a read that keeps failing is logged once, not on every poll", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await boot();

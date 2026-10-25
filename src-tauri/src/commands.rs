@@ -253,14 +253,17 @@ pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
 }
 
 /// The PATH for a tab: misag's own `path` without `inherited` (the wrapper
-/// directory of a misag this one was started from, whose hook would report to
-/// that misag's database) and with `wrapper` first. None when that is `path`
+/// directories of a misag, or a raterm, this one was started from, whose hook
+/// would report to that app's database) and with `wrapper` first. None when that is `path`
 /// unchanged, or when `path` is not UTF-8, which is then left alone rather than
 /// mangled (the wrapper is not used).
-pub fn tab_path(path: Option<&OsStr>, inherited: Option<&OsStr>, wrapper: Option<&Path>) -> Option<String> {
+pub fn tab_path(path: Option<&OsStr>, inherited: &[&OsStr], wrapper: Option<&Path>) -> Option<String> {
     let path = path.unwrap_or_default().to_str()?;
     let wrapper = wrapper.and_then(Path::to_str);
-    let skip = |dir: &str| [inherited.map(Path::new), wrapper.map(Path::new)].contains(&Some(Path::new(dir)));
+    let skip = |dir: &str| {
+        let dir = Path::new(dir);
+        inherited.iter().any(|d| Path::new(d) == dir) || wrapper.is_some_and(|w| Path::new(w) == dir)
+    };
     let kept = path.split(':').filter(|dir| !path.is_empty() && !skip(dir));
     let joined: Vec<&str> = wrapper.into_iter().chain(kept).collect();
     let joined = joined.join(":");
@@ -293,8 +296,9 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, wrapper: Option<&Path>
     let skips_permissions = matches!(&plan, LaunchPlan::Claude { settings, .. } if settings.skip_permissions);
     let wrapper = wrapper.filter(|_| matches!(plan, LaunchPlan::Terminal { hook: Some(_), .. }));
     let (launch, mut env) = launch_for(&plan);
-    let inherited = std::env::var_os(claude::WRAPPER_ENV);
-    if let Some(path) = tab_path(std::env::var_os("PATH").as_deref(), inherited.as_deref(), wrapper) {
+    let inherited: Vec<_> = [claude::WRAPPER_ENV, claude::RATERM_WRAPPER_ENV].into_iter().filter_map(std::env::var_os).collect();
+    let inherited: Vec<&OsStr> = inherited.iter().map(|d| d.as_os_str()).collect();
+    if let Some(path) = tab_path(std::env::var_os("PATH").as_deref(), &inherited, wrapper) {
         // Only claimed once it is really on PATH, so a misag started here knows what to drop.
         if let Some(dir) = wrapper.and_then(Path::to_str).filter(|dir| path.starts_with(dir)) {
             env.push((claude::WRAPPER_ENV.to_string(), dir.to_owned()));
@@ -708,21 +712,27 @@ mod tests {
         let os = |s: &str| std::ffi::OsString::from(s);
         let w = Some(Path::new("/d/bin"));
         let path = |p: &str, inherited: Option<&str>, wrapper| {
-            tab_path(Some(os(p).as_os_str()), inherited.map(os).as_deref(), wrapper)
+            let inherited: Vec<_> = inherited.map(os).into_iter().collect();
+            let inherited: Vec<&std::ffi::OsStr> = inherited.iter().map(|d| d.as_os_str()).collect();
+            tab_path(Some(os(p).as_os_str()), &inherited, wrapper)
         };
         assert_eq!(path("/usr/bin:/bin", None, w).as_deref(), Some("/d/bin:/usr/bin:/bin"));
         assert_eq!(path("/usr/bin", None, None), None, "unchanged");
         // Started from another misag's tab: its wrapper goes, wherever it is and however it is spelt.
         assert_eq!(path("/o/bin/:/usr/bin", Some("/o/bin"), w).as_deref(), Some("/d/bin:/usr/bin"));
         assert_eq!(path("/o/bin:/usr/bin", Some("/o/bin"), None).as_deref(), Some("/usr/bin"));
+        // Started from a raterm tab inside a misag tab: both wrappers go.
+        let both = [os("/o/bin"), os("/r/bin")];
+        let both: Vec<&std::ffi::OsStr> = both.iter().map(|d| d.as_os_str()).collect();
+        assert_eq!(tab_path(Some(os("/r/bin:/o/bin:/usr/bin").as_os_str()), &both, w).as_deref(), Some("/d/bin:/usr/bin"));
         // Not listed twice, and empty entries (the current directory) are kept.
         assert_eq!(path("/d/bin:/usr/bin::", None, w), None, "already first");
         assert_eq!(path("/usr/bin:/d/bin", None, w).as_deref(), Some("/d/bin:/usr/bin"));
         assert_eq!(path("", None, w).as_deref(), Some("/d/bin"));
-        assert_eq!(tab_path(None, None, w).as_deref(), Some("/d/bin"));
+        assert_eq!(tab_path(None, &[], w).as_deref(), Some("/d/bin"));
         // A PATH that is not UTF-8 is left alone rather than mangled.
         use std::os::unix::ffi::OsStrExt;
-        assert_eq!(tab_path(Some(std::ffi::OsStr::from_bytes(b"/\xff:/bin")), None, w), None);
+        assert_eq!(tab_path(Some(std::ffi::OsStr::from_bytes(b"/\xff:/bin")), &[], w), None);
     }
 
     #[test]

@@ -803,39 +803,64 @@ impl Db {
     }
 }
 
-/// Copies the database at `old`, with its WAL files, to `path` if there is no
-/// database there yet, and returns the notice that says so. A failed copy is
-/// logged and leaves nothing at `path`, so the app starts fresh.
+/// Copies the database at `old` to `path` if there is no database there yet, and
+/// returns the notice that says whether it worked. The copy is a snapshot taken
+/// through SQLite, so it is consistent even while raterm still runs and writes.
+/// A failed copy leaves nothing at `path`, so the app starts fresh and says why.
 fn import(path: &Path, old: &Path) -> Option<String> {
-    if !matches!(path.try_exists(), Ok(false)) || !matches!(old.try_exists(), Ok(true)) {
-        return None;
+    match (path.try_exists(), old.try_exists()) {
+        (Ok(false), Ok(true)) => {}
+        (Ok(_), Ok(_)) => return None,
+        (Err(e), _) => {
+            eprintln!("misag: could not check whether {} exists: {e}", path.display());
+            return None;
+        }
+        (_, Err(e)) => {
+            eprintln!("misag: could not check whether {} exists: {e}", old.display());
+            return None;
+        }
     }
-    // Copied under another name first, so a copy cut short is never opened.
+    // Written under another name first, so a copy cut short is never opened.
     let copying = PathBuf::from(format!("{}.importing", path.display()));
-    let copied = (|| {
+    let copied = (|| -> Result<(), String> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        for (src, dst) in database_files(old).iter().zip(&database_files(&copying)) {
-            match std::fs::copy(src, dst) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
-            }
-        }
-        move_files(&database_files(&copying), &database_files(path))
+        // Left by a copy cut short on an earlier start.
+        remove_files(&database_files(&copying));
+        let from = Connection::open_with_flags(old, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e| e.to_string())?;
+        let into = copying.to_str().ok_or("the path is not UTF-8")?;
+        from.execute("VACUUM INTO ?1", [into]).map_err(|e| e.to_string())?;
+        drop(from);
+        move_files(&database_files(&copying), &database_files(path)).map_err(|e| e.to_string())
     })();
     if let Err(e) = copied {
         eprintln!("misag: could not copy raterm's database from {}: {e}; starting fresh", old.display());
-        for file in database_files(&copying) {
-            let _ = std::fs::remove_file(file);
-        }
-        return None;
+        remove_files(&database_files(&copying));
+        return Some(format!(
+            "Saved tabs, settings and flows could not be copied from raterm, the app's old name ({e}). \
+             raterm's database is still at {}. To try again, quit Mischief of Agents, delete {} and start it again.",
+            old.display(),
+            path.display()
+        ));
     }
     eprintln!("misag: copied raterm's database from {} to {}", old.display(), path.display());
     Some(format!(
         "Saved tabs, settings and flows were copied from raterm, the app's old name. raterm's own database was left at {}.",
         old.display()
     ))
+}
+
+/// Removes those of `files` that exist, logging what could not be removed.
+fn remove_files(files: &[PathBuf]) {
+    for file in files {
+        match std::fs::remove_file(file) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                eprintln!("misag: could not remove {}: {e}", file.display());
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Renames each existing `from` file to the matching `to`, putting back whatever
@@ -998,6 +1023,20 @@ pub(crate) mod tests {
         let db = Db::open_or_import(Ok(path), Some(old));
         assert_eq!(db.load_layout().unwrap().tabs.len(), 0);
         assert_eq!(db.status(), StoreStatus::Saving);
+    }
+
+    #[test]
+    fn a_raterm_database_that_cannot_be_copied_says_so() {
+        let old = crate::test_support::temp_dir("import-bad-old").join(RATERM_FILE);
+        fs::write(&old, b"not a database, but long enough to be read as a page header").unwrap();
+        let path = crate::test_support::temp_dir("import-bad-new").join(FILE);
+        let db = Db::open_or_import(Ok(path.clone()), Some(old.clone()));
+        assert_eq!(db.load_layout().unwrap().tabs.len(), 0);
+        assert_eq!(db.hook_path(), Some(path.as_path()));
+        let StoreStatus::Recovered { notice } = db.status() else { panic!("expected a notice") };
+        assert!(notice.contains("could not be copied"), "{notice}");
+        assert!(notice.contains(&old.display().to_string()), "{notice}");
+        assert!(files_named(path.parent().unwrap(), &format!("{FILE}.importing")).is_empty());
     }
 
     #[test]
