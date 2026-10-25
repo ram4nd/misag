@@ -214,7 +214,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
         showError(null);
         saved = true;
       } catch (err) {
-        console.error("raterm: could not save the flow", err);
+        console.error("misag: could not save the flow", err);
         showError(`Not saved: ${opts.errorText(err)}. Your latest changes are not stored; the next change tries again.`);
         $<HTMLElement>(".problems").textContent = "Not checked: the latest changes are not saved.";
         saved = false;
@@ -328,7 +328,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       showError(null);
       return true;
     } catch (err) {
-      console.error("raterm: could not load the flow", err);
+      console.error("misag: could not load the flow", err);
       showError(`The flow could not be loaded (${opts.errorText(err)}). Close and reopen this tab to try again.`);
       return false;
     }

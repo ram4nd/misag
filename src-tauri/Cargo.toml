@@ -1,12 +1,13 @@
 [package]
-name = "raterm"
+name = "misag"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-only"
 
 [lib]
 # The `_lib` suffix keeps the lib name distinct from the bin name, which
 # otherwise collides on Windows: https://github.com/rust-lang/cargo/issues/8519
-name = "raterm_lib"
+name = "misag_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

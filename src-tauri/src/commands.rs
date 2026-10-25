@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use tauri::ipc::{Channel, Response};
 use tauri::State;
 
-/// raterm's own binary, resolved once at startup (see `session::live_path`); also
+/// misag's own binary, resolved once at startup (see `session::live_path`); also
 /// given to `Sessions` as its trampoline. Its path is written into shell command
 /// lines, so holding an `Ok` one proves it is valid UTF-8.
 pub struct AppExe(Result<PathBuf, String>);
@@ -25,7 +25,7 @@ impl AppExe {
     pub fn new(exe: Result<PathBuf, String>) -> Self {
         Self(exe.and_then(|exe| match exe.to_str() {
             Some(_) => Ok(exe),
-            None => Err(format!("raterm's path {exe:?} is not valid UTF-8")),
+            None => Err(format!("misag's path {exe:?} is not valid UTF-8")),
         }))
     }
 
@@ -211,7 +211,7 @@ pub fn launch_plan<'a>(tab: &'a TabLaunch, exe: &'a AppExe, db: &'a Db) -> Resul
     // An unreadable setting never blocks a tab; it starts with the cautious settings,
     // and the startup notice and the Settings tab show the error.
     let settings = db.load_settings().unwrap_or_else(|e| {
-        eprintln!("raterm: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
+        eprintln!("misag: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
         Settings::cautious()
     });
     Ok(LaunchPlan::Claude { tab_id: &tab.tab_id, session, hook, resume, settings })
@@ -225,14 +225,14 @@ fn hook_env(tab_id: &TabId, db: &Path) -> Env {
         (claude::DB_ENV.to_string(), db.to_string_lossy().into_owned()),
         // A flow run sends one prompt after another from the Stop hook; Claude Code
         // otherwise stops honouring the hook after 8 in a row. runs::MAX_RUN_STEPS
-        // is raterm's own limit.
+        // is misag's own limit.
         (claude::STOP_CAP_ENV.to_string(), claude::STOP_CAP.to_string()),
     ]
 }
 
 /// Terminal tabs run their command (a blank one is a login shell). Claude tabs run
 /// Claude Code pinned to their session, preceded by the arguments the settings add.
-/// With a database, both get the hook environment that lets `raterm --claude-hook`
+/// With a database, both get the hook environment that lets `misag --claude-hook`
 /// record session changes for the tab (`plan_spawn` adds the wrapper's PATH).
 pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
     match plan {
@@ -252,9 +252,9 @@ pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
     }
 }
 
-/// The PATH for a tab: raterm's own `path` without `inherited` (the wrapper
-/// directory of a raterm this one was started from, whose hook would report to
-/// that raterm's database) and with `wrapper` first. None when that is `path`
+/// The PATH for a tab: misag's own `path` without `inherited` (the wrapper
+/// directory of a misag this one was started from, whose hook would report to
+/// that misag's database) and with `wrapper` first. None when that is `path`
 /// unchanged, or when `path` is not UTF-8, which is then left alone rather than
 /// mangled (the wrapper is not used).
 pub fn tab_path(path: Option<&OsStr>, inherited: Option<&OsStr>, wrapper: Option<&Path>) -> Option<String> {
@@ -295,7 +295,7 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, wrapper: Option<&Path>
     let (launch, mut env) = launch_for(&plan);
     let inherited = std::env::var_os(claude::WRAPPER_ENV);
     if let Some(path) = tab_path(std::env::var_os("PATH").as_deref(), inherited.as_deref(), wrapper) {
-        // Only claimed once it is really on PATH, so a raterm started here knows what to drop.
+        // Only claimed once it is really on PATH, so a misag started here knows what to drop.
         if let Some(dir) = wrapper.and_then(Path::to_str).filter(|dir| path.starts_with(dir)) {
             env.push((claude::WRAPPER_ENV.to_string(), dir.to_owned()));
         }
@@ -344,7 +344,7 @@ pub fn pty_spawn(
         move |bytes| on_data.send(Response::new(bytes.to_vec())).is_ok(),
         move |code| {
             if on_exit.send(code).is_err() {
-                eprintln!("raterm: exit notification not delivered");
+                eprintln!("misag: exit notification not delivered");
             }
         },
     )?;
@@ -434,7 +434,7 @@ pub fn claude_states(
             },
             Ok(None) => ClaudeState::Closed,
             Err(e) => {
-                eprintln!("raterm: could not look up the Claude session in tab {}: {e}", t.tab_id);
+                eprintln!("misag: could not look up the Claude session in tab {}: {e}", t.tab_id);
                 ClaudeState::Unknown
             }
         }
@@ -558,13 +558,31 @@ pub fn fs_list(dir: String) -> Result<crate::files::Listing, CommandError> {
     Ok(crate::files::list(&dir)?)
 }
 
-/// The newest `limit` conversations Claude saved in `dir`, for the Session history box.
+/// The pinned conversations Claude saved, then the newest `limit` others, for the
+/// Session history box. Pins whose transcript is gone are dropped.
 #[tauri::command(async)]
-pub fn claude_history(cache: State<'_, crate::history::Cache>, dir: String, limit: usize) -> Result<crate::history::Page, CommandError> {
+pub fn claude_history(
+    cache: State<'_, crate::history::Cache>,
+    db: State<'_, Db>,
+    limit: usize,
+) -> Result<crate::history::Page, CommandError> {
     let Some(projects) = claude::projects_dir() else {
         return Err("Claude's config folder is unknown: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string().into());
     };
-    Ok(cache.list(&projects, &session::expand_tilde(&dir), limit)?)
+    let page = cache.list(&projects, limit, &db.pinned_sessions()?)?;
+    for id in &page.gone_pins {
+        // The listing stands without it; the next one tries again.
+        if let Err(e) = db.set_session_pinned(id, false) {
+            eprintln!("misag: could not unpin {}, whose transcript is gone: {e}", id.as_str());
+        }
+    }
+    Ok(page)
+}
+
+/// Pins a Claude session to the top of the Session history box, or unpins it.
+#[tauri::command(async)]
+pub fn claude_session_pin(db: State<'_, Db>, id: SessionId, pinned: bool) -> Result<(), CommandError> {
+    Ok(db.set_session_pinned(&id, pinned)?)
 }
 
 #[tauri::command(async)]
@@ -619,7 +637,7 @@ mod tests {
 
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
     const LATER: &str = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
-    const EXE: &str = "/bin/raterm";
+    const EXE: &str = "/bin/misag";
 
     #[test]
     fn a_loaded_flow_is_one_flat_object() {
@@ -671,22 +689,22 @@ mod tests {
         let plan = plan_spawn(&request, &exe, &db, Some(&wrapper)).unwrap();
         assert_eq!(plan.request.launch, Launch::LoginShell);
         let env: HashMap<_, _> = plan.request.env.into_iter().collect();
-        assert_eq!(env["RATERM_TAB"], "tab-1");
-        assert_eq!(env["RATERM_DB"], path.to_str().unwrap());
-        assert_eq!(env["RATERM_WRAPPER"], wrapper.to_str().unwrap());
+        assert_eq!(env["MISAG_TAB"], "tab-1");
+        assert_eq!(env["MISAG_DB"], path.to_str().unwrap());
+        assert_eq!(env["MISAG_WRAPPER"], wrapper.to_str().unwrap());
         assert!(env["PATH"].starts_with(&format!("{}:", wrapper.display())), "{}", env["PATH"]);
 
         // Without an installed wrapper the hook environment is still set, but PATH is not changed for it.
         let plan = plan_spawn(&request, &exe, &db, None).unwrap();
         let env: HashMap<_, _> = plan.request.env.into_iter().collect();
-        assert!(env.contains_key("RATERM_TAB") && !env.contains_key("RATERM_WRAPPER"));
+        assert!(env.contains_key("MISAG_TAB") && !env.contains_key("MISAG_WRAPPER"));
         let memory = Db::open_or_recover(Err("no data dir".into()));
         let plan = plan_spawn(&request, &exe, &memory, Some(&wrapper)).unwrap();
-        assert!(!plan.request.env.iter().any(|(k, _)| k.starts_with("RATERM")), "nothing to report to");
+        assert!(!plan.request.env.iter().any(|(k, _)| k.starts_with("MISAG")), "nothing to report to");
     }
 
     #[test]
-    fn tab_paths_put_the_wrapper_first_and_drop_an_outer_raterm_wrapper() {
+    fn tab_paths_put_the_wrapper_first_and_drop_an_outer_misag_wrapper() {
         let os = |s: &str| std::ffi::OsString::from(s);
         let w = Some(Path::new("/d/bin"));
         let path = |p: &str, inherited: Option<&str>, wrapper| {
@@ -694,7 +712,7 @@ mod tests {
         };
         assert_eq!(path("/usr/bin:/bin", None, w).as_deref(), Some("/d/bin:/usr/bin:/bin"));
         assert_eq!(path("/usr/bin", None, None), None, "unchanged");
-        // Started from another raterm's tab: its wrapper goes, wherever it is and however it is spelt.
+        // Started from another misag's tab: its wrapper goes, wherever it is and however it is spelt.
         assert_eq!(path("/o/bin/:/usr/bin", Some("/o/bin"), w).as_deref(), Some("/d/bin:/usr/bin"));
         assert_eq!(path("/o/bin:/usr/bin", Some("/o/bin"), None).as_deref(), Some("/usr/bin"));
         // Not listed twice, and empty entries (the current directory) are kept.
@@ -800,7 +818,7 @@ mod tests {
     #[test]
     fn claude_tabs_run_claude_with_the_hook_environment() {
         let tab_id = tid("tab-1");
-        let hook = Some(HookTarget { exe: Path::new(EXE), db: Path::new("/data/raterm.db") });
+        let hook = Some(HookTarget { exe: Path::new(EXE), db: Path::new("/data/misag.db") });
         let plan = LaunchPlan::Claude { tab_id: &tab_id, session: session(), hook, resume: false, settings: Settings::default() };
         let (launch, env) = launch_for(&plan);
         let Launch::Program { program, args } = launch else { panic!("expected a program") };
@@ -809,8 +827,8 @@ mod tests {
         assert_eq!(
             env,
             [
-                ("RATERM_TAB".into(), "tab-1".into()),
-                ("RATERM_DB".into(), "/data/raterm.db".into()),
+                ("MISAG_TAB".into(), "tab-1".into()),
+                ("MISAG_DB".into(), "/data/misag.db".into()),
                 // A flow sends prompt after prompt from the Stop hook; Claude Code's own
                 // cap on hook continuations (8) would cut it short.
                 ("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP".into(), "51".into()),
@@ -914,14 +932,14 @@ mod tests {
         let db = Db::open(temp_db("plan-errors")).unwrap();
         let err = launch_plan(&claude_tab(), &AppExe::new(Err("gone".into())), &db).err().unwrap();
         assert!(err.message.contains("cannot start Claude: gone"));
-        // A terminal tab does not need raterm's binary.
+        // A terminal tab does not need misag's binary.
         assert!(launch_plan(&terminal_tab(), &AppExe::new(Err("gone".into())), &db).is_ok());
     }
 
     #[test]
     fn the_binary_path_must_be_utf8() {
         use std::os::unix::ffi::OsStrExt;
-        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/opt/\xff/raterm"));
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/opt/\xff/misag"));
         assert!(AppExe::new(Ok(bad)).path().unwrap_err().contains("not valid UTF-8"));
         assert_eq!(exe().path(), Ok(Path::new(EXE)));
     }

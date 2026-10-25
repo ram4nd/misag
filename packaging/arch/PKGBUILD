@@ -1,0 +1,32 @@
+# Maintainer: Ra Mänd
+# Repackages the .deb from `pnpm tauri build --bundles deb`; build.sh copies it here first.
+pkgname=misag-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Mischief of Agents: a Linux terminal for keeping AI agents on the path you set"
+arch=('x86_64')
+url="https://github.com/ram4nd/raterm"
+license=('GPL-3.0-only')
+depends=('webkit2gtk-4.1' 'gtk3')
+optdepends=('claude-code: Claude tabs and flows')
+provides=('misag')
+conflicts=('misag')
+options=('!strip' '!debug')
+source=("misag_${pkgver}_amd64.deb")
+sha256sums=('SKIP')
+
+package() {
+  bsdtar -xf data.tar.gz -C "$pkgdir"
+
+  # Tauri names the desktop file after the product and puts the 256px icon in a "256x256@2" folder.
+  cd "$pkgdir/usr/share"
+  mv "applications/Mischief of Agents.desktop" applications/misag.desktop
+  mkdir -p icons/hicolor/256x256/apps
+  mv icons/hicolor/256x256@2/apps/misag.png icons/hicolor/256x256/apps/misag.png
+  rm -r icons/hicolor/256x256@2
+
+  # The .deb carries the license where Debian keeps it; Arch keeps it under licenses/.
+  mkdir -p "licenses/$pkgname"
+  mv doc/mischief-of-agents/copyright "licenses/$pkgname/LICENSE"
+  rm -r doc
+}

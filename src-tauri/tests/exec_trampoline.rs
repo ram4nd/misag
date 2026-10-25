@@ -1,10 +1,10 @@
 //! Claude tabs under a non-POSIX login shell (fish, csh, ...) go through
-//! `raterm --exec`. A shell named `fish` that is really `sh` stands in for one
+//! `misag --exec`. A shell named `fish` that is really `sh` stands in for one
 //! here, since it is enough to route the launch through the trampoline.
 
 mod common;
 
-use raterm_lib::session::{Launch, Sessions, SpawnRequest};
+use misag_lib::session::{Launch, Sessions, SpawnRequest};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ fn programs_run_through_the_trampoline_with_arguments_intact() {
     std::os::unix::fs::symlink("/bin/sh", &fake_fish).unwrap();
 
     let sessions = Sessions::new(fake_fish.to_str().unwrap(), Duration::from_millis(300))
-        .with_trampoline(env!("CARGO_BIN_EXE_raterm").into());
+        .with_trampoline(env!("CARGO_BIN_EXE_misag").into());
     let output = Arc::new(Mutex::new(Vec::new()));
     let sink = output.clone();
     let (tx, exited) = mpsc::channel();
@@ -37,11 +37,11 @@ fn programs_run_through_the_trampoline_with_arguments_intact() {
 }
 
 fn exec(program_list: Option<&str>) -> std::process::Output {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_raterm"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_misag"));
     cmd.arg("--exec").stderr(std::process::Stdio::null());
     match program_list {
-        Some(list) => cmd.env("RATERM_EXEC", list),
-        None => cmd.env_remove("RATERM_EXEC"),
+        Some(list) => cmd.env("MISAG_EXEC", list),
+        None => cmd.env_remove("MISAG_EXEC"),
     };
     cmd.output().unwrap()
 }
@@ -57,7 +57,7 @@ fn exec_mode_reports_bad_program_lists_and_missing_programs() {
 
 #[test]
 fn exec_mode_does_not_pass_its_variable_on() {
-    let out = exec(Some(r#"["sh","-c","echo ${RATERM_EXEC-unset}"]"#));
+    let out = exec(Some(r#"["sh","-c","echo ${MISAG_EXEC-unset}"]"#));
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "unset");
 }

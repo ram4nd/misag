@@ -61,7 +61,7 @@ export function createTree(el: HTMLUListElement, opts: TreeOptions): Tree {
     try {
       listing = await opts.list(dir);
     } catch (err) {
-      console.error("raterm: could not list", dir, err);
+      console.error("misag: could not list", dir, err);
       ul.replaceChildren(note(opts.errorText(err), depth, true));
       return undefined;
     }

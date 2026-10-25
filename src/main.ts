@@ -167,7 +167,7 @@ const UNTRACKED_GRACE_MS = 10_000;
 /** How often the tabs' directories and terminal tabs' Claude are checked (see `pollTabs`). */
 const TAB_POLL_MS = 2_000;
 
-/** How often the Session history box, while it can be seen, reads the active folder's sessions again, as Claude adds to them. */
+/** How often the Session history box, while it can be seen, reads the saved Claude sessions again, as Claude adds to them. */
 const HISTORY_POLL_MS = 10_000;
 
 /** Tab changes are saved this long after the last one, so a burst is one save. */
@@ -192,7 +192,7 @@ const THEME = {
 
 function $<T extends HTMLElement>(sel: string): T {
   const el = document.querySelector<T>(sel);
-  if (!el) throw new Error(`raterm: missing element ${sel}`);
+  if (!el) throw new Error(`misag: missing element ${sel}`);
   return el;
 }
 const tabsEl = $<HTMLDivElement>("#tabs");
@@ -241,7 +241,7 @@ function pageOf(id: PageId): Page {
   if (!isEditorPage(id)) return pages[id];
   const editor = editorPages.get(id);
   // Editor pages leave the map only after their tab has closed.
-  if (!editor) throw new Error(`raterm: no editor page ${id}`);
+  if (!editor) throw new Error(`misag: no editor page ${id}`);
   return editor.page;
 }
 const settingsForm = pages.settings.form;
@@ -277,7 +277,7 @@ function createView(): { el: HTMLDivElement; term: Terminal; fit: FitAddon } {
     term.loadAddon(fit);
     term.loadAddon(
       new WebLinksAddon((_e, uri) => {
-        openUrl(uri).catch((err) => console.error("raterm: could not open link", uri, err));
+        openUrl(uri).catch((err) => console.error("misag: could not open link", uri, err));
       }),
     );
     term.open(el);
@@ -324,7 +324,7 @@ async function spawn(opts: SpawnOptions) {
   term.onResize(({ cols, rows }) => {
     if (s.id === null || s.exited) return;
     invoke("pty_resize", { id: s.id, cols, rows }).catch((err) =>
-      console.error("raterm: resize failed", err),
+      console.error("misag: resize failed", err),
     );
   });
   term.onTitleChange((title) => {
@@ -407,7 +407,7 @@ function restart(s: Session) {
   s.id = null;
   s.term.reset();
   renderSessions();
-  start(s, true).catch((err) => console.error("raterm: could not restart tab", err));
+  start(s, true).catch((err) => console.error("misag: could not restart tab", err));
 }
 
 /**
@@ -427,7 +427,7 @@ function watchHookReport(s: Session, since: number, startNo: number) {
       reported = await invoke<boolean>("claude_reported", { tabId: s.tabId, since });
     } catch (err) {
       // Unknown, so neither warn nor clear; try again later.
-      console.error("raterm: could not check the session report", err);
+      console.error("misag: could not check the session report", err);
       return void setTimeout(check, STORE_POLL_MS);
     }
     if (reported || s.starts !== startNo) return setNotice(topic, null);
@@ -455,7 +455,7 @@ function errorText(err: unknown): string {
 function write(s: Session, data: Uint8Array) {
   if (s.id === null || s.exited) return;
   invoke("pty_write", { id: s.id, data: Array.from(data) }).catch((err) =>
-    console.error("raterm: write failed", err),
+    console.error("misag: write failed", err),
   );
 }
 
@@ -504,12 +504,12 @@ function close(s: Session) {
   if (s.closing) return;
   s.closing = true;
   // Its run can never be answered again: the tab's id is not reused.
-  invoke("flow_stop_tab", { tabId: s.tabId }).catch((err) => console.error("raterm: could not end the tab's flow run", err));
+  invoke("flow_stop_tab", { tabId: s.tabId }).catch((err) => console.error("misag: could not end the tab's flow run", err));
   const i = sessions.indexOf(s);
   sessions.splice(i, 1);
   // A missing session (already exited) is a no-op on the backend.
   if (s.id !== null) {
-    invoke("pty_kill", { id: s.id }).catch((err) => console.error("raterm: kill failed", err));
+    invoke("pty_kill", { id: s.id }).catch((err) => console.error("misag: kill failed", err));
   }
   s.term.dispose();
   s.el.remove();
@@ -645,7 +645,7 @@ homeDir().then(
     home = dir;
     sessions.forEach(updateTab);
   },
-  (err) => console.error("raterm: could not find the home directory", err),
+  (err) => console.error("misag: could not find the home directory", err),
 );
 
 /** True while `pollTabs` waits for the backend, so a slow check is not started twice. */
@@ -654,8 +654,8 @@ let polling = false;
 /**
  * Checks the running tabs' directories and the Claude in terminal tabs, so labels
  * and icons follow them. When either changed it saves (a Claude starting or
- * quitting in a terminal tab changes nothing else) and shows the Session history
- * of the active tab's folder, which may have changed. Answers for a tab that exited,
+ * quitting in a terminal tab changes nothing else) and redraws the Session history
+ * box, whose marks of the tabs that have a session open may have changed. Answers for a tab that exited,
  * restarted or closed meanwhile are dropped.
  */
 async function pollTabs() {
@@ -684,7 +684,7 @@ async function pollTabs() {
       scheduleSave();
     }
   } catch (err) {
-    console.error("raterm: could not check the tabs", err);
+    console.error("misag: could not check the tabs", err);
   } finally {
     polling = false;
   }
@@ -763,7 +763,7 @@ async function loadPage(p: Page) {
     showPageError(p, null);
     enablePage(p, true);
   } catch (err) {
-    console.error("raterm: could not load settings", err);
+    console.error("misag: could not load settings", err);
     showPageError(p, `Settings could not be read (${errorText(err)}), ${p.unreadable}`);
   }
 }
@@ -778,7 +778,7 @@ async function saveSettingsForm() {
     settings = await invoke<Settings>("settings_save", { settings: readSettingsForm() });
     showPageError(pages.settings, null);
   } catch (err) {
-    console.error("raterm: could not save settings", err);
+    console.error("misag: could not save settings", err);
     showPageError(pages.settings, `Settings not saved: ${errorText(err)}`);
   }
   fillSettingsForms();
@@ -788,7 +788,7 @@ async function saveSettingsForm() {
 let settingsQueue = Promise.resolve();
 const queueSettings = (task: () => Promise<void>) => {
   // A task that throws is logged, so it cannot stop the ones queued after it.
-  settingsQueue = settingsQueue.then(task).catch((err) => console.error("raterm: settings task failed", err));
+  settingsQueue = settingsQueue.then(task).catch((err) => console.error("misag: settings task failed", err));
 };
 settingsForm.onchange = () => queueSettings(saveSettingsForm);
 for (const id of pageIds) pages[id].form.onsubmit = (e) => e.preventDefault();
@@ -907,7 +907,7 @@ function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveLayout().catch((err) => {
-      console.error("raterm: could not save tabs", err);
+      console.error("misag: could not save tabs", err);
       // Tried again, so a passing problem (such as a busy database) does not lose the change.
       saveTimer = setTimeout(scheduleSave, SAVE_RETRY_MS);
     });
@@ -956,7 +956,7 @@ async function saveLayout() {
 async function liveCwds(ids: number[]): Promise<Record<number, string>> {
   if (!ids.length) return {};
   return invoke<Record<number, string>>("pty_cwds", { ids }).catch((err) => {
-    console.error("raterm: could not read tab directories", err);
+    console.error("misag: could not read tab directories", err);
     return {};
   });
 }
@@ -966,7 +966,7 @@ async function claudeStates(tabs: Session[]): Promise<Record<number, ClaudeState
   if (!tabs.length) return {};
   const query = tabs.map((s) => ({ id: s.id, tabId: s.tabId }));
   return invoke<Record<number, ClaudeState>>("claude_open_sessions", { tabs: query }).catch((err) => {
-    console.error("raterm: could not check for Claude sessions in terminal tabs", err);
+    console.error("misag: could not check for Claude sessions in terminal tabs", err);
     return {};
   });
 }
@@ -995,7 +995,7 @@ function followClaude(s: Session, state: ClaudeState | undefined) {
   else if (Date.now() - s.untracked.since >= UNTRACKED_GRACE_MS) {
     setNotice(
       tabTopic(s, "untracked"),
-      `Claude in “${s.name}” did not start through raterm's claude wrapper (a claude alias, or a PATH that lists another claude first), so it will not be reopened.`,
+      `Claude in “${s.name}” did not start through Mischief of Agents's claude wrapper (a claude alias, or a PATH that lists another claude first), so it will not be reopened.`,
       true,
       String(state.pid),
     );
@@ -1040,7 +1040,7 @@ async function showStoreStatus() {
 async function restore() {
   // Sessions from a previous page load (a dev reload) have no tab any more.
   const reset = invoke("pty_reset").catch((err) => {
-    console.error("raterm: could not reset sessions", err);
+    console.error("misag: could not reset sessions", err);
     setNotice("reset", `Leftover sessions could not be stopped (${errorText(err)}); restored Claude tabs may fail to start.`);
   });
   // Loaded while the reset runs; spawning waits for both.
@@ -1049,7 +1049,7 @@ async function restore() {
   try {
     [, saved] = await Promise.all([reset, load]);
   } catch (err) {
-    console.error("raterm: could not load saved tabs", err);
+    console.error("misag: could not load saved tabs", err);
     canSave = false;
     setNotice("load", `Saved tabs could not be read (${errorText(err)}), so changes are not saved this session.`, false);
     return;
@@ -1067,7 +1067,7 @@ async function restore() {
     results.forEach((r, i) => {
       if (r.status !== "rejected") return;
       lost++;
-      console.error("raterm: could not restore tab", saved.tabs[i].name, r.reason);
+      console.error("misag: could not restore tab", saved.tabs[i].name, r.reason);
     });
   } finally {
     restoring = false;
@@ -1103,7 +1103,7 @@ function setWorkspace(workspace: string | null) {
       fillSettingsForms();
       showWorkspace();
     } catch (err) {
-      console.error("raterm: could not save the workspace folder", err);
+      console.error("misag: could not save the workspace folder", err);
       showPageError(pages.workspace, `Workspace folder not saved: ${errorText(err)}`);
     }
   });
@@ -1132,7 +1132,7 @@ function insertPath(path: string) {
       if (sessions.includes(s)) activate(s);
     })
     .catch((err) => {
-      console.error("raterm: could not type the path", err);
+      console.error("misag: could not type the path", err);
       setNotice("path", `${shown} could not be typed: ${errorText(err)}.`);
     });
 }
@@ -1154,7 +1154,7 @@ function openTab(run: TabKind, name?: string, chosenCwd?: string) {
   (async () => {
     const cwd = chosenCwd || (await activeCwd());
     await spawn({ run, name, cwd, fallbackToHome: !chosenCwd });
-  })().catch((err) => console.error(`raterm: could not open ${run.kind} tab`, err));
+  })().catch((err) => console.error(`misag: could not open ${run.kind} tab`, err));
 }
 
 function openTerminalTab(name?: string, chosenCwd?: string) {
@@ -1192,7 +1192,7 @@ new ResizeObserver(() => {
   if (shownPage === null) active?.fit.fit();
 }).observe(termsEl);
 
-const SIDEBAR_KEY = "raterm.sidebarCollapsed";
+const SIDEBAR_KEY = "misag.sidebarCollapsed";
 function setSidebar(collapsed: boolean) {
   document.body.classList.toggle("sidebar-collapsed", collapsed);
   remember(SIDEBAR_KEY, collapsed);
@@ -1231,8 +1231,6 @@ const flows = createFlows({
 const PASTE_SUBMIT_MS = 150;
 /** Tabs whose flow run waits for the person, marked in the tab bar. */
 const waitingTabs = new Set<string>();
-/** Tabs with a flow run, so the Session history box does not switch them to another session. */
-const runTabs = new Set<string>();
 
 /**
  * Types `text` into the tab as one paste and sends it, as if the person had. The
@@ -1267,7 +1265,7 @@ async function startFlow(flow: Flow) {
     flows.showBoxError(null);
     if (prompt !== null) typePrompt(s, prompt);
   } catch (err) {
-    console.error("raterm: could not start the flow", err);
+    console.error("misag: could not start the flow", err);
     flows.showBoxError(`Could not start "${flow.name}": ${errorText(err)}`);
   }
   await pollRuns();
@@ -1285,7 +1283,7 @@ async function continueRun(run: Run, output: string, note: string) {
     flows.showBoxError(null);
     if (prompt !== null) typePrompt(s, prompt);
   } catch (err) {
-    console.error("raterm: could not continue the run", err);
+    console.error("misag: could not continue the run", err);
     flows.showBoxError(`Could not go on: ${errorText(err)}`);
   }
   await pollRuns();
@@ -1296,7 +1294,7 @@ async function stopRun(run: Run) {
     await invoke("flow_stop", { runId: run.id });
     flows.showBoxError(null);
   } catch (err) {
-    console.error("raterm: could not stop the run", err);
+    console.error("misag: could not stop the run", err);
     flows.showBoxError(`Could not stop the run: ${errorText(err)}`);
   }
   await pollRuns();
@@ -1313,14 +1311,12 @@ async function pollRuns() {
     runsError = null;
     flows.showRuns(runs);
     waitingTabs.clear();
-    runTabs.clear();
     for (const run of runs) {
-      runTabs.add(run.tabId);
       if (run.status !== "running") waitingTabs.add(run.tabId);
     }
     sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", waitingTabs.has(s.tabId)));
   } catch (err) {
-    console.error("raterm: could not read the flow runs", err);
+    console.error("misag: could not read the flow runs", err);
     runsError = `Flow runs could not be read: ${errorText(err)}`;
     flows.showBoxError(runsError);
   }
@@ -1380,35 +1376,45 @@ flows.reload().catch(() => {});
 const historyBox = $<HTMLElement>("#history-box");
 const sessionHistory = createHistory({
   box: historyBox,
-  list: async (dir, limit) => {
-    const [page] = await Promise.all([invoke<HistoryPage>("claude_history", { dir, limit }), readTabSessions()]);
+  list: async (limit) => {
+    const [page] = await Promise.all([invoke<HistoryPage>("claude_history", { limit }), readTabSessions()]);
     return page;
   },
   errorText,
+  folderLabel: (cwd) => folderLabel(cwd, home),
   openIn: (id) => {
     const s = tabWithSession(id);
     return !s ? null : s === active ? "this tab" : `in ${tabLabel(s)}`;
   },
-  onResume: (past) =>
-    resumeHere(past).catch((err) => {
-      console.error("raterm: could not resume the session", err);
-      setNotice("history", `“${past.title}” could not be resumed: ${errorText(err)}.`);
-    }),
-  onOpenTab: (past) => {
-    const s = tabWithSession(past.id);
-    if (s) return activate(s);
-    openTab({ kind: "claude", claudeSession: past.id }, undefined, past.cwd);
+  onResume: (past) => resumeInNewTab(past),
+  pin: async (id, pinned) => {
+    try {
+      await invoke("claude_session_pin", { id, pinned });
+      setNotice("history-pin", null);
+      return true;
+    } catch (err) {
+      console.error("misag: could not pin the session", err);
+      setNotice("history-pin", `The session could not be ${pinned ? "pinned" : "unpinned"}: ${errorText(err)}.`);
+      return false;
+    }
   },
 });
+
+/** Resumes a past session in a new Claude tab in its folder, or shows the tab that has it open. */
+function resumeInNewTab(past: Past) {
+  const s = tabWithSession(past.id);
+  if (s) return activate(s);
+  openTab({ kind: "claude", claudeSession: past.id }, undefined, past.cwd);
+}
 const toolboxes = setupToolboxes($<HTMLElement>("#sidebar"), (box) => {
   if (box === historyBox) reloadHistoryIfShown();
 });
 $<HTMLButtonElement>("#settings .reset-sidebar").onclick = () => toolboxes.reset();
 historyBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => void sessionHistory.reload();
 
-/** Shows the sessions of the active tab's folder; a tab whose folder is not known yet started in home. */
+/** Marks again which sessions the active tab and the others have open. */
 function showHistory() {
-  sessionHistory.show(active ? (tabDir(active) ?? "~") : null);
+  sessionHistory.redraw();
 }
 
 /** The Claude session each tab's hook last reported, by tab id, as last read. */
@@ -1419,7 +1425,7 @@ async function readTabSessions() {
   try {
     reportedSessions = await invoke<Record<string, string>>("claude_tab_sessions");
   } catch (err) {
-    console.error("raterm: could not read the tabs' Claude sessions", err);
+    console.error("misag: could not read the tabs' Claude sessions", err);
   }
 }
 
@@ -1430,40 +1436,6 @@ function tabWithSession(id: string): Session | undefined {
     const open = s.run.kind === "claude" ? (reportedSessions[s.tabId] ?? s.run.claudeSession) : s.claudeOpen;
     return open === id;
   });
-}
-
-/** Whether Claude runs in the tab: asked now for a terminal tab; "unknown" if that check fails. */
-async function claudeIn(s: Session): Promise<"yes" | "no" | "unknown"> {
-  if (s.run.kind === "claude") return "yes";
-  const state = (await claudeStates([s]))[s.id!];
-  if (!state || state.state === "unknown") return "unknown";
-  return state.state === "closed" ? "no" : "yes";
-}
-
-/**
- * Resumes a past session in the active tab: with /resume in the Claude running
- * there, else with `claude --resume` at its shell prompt. A session already open
- * in a tab shows that tab instead, so one conversation never runs twice. The id
- * came from the backend as a validated UUID, so it is safe to type.
- */
-async function resumeHere(past: Past) {
-  const open = tabWithSession(past.id);
-  if (open) {
-    setNotice("history", null);
-    return activate(open);
-  }
-  const s = active;
-  const not = `“${past.title}” was not resumed:`;
-  const running = (t: Session | null): t is Session => !!t && !t.exited && !t.closing && t.id !== null && sessions.includes(t);
-  if (!running(s)) return setNotice("history", `${not} the active tab is not running. Its new-tab button opens it in a new tab.`);
-  if (runTabs.has(s.tabId)) return setNotice("history", `${not} “${tabLabel(s)}” runs a flow; stop the run first.`);
-  const claude = await claudeIn(s);
-  if (!running(s)) return setNotice("history", `${not} the tab stopped meanwhile.`);
-  if (claude === "unknown") return setNotice("history", `${not} raterm could not tell whether Claude runs in “${tabLabel(s)}”.`);
-  if (claude === "yes") typePrompt(s, `/resume ${past.id}`);
-  else write(s, encoder.encode(`claude --resume ${past.id}\r`));
-  setNotice("history", null);
-  activate(s);
 }
 
 /** Whether the Session history box can be seen: open, with the sidebar shown, in a visible window. */
@@ -1478,7 +1450,7 @@ document.addEventListener("visibilitychange", reloadHistoryIfShown);
 const workspaceInput = pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement;
 const pickWorkspace = () =>
   chooseWorkspace().catch((err) => {
-    console.error("raterm: could not open the folder picker", err);
+    console.error("misag: could not open the folder picker", err);
     showPageError(pages.workspace, `The folder picker could not be opened: ${errorText(err)}`);
   });
 workspaceInput.onclick = pickWorkspace;
@@ -1508,7 +1480,7 @@ async function watchWindowClose() {
       await saveLayout();
       warned = false;
     } catch (err) {
-      console.error("raterm: could not save tabs", err);
+      console.error("misag: could not save tabs", err);
       if (warned) return;
       warned = true;
       event.preventDefault();
@@ -1524,7 +1496,7 @@ queueSettings(async () => {
   try {
     await loadSettings();
   } catch (err) {
-    console.error("raterm: could not load settings", err);
+    console.error("misag: could not load settings", err);
     setNotice(
       "settings",
       `Settings could not be read (${errorText(err)}), ${pages.workspace.unreadable} Claude tabs start with permission prompts and auto memory off.`,
@@ -1534,24 +1506,24 @@ queueSettings(async () => {
 });
 // Async so a failure (e.g. outside Tauri) is logged instead of aborting the UI setup.
 watchWindowClose().catch((err) => {
-  console.error("raterm: could not watch window close", err);
+  console.error("misag: could not watch window close", err);
   setNotice("close", "Tabs are saved after each change, but not when the window closes.");
 });
 const checkStore = () =>
   showStoreStatus().catch((err) => {
-    console.error("raterm: could not read the store status", err);
+    console.error("misag: could not read the store status", err);
     setNotice("store", `Could not check whether tabs are being saved (${errorText(err)}).`);
   });
 checkStore();
 // Session-hook failures can happen at any time, so they are checked on a timer.
 setInterval(checkStore, STORE_POLL_MS);
-// Directories and the Claude in terminal tabs change without telling raterm, and
+// Directories and the Claude in terminal tabs change without telling misag, and
 // flow runs move on in the Stop hook.
 setInterval(pollTabs, TAB_POLL_MS);
 setInterval(pollRuns, TAB_POLL_MS);
 setInterval(reloadHistoryIfShown, HISTORY_POLL_MS);
 restore().catch((err) => {
-  console.error("raterm: restore failed", err);
+  console.error("misag: restore failed", err);
   canSave = false;
   setNotice("load", "Saved tabs could not be restored, so changes are not saved this session.", false);
 });

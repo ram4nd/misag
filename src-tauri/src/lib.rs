@@ -12,9 +12,9 @@ pub mod settings;
 use std::path::PathBuf;
 use tauri::{Manager, RunEvent};
 
-/// `raterm --exec`: replaces this process with the program and arguments in
-/// `RATERM_EXEC` (a JSON array), so non-POSIX login shells can launch Claude tabs
-/// without quoting the program or its arguments. `RATERM_EXEC` itself is not passed
+/// `misag --exec`: replaces this process with the program and arguments in
+/// `MISAG_EXEC` (a JSON array), so non-POSIX login shells can launch Claude tabs
+/// without quoting the program or its arguments. `MISAG_EXEC` itself is not passed
 /// on. Returns only on failure, with the exit code to use.
 ///
 /// Exit codes follow the shell's: 2 for bad usage, 126 when the program cannot be
@@ -25,30 +25,30 @@ pub fn run_exec() -> i32 {
     let raw = match std::env::var(var) {
         Ok(raw) => raw,
         Err(e) => {
-            eprintln!("raterm: {flag} needs {var}: {e}");
+            eprintln!("misag: {flag} needs {var}: {e}");
             return 2;
         }
     };
     let argv: Vec<String> = match serde_json::from_str(&raw) {
         Ok(argv) => argv,
         Err(e) => {
-            eprintln!("raterm: {var} is not a JSON array of strings: {e}");
+            eprintln!("misag: {var} is not a JSON array of strings: {e}");
             return 2;
         }
     };
     let Some((program, args)) = argv.split_first() else {
-        eprintln!("raterm: {var} is empty");
+        eprintln!("misag: {var} is empty");
         return 2;
     };
     let err = std::process::Command::new(program).args(args).env_remove(var).exec();
-    eprintln!("raterm: could not run {program}: {err}");
+    eprintln!("misag: could not run {program}: {err}");
     if err.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }
 }
 
-/// `raterm --claude-launch [args]`, run by the `claude` wrapper in terminal tabs:
+/// `misag --claude-launch [args]`, run by the `claude` wrapper in terminal tabs:
 /// replaces this process with the real `claude` (the wrapper took itself off
 /// `PATH`), started like a Claude tab with the settings and hook from the database
-/// in `RATERM_DB`. Without a usable database it starts untracked with the cautious
+/// in `MISAG_DB`. Without a usable database it starts untracked with the cautious
 /// settings; if only the settings cannot be read, it is still tracked. Returns only
 /// on failure, with the exit code a shell uses (127 not found, 126 otherwise).
 pub fn run_launch() -> i32 {
@@ -60,31 +60,31 @@ pub fn run_launch() -> i32 {
         None => Err(format!("{} is not set", claude::DB_ENV)),
     });
     let settings = settings.unwrap_or_else(|e| {
-        eprintln!("raterm: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
+        eprintln!("misag: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
         settings::Settings::cautious()
     });
     let exe = own_exe();
     let hook = match (exe.path(), &store) {
         (Ok(exe), Ok(Some(_))) => Some(exe),
         (Err(e), Ok(Some(_))) => {
-            eprintln!("raterm: {e}, so this Claude session will not be remembered");
+            eprintln!("misag: {e}, so this Claude session will not be remembered");
             None
         }
         _ => None,
     };
     let args = claude::launch_args(&settings, hook, std::env::args_os().skip(2));
     let err = std::process::Command::new("claude").args(args).exec();
-    eprintln!("raterm: could not run claude: {err}");
+    eprintln!("misag: could not run claude: {err}");
     if err.kind() == std::io::ErrorKind::NotFound { 127 } else { 126 }
 }
 
-/// raterm's own binary, for Claude's hook, `--claude-launch` and the `--exec` trampoline.
+/// misag's own binary, for Claude's hook, `--claude-launch` and the `--exec` trampoline.
 fn own_exe() -> commands::AppExe {
     commands::AppExe::new(
         std::env::current_exe()
             // After an upgrade replaced the binary, run the new one at the same path.
             .map(session::live_path)
-            .map_err(|e| format!("cannot locate the raterm binary: {e}")),
+            .map_err(|e| format!("cannot locate the misag binary: {e}")),
     )
 }
 
@@ -93,10 +93,10 @@ fn own_exe() -> commands::AppExe {
 fn open_store(dir: Result<PathBuf, String>) -> db::Db {
     let db = db::Db::open_or_recover(dir.map(|d| d.join(db::FILE)));
     if let Err(e) = db.prune_claude_sessions() {
-        eprintln!("raterm: could not prune Claude sessions: {e}");
+        eprintln!("misag: could not prune Claude sessions: {e}");
     }
     if let Err(e) = db.resume_runs() {
-        eprintln!("raterm: could not resume the flow runs: {e}");
+        eprintln!("misag: could not resume the flow runs: {e}");
     }
     db
 }
@@ -105,12 +105,12 @@ fn open_store(dir: Result<PathBuf, String>) -> db::Db {
 /// runs untracked, nothing worse; the UI says why (see `store_status`).
 fn install_wrapper(store: &db::Db, exe: &commands::AppExe) -> commands::Wrapper {
     let installed = match (store.hook_path(), exe.path()) {
-        (None, _) => Err("raterm is running without its database".to_string()),
+        (None, _) => Err("Mischief of Agents is running without its database".to_string()),
         (_, Err(e)) => Err(e.to_string()),
         (Some(db), Ok(exe)) => claude::install_wrapper(db, exe),
     };
     if let Err(e) = &installed {
-        eprintln!("raterm: no claude wrapper for terminal tabs: {e}");
+        eprintln!("misag: no claude wrapper for terminal tabs: {e}");
     }
     commands::Wrapper(installed)
 }
@@ -120,7 +120,7 @@ pub fn run() {
     let sessions = match exe.path_str() {
         Ok(exe) => session::Sessions::default().with_trampoline(exe.to_owned()),
         Err(e) => {
-            eprintln!("raterm: {e}; Claude tabs cannot start");
+            eprintln!("misag: {e}; Claude tabs cannot start");
             session::Sessions::default()
         }
     };
@@ -129,11 +129,11 @@ pub fn run() {
         // would overwrite each other's saved tabs.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let Some(window) = app.get_webview_window("main") else {
-                eprintln!("raterm: another launch was refused, but there is no window to focus");
+                eprintln!("misag: another launch was refused, but there is no window to focus");
                 return;
             };
             if let Err(e) = window.unminimize().and_then(|()| window.set_focus()) {
-                eprintln!("raterm: could not focus the window for another launch: {e}");
+                eprintln!("misag: could not focus the window for another launch: {e}");
             }
         }))
         .plugin(tauri_plugin_opener::init())
@@ -143,7 +143,7 @@ pub fn run() {
         .manage(history::Cache::default())
         .setup(|app| {
             // Debug builds keep their data in a subdirectory, so even a dev build run
-            // without the dev config's identifier never touches an installed raterm's.
+            // without the dev config's identifier never touches an installed misag's.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string());
             let dir = dir.map(|d| if cfg!(debug_assertions) { d.join("dev") } else { d });
             let store = open_store(dir);
@@ -167,6 +167,7 @@ pub fn run() {
             commands::settings_save,
             commands::fs_list,
             commands::claude_history,
+            commands::claude_session_pin,
             commands::claude_tab_sessions,
             commands::flows_list,
             commands::flow_create,
@@ -183,7 +184,7 @@ pub fn run() {
             commands::flow_stop_tab,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building raterm")
+        .expect("error while building misag")
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 app.state::<session::Sessions>().kill_all_and_wait();
@@ -198,7 +199,7 @@ pub(crate) mod test_support {
 
     /// An empty directory for one test, named after it and this test process.
     pub fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("raterm-test-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("misag-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

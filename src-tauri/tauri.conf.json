@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "raterm",
+  "productName": "Mischief of Agents",
   "version": "0.1.0",
-  "identifier": "com.tag1.raterm",
+  "identifier": "io.github.ram4nd.misag",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "raterm",
+        "title": "Mischief of Agents",
         "width": 1280,
         "height": 800
       }
@@ -23,6 +23,19 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "Ra Mänd",
+    "copyright": "Copyright (C) 2026 Ra Mänd",
+    "license": "GPL-3.0-only",
+    "category": "DeveloperTool",
+    "shortDescription": "A Linux terminal for keeping AI agents on the path you set",
+    "longDescription": "Run Claude Code agents in tabs that remember their sessions, turn their auto memory off, and give them flows: graphs of steps they work through on their own.",
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/doc/mischief-of-agents/copyright": "../LICENSE"
+        }
+      }
+    },
     "targets": [
       "deb",
       "appimage"

@@ -1,15 +1,15 @@
-//! A tab started from a raterm that Claude Code launched (as with a dev build run
+//! A tab started from a misag that Claude Code launched (as with a dev build run
 //! from Claude Code) must not inherit that session, but must keep the user's own
 //! settings. Its own test binary, because it changes this process's environment.
 
-use raterm_lib::session::{Launch, Sessions, SpawnRequest, CLAUDE_CODE_SHELL_ENV, LAUNCHER_ENV};
+use misag_lib::session::{Launch, Sessions, SpawnRequest, CLAUDE_CODE_SHELL_ENV, LAUNCHER_ENV};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[test]
 fn tabs_drop_the_launching_claude_session_but_keep_user_settings() {
-    let home = std::env::temp_dir().join(format!("raterm-it-launcher-env-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!("misag-it-launcher-env-{}", std::process::id()));
     std::fs::create_dir_all(&home).unwrap();
     let kept = [("CLAUDE_CONFIG_DIR", "/cfg"), ("CLAUDE_CODE_USE_BEDROCK", "1")];
     let leaked = LAUNCHER_ENV.iter().chain(CLAUDE_CODE_SHELL_ENV).map(|k| (*k, "leaked"));

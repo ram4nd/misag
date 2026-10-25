@@ -2,15 +2,15 @@
 //! each tab is in and moves the tab's flow run on.
 //!
 //! Each Claude tab runs `claude` with a hook passed through `--settings`, so the
-//! user's own Claude configuration is untouched. The hook is raterm's own binary
-//! in `--claude-hook` mode, for the tab named by `RATERM_TAB`. Claude runs it
+//! user's own Claude configuration is untouched. The hook is misag's own binary
+//! in `--claude-hook` mode, for the tab named by `MISAG_TAB`. Claude runs it
 //! whenever a session starts (launch, `--resume`, `/resume`, `/clear`, compaction),
 //! and it records the session in the database; and whenever Claude ends a turn
 //! (Stop), and it moves the tab's flow run on (see `runs`), printing the next
 //! prompt for Claude when there is one.
 //!
 //! Terminal tabs find a `claude` wrapper first on their `PATH` (see
-//! `install_wrapper`), which hands `claude` to `raterm --claude-launch`: that
+//! `install_wrapper`), which hands `claude` to `misag --claude-launch`: that
 //! starts the real `claude` with the same hook and the current settings, so a
 //! Claude session started in a terminal tab is recorded for that tab and set up
 //! like a Claude tab's.
@@ -27,19 +27,19 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Set on Claude and terminal tabs: the tab the hook reports for.
-pub const TAB_ENV: &str = "RATERM_TAB";
+pub const TAB_ENV: &str = "MISAG_TAB";
 /// Set on Claude and terminal tabs: the database the hook reports to.
-pub const DB_ENV: &str = "RATERM_DB";
-/// Set on terminal tabs: the wrapper directory raterm put first on their PATH, so
-/// a raterm started from such a tab can take it off again.
-pub const WRAPPER_ENV: &str = "RATERM_WRAPPER";
+pub const DB_ENV: &str = "MISAG_DB";
+/// Set on terminal tabs: the wrapper directory misag put first on their PATH, so
+/// a misag started from such a tab can take it off again.
+pub const WRAPPER_ENV: &str = "MISAG_WRAPPER";
 /// Claude Code sets this for the commands and hooks it runs (seen in 2.1): its
 /// own process, recorded with the session.
 pub const PID_ENV: &str = "CLAUDE_PID";
 /// The subdirectory of the database's directory that holds the `claude` wrapper.
 pub const WRAPPER_DIR: &str = "bin";
 /// Claude Code's cap on Stop-hook continuations in a row (8 by default). Tabs get
-/// it raised to just above raterm's own limit (`runs::MAX_RUN_STEPS`), so a flow
+/// it raised to just above misag's own limit (`runs::MAX_RUN_STEPS`), so a flow
 /// run is not cut short; it applies to the user's own Stop hooks in those tabs too.
 pub const STOP_CAP_ENV: &str = "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP";
 pub const STOP_CAP: u32 = 51;
@@ -63,8 +63,8 @@ const HOOK_LOG_TAIL: u64 = 4 * HOOK_MESSAGE_LIMIT as u64 + 256;
 /// Written in place of the tab id when the hook does not know its tab.
 const NO_TAB: &str = "-";
 /// Makes the hook panic on purpose, so tests can check that a panic is still
-/// logged and exits 0. Only honoured in debug builds; never set by raterm itself.
-pub const PANIC_TEST_ENV: &str = "RATERM_HOOK_TEST_PANIC";
+/// logged and exits 0. Only honoured in debug builds; never set by misag itself.
+pub const PANIC_TEST_ENV: &str = "MISAG_HOOK_TEST_PANIC";
 
 /// A Claude Code session id. Only canonical lowercase UUIDs are accepted, since
 /// the id ends up in a command line and a file path; holding one proves that.
@@ -175,13 +175,13 @@ pub fn hook_command(exe: &Path) -> String {
     format!("{} {HOOK_FLAG}", shell_quote(&exe.to_string_lossy()))
 }
 
-/// The `--settings` JSON: `keys` (from raterm's own settings) plus, with `hook_exe`,
-/// raterm's hook for SessionStart (to record the tab's session) and Stop (to move
+/// The `--settings` JSON: `keys` (from misag's own settings) plus, with `hook_exe`,
+/// misag's hook for SessionStart (to record the tab's session) and Stop (to move
 /// the tab's flow run on). None when there are no keys and no hook, so no
 /// `--settings` is passed.
 fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
     if let Some(exe) = hook_exe {
-        debug_assert!(!keys.contains_key("hooks"), "a setting would replace raterm's hook");
+        debug_assert!(!keys.contains_key("hooks"), "a setting would replace misag's hook");
         let command = hook_command(exe);
         let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]);
         keys.insert("hooks".into(), serde_json::json!({ "SessionStart": hook, "Stop": hook }));
@@ -196,7 +196,7 @@ pub fn wrapper_dir(db: &Path) -> Option<PathBuf> {
 
 /// The `claude` wrapper: takes its own directory off `PATH` and has `exe` start the
 /// real `claude` (see `LAUNCH_FLAG`), or runs `claude` unchanged with a warning if
-/// `exe` has gone (another raterm build rewrote the shared wrapper, say). Inside a
+/// `exe` has gone (another misag build rewrote the shared wrapper, say). Inside a
 /// Claude session (`CLAUDECODE`, which
 /// terminal tabs never inherit) it runs `claude` unchanged, so a `claude` that
 /// Claude itself runs cannot replace the session recorded for the tab.
@@ -204,9 +204,9 @@ fn wrapper_script(dir: &str, exe: &Path) -> String {
     let (dir, exe) = (shell_quote(dir), shell_quote(&exe.to_string_lossy()));
     format!(
         r#"#!/bin/sh
-# Written by raterm at every start; changes are lost. Terminal tabs have this
-# directory first on PATH, so `claude` there starts with raterm's settings and
-# reports its session to raterm.
+# Written by misag at every start; changes are lost. Terminal tabs have this
+# directory first on PATH, so `claude` there starts with misag's settings and
+# reports its session to misag.
 self={dir}
 rest=
 set -f
@@ -220,7 +220,7 @@ PATH=$rest
 export PATH
 if [ -n "$CLAUDECODE" ]; then exec claude "$@"; fi
 if [ ! -x {exe} ]; then
-  echo "raterm: "{exe}" is gone, so claude starts without raterm's settings and session hook" >&2
+  echo "misag: "{exe}" is gone, so claude starts without misag's settings and session hook" >&2
   exec claude "$@"
 fi
 exec {exe} {LAUNCH_FLAG} "$@"
@@ -229,7 +229,7 @@ exec {exe} {LAUNCH_FLAG} "$@"
 }
 
 /// Writes the `claude` wrapper (see `wrapper_script`) into `wrapper_dir(db)`,
-/// replacing any earlier one, so it always starts `claude` through this raterm. Returns the
+/// replacing any earlier one, so it always starts `claude` through this misag. Returns the
 /// directory.
 pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
@@ -273,7 +273,7 @@ pub fn launch_args(settings: &Settings, hook_exe: Option<&Path>, args: impl Into
     all
 }
 
-/// The part of Claude's SessionStart payload raterm records.
+/// The part of Claude's SessionStart payload misag records.
 #[derive(Deserialize)]
 struct SessionStart {
     session_id: SessionId,
@@ -381,7 +381,7 @@ fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, cl
         Some("SessionStart") | None => record(&payload, tab_id, db_path, claude_pid)
             .map(|()| Outcome::Recorded)
             .map_err(|e| format!("could not record the Claude session: {e}")),
-        Some(other) => Err(format!("raterm's hook was run for {other}, which it does not handle")),
+        Some(other) => Err(format!("misag's hook was run for {other}, which it does not handle")),
     }
 }
 
@@ -396,14 +396,14 @@ fn log_failure(db_path: Option<&Path>, tab_id: Option<&TabId>, message: &str) {
         message.truncate(cut);
         message.push('…');
     }
-    let _ = writeln!(std::io::stderr(), "raterm: {message}");
+    let _ = writeln!(std::io::stderr(), "misag: {message}");
     let Some(log) = db_path.and_then(Path::parent).map(|dir| dir.join(HOOK_LOG)) else { return };
     let too_big = std::fs::metadata(&log).is_ok_and(|m| m.len() > HOOK_LOG_LIMIT);
     let file = std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(&log);
     let tab = tab_id.map_or(NO_TAB, TabId::as_str);
     let written = file.and_then(|mut file| writeln!(file, "{} {tab} {message}", unix_secs(SystemTime::now())));
     if let Err(e) = written {
-        let _ = writeln!(std::io::stderr(), "raterm: could not write {}: {e}", log.display());
+        let _ = writeln!(std::io::stderr(), "misag: could not write {}: {e}", log.display());
     }
 }
 
@@ -470,7 +470,7 @@ pub fn hook_problem(db: &Db) -> Option<HookProblem> {
     match db.latest_report_at(failure.tab_id.as_ref()) {
         Ok(Some(reported)) if reported > failure.at => return None,
         Ok(_) => {}
-        Err(e) => eprintln!("raterm: could not check the latest session report: {e}"),
+        Err(e) => eprintln!("misag: could not check the latest session report: {e}"),
     }
     let message = match &failure.tab_id {
         Some(tab) => format!("tab {tab}: {}", failure.message),
@@ -479,7 +479,7 @@ pub fn hook_problem(db: &Db) -> Option<HookProblem> {
     Some(HookProblem { at: failure.at, message, log: shown })
 }
 
-/// Entry point for `raterm --claude-hook`. Always exits 0: a failure here must
+/// Entry point for `misag --claude-hook`. Always exits 0: a failure here must
 /// never disturb the Claude session, so it is only logged. Panics are handled by a
 /// panic hook that logs and exits 0 before any unwinding, which also works with
 /// the release profile's `panic = "abort"` (see Cargo.toml), where `catch_unwind`
@@ -520,7 +520,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
-    const EXE: &str = "/opt/my apps/raterm";
+    const EXE: &str = "/opt/my apps/misag";
 
     fn id() -> SessionId {
         SessionId::parse(ID).unwrap()
@@ -550,7 +550,7 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
-        assert_eq!(hook["command"], "'/opt/my apps/raterm' --claude-hook");
+        assert_eq!(hook["command"], "'/opt/my apps/misag' --claude-hook");
         // The same command runs when Claude ends a turn, to move a flow run on.
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0], *hook);
         assert_eq!(settings.as_object().unwrap().len(), 1, "only the hook");
@@ -576,7 +576,7 @@ mod tests {
         assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         assert_eq!(settings["autoMemoryEnabled"], false);
-        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "'/opt/my apps/raterm' --claude-hook");
+        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "'/opt/my apps/misag' --claude-hook");
     }
 
     #[test]
@@ -594,11 +594,11 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Runs the installed wrapper with stand-ins for raterm and the real `claude`.
+    /// Runs the installed wrapper with stand-ins for misag and the real `claude`.
     fn run_wrapper(base: &Path, extra_env: &[(&str, &str)]) -> Vec<String> {
-        let exe = base.join("my apps/raterm");
-        stand_in(&exe, "raterm");
-        let wrapper = install_wrapper(&base.join("data/raterm.db"), &exe).unwrap();
+        let exe = base.join("my apps/misag");
+        stand_in(&exe, "misag");
+        let wrapper = install_wrapper(&base.join("data/misag.db"), &exe).unwrap();
         let real = base.join("real");
         stand_in(&real.join("claude"), "claude");
         let path = format!("{}:{}/:{}:/usr/bin:/bin", wrapper.display(), wrapper.display(), real.display());
@@ -614,10 +614,10 @@ mod tests {
     }
 
     #[test]
-    fn the_wrapper_hands_claude_to_raterm() {
+    fn the_wrapper_hands_claude_to_misag() {
         let base = crate::test_support::temp_dir("wrapper");
         let lines = run_wrapper(&base, &[]);
-        assert_eq!(lines[..4], ["raterm", LAUNCH_FLAG, "--resume", "it's"]);
+        assert_eq!(lines[..4], ["misag", LAUNCH_FLAG, "--resume", "it's"]);
         assert_eq!(lines[4], format!("PATH={}:/usr/bin:/bin", base.join("real").display()), "its own directory is gone");
         // Installing again replaces it.
         assert_eq!(run_wrapper(&base, &[]), lines);
@@ -627,19 +627,19 @@ mod tests {
     #[test]
     fn without_a_real_claude_the_wrapper_fails_instead_of_calling_itself() {
         let base = crate::test_support::temp_dir("wrapper-missing");
-        let wrapper = install_wrapper(&base.join("data/raterm.db"), Path::new(EXE)).unwrap();
+        let wrapper = install_wrapper(&base.join("data/misag.db"), Path::new(EXE)).unwrap();
         // Listed twice and with a trailing slash: every spelling must be taken off.
         let path = format!("{w}:{w}/:{w}:{empty}", w = wrapper.display(), empty = base.display());
-        // Nested in Claude, the wrapper runs `claude` itself rather than through raterm.
+        // Nested in Claude, the wrapper runs `claude` itself rather than through misag.
         let out = std::process::Command::new(wrapper.join("claude")).env("PATH", path).env("CLAUDECODE", "1").output().unwrap();
         assert_eq!(out.status.code(), Some(127), "{}", String::from_utf8_lossy(&out.stderr));
         fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
-    fn a_wrapper_whose_raterm_is_gone_still_runs_claude() {
+    fn a_wrapper_whose_misag_is_gone_still_runs_claude() {
         let base = crate::test_support::temp_dir("wrapper-stale");
-        let wrapper = install_wrapper(&base.join("data/raterm.db"), &base.join("gone/raterm")).unwrap();
+        let wrapper = install_wrapper(&base.join("data/misag.db"), &base.join("gone/misag")).unwrap();
         let real = base.join("real");
         stand_in(&real.join("claude"), "claude");
         let out = std::process::Command::new("claude")
@@ -651,7 +651,7 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let lines: Vec<String> = String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect();
         assert_eq!(lines[..2], ["claude", "-c"]);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("gone/raterm"), "says why the settings are missing");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("gone/misag"), "says why the settings are missing");
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -661,11 +661,11 @@ mod tests {
             return;
         }
         let base = crate::test_support::temp_dir("wrapper-readonly");
-        let dir = wrapper_dir(&base.join("raterm.db")).unwrap();
+        let dir = wrapper_dir(&base.join("misag.db")).unwrap();
         fs::create_dir(&dir).unwrap();
         // The rename fails: `claude` is a directory that is not empty.
         fs::create_dir_all(dir.join("claude/x")).unwrap();
-        let err = install_wrapper(&base.join("raterm.db"), Path::new(EXE)).unwrap_err();
+        let err = install_wrapper(&base.join("misag.db"), Path::new(EXE)).unwrap_err();
         assert!(err.contains("cannot write the claude wrapper"), "{err}");
         assert!(!dir.join(".claude.partial").exists());
         fs::remove_dir_all(&base).unwrap();
@@ -807,10 +807,10 @@ mod tests {
         let db = Db::open(path.clone()).unwrap();
         assert_eq!(hook_problem(&db), None, "older failures are not this run's");
         let now = unix_secs(SystemTime::now());
-        fs::write(log_of(&path), format!("1 - an old failure\n{now} - schema 2 in raterm.db, this binary knows 1\n"))
+        fs::write(log_of(&path), format!("1 - an old failure\n{now} - schema 2 in misag.db, this binary knows 1\n"))
             .unwrap();
         let problem = hook_problem(&db).unwrap();
-        assert_eq!((problem.at, problem.message.as_str()), (now, "schema 2 in raterm.db, this binary knows 1"));
+        assert_eq!((problem.at, problem.message.as_str()), (now, "schema 2 in misag.db, this binary knows 1"));
     }
 
     #[test]
@@ -913,7 +913,7 @@ mod tests {
     fn the_hook_needs_its_environment() {
         let path = temp_db("hook-env");
         let err = hook("{}".as_bytes(), None, Some(&path), None).unwrap_err();
-        assert!(err.contains("RATERM_TAB"), "{err}");
+        assert!(err.contains("MISAG_TAB"), "{err}");
         assert!(hook("{}".as_bytes(), Some(&tid("t")), None, None).is_err());
         assert!(!path.exists(), "nothing should be written without a tab");
     }

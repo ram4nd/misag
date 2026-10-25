@@ -2,7 +2,7 @@
 //!
 //! A run starts at the flow's Start step and moves along outputs. A prompt step
 //! sends its text to Claude; when Claude ends its turn, the Stop hook
-//! (`raterm --claude-hook`, a separate process) reads the `FLOW: <output>` line
+//! (`misag --claude-hook`, a separate process) reads the `FLOW: <output>` line
 //! Claude ended with and moves on, handing Claude the next prompt as hook context.
 //! A manual step, or a reply the runner cannot follow, waits for the person, who
 //! picks an output in the sidebar (and can do so for a running step too, if Claude
@@ -80,7 +80,7 @@ impl Status {
             "attention" => Status::Attention,
             "done" => Status::Done,
             "stopped" => Status::Stopped,
-            other => return Err(format!("a run has the status {other:?}, which this raterm does not know")),
+            other => return Err(format!("a run has the status {other:?}, which this version does not know")),
         })
     }
 }
@@ -264,7 +264,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
     let node = run.node()?.clone();
     let wait = |why: String| set(&tx, run.id, &node.id, Status::Attention, run.steps, Some(&why)).map(|()| None);
     let Some(reply) = reply else {
-        let prompt = wait("Claude Code did not report Claude's reply to raterm; update Claude Code to run flows.".into())?;
+        let prompt = wait("Claude Code did not report Claude's reply to Mischief of Agents; update Claude Code to run flows.".into())?;
         tx.commit().map_err(sql)?;
         return Ok(prompt);
     };
@@ -320,7 +320,7 @@ pub fn stop_tab(conn: &Connection, tab_id: &TabId) -> Result<(), String> {
 }
 
 /// At startup: stops the runs of tabs that are no longer open, and makes running
-/// ones wait, as their Claude was stopped with raterm and will not reply.
+/// ones wait, as their Claude was stopped with misag and will not reply.
 pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let tabs: Vec<String> = {
@@ -332,7 +332,7 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
         if open_tabs.iter().any(|open| open.as_str() == tab) {
             tx.execute(
                 "UPDATE flow_runs SET status = 'attention', note = ?2, updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
-                params![tab, "raterm was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.", now()],
+                params![tab, "Mischief of Agents was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.", now()],
             )
             .map_err(sql)?;
         } else {
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn raterm_s_step_limit_stays_below_claude_code_s() {
+    fn misag_s_step_limit_stays_below_claude_code_s() {
         assert!(MAX_RUN_STEPS < i64::from(crate::claude::STOP_CAP));
     }
 

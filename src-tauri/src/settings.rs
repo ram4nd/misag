@@ -43,13 +43,13 @@ impl Settings {
         Ok(self)
     }
 
-    /// The arguments these settings add to every Claude raterm starts.
+    /// The arguments these settings add to every Claude misag starts.
     pub fn claude_args(&self) -> Vec<String> {
         if self.skip_permissions { vec![SKIP_PERMISSIONS_FLAG.into()] } else { vec![] }
     }
 
     /// The Claude settings keys these settings add to the `--settings` JSON of every
-    /// Claude raterm starts. A setting left at its default adds nothing, so the user's own Claude
+    /// Claude misag starts. A setting left at its default adds nothing, so the user's own Claude
     /// configuration decides.
     pub fn claude_settings(&self) -> Map<String, Value> {
         let mut keys = Map::new();
@@ -71,7 +71,7 @@ pub fn skips_permissions(args: &[String]) -> bool {
     })
 }
 
-/// Fails unless `dir` is a directory raterm can use, saying why.
+/// Fails unless `dir` is a directory misag can use, saying why.
 fn check_folder(dir: &str) -> Result<(), String> {
     match std::fs::metadata(crate::session::expand_tilde(dir)) {
         Ok(meta) if meta.is_dir() => Ok(()),

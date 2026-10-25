@@ -13,11 +13,11 @@ import {
   House,
   Menu,
   Pencil,
+  Pin,
   Play,
   RefreshCw,
   Settings,
   Square,
-  SquareArrowOutUpRight,
   SquareTerminal,
   Trash2,
   Workflow,
@@ -32,7 +32,7 @@ export const CLAUDE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria
   </g>
 </svg>`;
 
-/** The Lucide icons raterm uses, by name: for `data-icon` attributes in index.html and for `icon()`. */
+/** The Lucide icons misag uses, by name: for `data-icon` attributes in index.html and for `icon()`. */
 const ICONS = {
   archive: Archive,
   "archive-restore": ArchiveRestore,
@@ -47,11 +47,11 @@ const ICONS = {
   house: House,
   menu: Menu,
   pencil: Pencil,
+  pin: Pin,
   play: Play,
   "refresh-cw": RefreshCw,
   settings: Settings,
   square: Square,
-  "square-arrow-out-up-right": SquareArrowOutUpRight,
   "square-terminal": SquareTerminal,
   "trash-2": Trash2,
   workflow: Workflow,
@@ -73,7 +73,7 @@ export function fillIcons(root: ParentNode = document) {
   for (const el of root.querySelectorAll<HTMLElement>("[data-icon]")) {
     const name = el.dataset.icon ?? "";
     if (!Object.hasOwn(ICONS, name)) {
-      console.error("raterm: unknown icon", name);
+      console.error("misag: unknown icon", name);
       continue;
     }
     el.replaceChildren(icon(name as IconName, Number(el.dataset.size) || 16));

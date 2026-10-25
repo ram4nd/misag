@@ -104,8 +104,14 @@ body.dragging-toolbox, body.dragging-toolbox * { cursor: grabbing !important; us
 .toolbox .toggle { flex: 1; display: flex; align-items: center; gap: 4px; text-align: left; font-weight: 600; }
 .toolbox .chevron { width: 14px; transition: transform .1s; }
 .toolbox.collapsed .chevron { transform: rotate(-90deg); }
-/* The gutter keeps the scrollbar off the buttons at the right edge of rows. */
+/* The gutter keeps the scrollbar off the buttons at the right edge of rows. WebKitGTK
+   draws overlay scrollbars over the content and ignores the gutter for them; a styled
+   ::-webkit-scrollbar is a classic one that takes its own width. */
 .toolbox .body { flex: 1; min-height: 0; overflow: auto; scrollbar-gutter: stable; }
+.toolbox .body::-webkit-scrollbar { width: 8px; }
+.toolbox .body::-webkit-scrollbar-track { background: transparent; }
+.toolbox .body::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; border: 2px solid var(--panel); }
+.toolbox .body::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 .toolbox.collapsed .body { display: none; }
 
 /* ---------- file tree ---------- */
@@ -272,7 +278,7 @@ svg.lucide { display: block; flex: none; }
 .flow-editor .problems p { margin: 0 0 4px; }
 .flow-editor .problems ul { margin: 0; padding-left: 18px; }
 
-/* Drawflow's own stylesheet lays the canvas out; these give the steps raterm's look. */
+/* Drawflow's own stylesheet lays the canvas out; these give the steps misag's look. */
 .flow-editor .drawflow .drawflow-node {
   width: 180px; min-height: 0; padding: 8px 12px; border-radius: 8px;
   background: var(--surface); color: var(--fg); border: 1px solid var(--line);
@@ -321,17 +327,21 @@ svg.lucide { display: block; flex: none; }
 #history-box .sessions li { display: flex; align-items: center; padding-right: 6px; }
 #history-box .sessions li:hover { background: var(--hover); }
 #history-box .resume {
-  flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 6px; padding: 3px 4px 3px 10px;
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; padding: 3px 4px 3px 10px;
   border-radius: 0; background: none; text-align: left; white-space: nowrap;
 }
-#history-box .title { flex: 1; overflow: hidden; text-overflow: ellipsis; }
-#history-box .age { flex: none; color: var(--muted); font-size: 11px; }
-#history-box .new-tab {
+#history-box .title { overflow: hidden; text-overflow: ellipsis; }
+#history-box .meta { display: flex; gap: 6px; font-size: 11px; color: var(--muted); }
+#history-box .folder { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#history-box .age { flex: none; }
+#history-box .pin {
   flex: none; display: grid; visibility: hidden; place-items: center; width: 22px; height: 22px; padding: 0;
   border-radius: 4px; background: none; color: var(--muted);
 }
-#history-box li:hover .new-tab, #history-box li:focus-within .new-tab { visibility: visible; }
-#history-box .new-tab:hover { background: var(--press); color: var(--fg); }
+#history-box li:hover .pin, #history-box li:focus-within .pin, #history-box li.pinned .pin { visibility: visible; }
+#history-box .pin:hover { background: var(--press); color: var(--fg); }
+#history-box li.pinned .pin { color: var(--accent); }
+#history-box li.pinned .pin svg { fill: currentColor; }
 #history-box .hint, #history-box .error, #history-box .note { margin: 4px 10px; color: var(--muted); }
 #history-box .open { flex: none; color: var(--accent); font-size: 11px; }
 #history-box .error { color: #b3261e; }

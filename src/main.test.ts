@@ -134,7 +134,7 @@ type Layout = {
 const TAB_POLL_MS = 2_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SESSION = "0f8fad5b-d9cb-469f-a165-70867728950e";
-const LOG = "/home/me/.local/share/com.tag1.raterm/hook.log";
+const LOG = "/home/me/.local/share/io.github.ram4nd.misag/hook.log";
 
 let calls: Call[];
 let spawnBehaviour: (args: SpawnCall, id: number) => number | Promise<number>;
@@ -190,13 +190,15 @@ let activeRuns: Run[];
 /** The prompt flow_start and flow_continue return; a string makes them fail with it. */
 let runPrompt: string | null;
 let runRefusal: string | null;
-type Past = { id: string; title: string; cwd: string; modified: number };
-/** What claude_history lists per folder; other folders have none. */
-let pastSessions: Record<string, Past[]>;
-/** claude_history for a folder waits for its promise here, so a test can hold an answer back. */
-let historyGates: Record<string, Promise<void>>;
+type Past = { id: string; title: string; cwd: string; modified: number; pinned?: boolean };
+/** What claude_history lists: the sessions of every folder, newest first. */
+let pastSessions: Past[];
 /** How many transcripts claude_history reports it could not read. */
 let historyUnreadable: number;
+/** The sessions pinned with claude_session_pin, listed first by claude_history. */
+let pinnedSessions: Set<string>;
+/** Gates the next claude_history calls wait on, one each, in order. */
+let historyGates: Promise<void>[];
 /** The session each tab's hook reported, by tab id (claude_tab_sessions). */
 let tabSessions: Record<string, string>;
 
@@ -349,9 +351,10 @@ beforeEach(() => {
   activeRuns = [];
   runPrompt = null;
   runRefusal = null;
-  pastSessions = {};
-  historyGates = {};
+  pastSessions = [];
   historyUnreadable = 0;
+  pinnedSessions = new Set();
+  historyGates = [];
   tabSessions = {};
   fsTree = { "~": [{ name: "work", dir: true }] };
   picker.picked = null;
@@ -398,11 +401,22 @@ beforeEach(() => {
       });
     }
     if (cmd === "claude_history") {
-      const { dir, limit } = args as { dir: string; limit: number };
-      return (historyGates[dir] ?? Promise.resolve()).then(() => {
-        const all = pastSessions[dir] ?? [];
-        return { sessions: all.slice(0, limit), more: all.length > limit, unreadable: historyUnreadable };
+      const { limit } = args as { limit: number };
+      const gate = historyGates.shift() ?? Promise.resolve();
+      // Read when called, answered when the gate opens.
+      const page = pastSessions.slice();
+      const pins = new Set(pinnedSessions);
+      return gate.then(() => {
+        const pinned = page.filter((p) => pins.has(p.id)).map((p) => ({ ...p, pinned: true }));
+        const rest = page.filter((p) => !pins.has(p.id)).map((p) => ({ ...p, pinned: false }));
+        return { sessions: [...pinned, ...rest.slice(0, limit)], more: rest.length > limit, unreadable: historyUnreadable };
       });
+    }
+    if (cmd === "claude_session_pin") {
+      const { id, pinned } = args as { id: string; pinned: boolean };
+      if (pinned) pinnedSessions.add(id);
+      else pinnedSessions.delete(id);
+      return null;
     }
     if (cmd === "claude_tab_sessions") return tabSessions;
     if (cmd === "settings_load") return settingsLoadGate.then(() => storedSettings);
@@ -578,9 +592,9 @@ describe("tab labels", () => {
   test("the label follows the tab's current directory", async () => {
     await boot();
     await clickClaude();
-    liveCwds[1] = "/home/me/src/raterm";
+    liveCwds[1] = "/home/me/src/misag";
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    expect(tabNames()).toEqual(["raterm"]);
+    expect(tabNames()).toEqual(["misag"]);
     liveCwds[1] = "/home/me";
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     expect(tabNames()).toEqual(["~"]);
@@ -880,11 +894,11 @@ describe("new terminal dialog", () => {
     await clickTerminal(true);
     expect(dialog().open).toBe(true);
     field("name")!.value = "agent";
-    field("cwd")!.value = "~/src/raterm";
+    field("cwd")!.value = "~/src/misag";
     dialog().close("ok");
     for (let i = 0; i < 3; i++) await flush();
     expect(tabNames()).toEqual(["agent"]);
-    expect(spawns()[0]).toMatchObject({ kind: "terminal", cwd: "~/src/raterm" });
+    expect(spawns()[0]).toMatchObject({ kind: "terminal", cwd: "~/src/misag" });
   });
 
   test("can open a Claude tab instead", async () => {
@@ -1122,7 +1136,7 @@ describe("saving tabs", () => {
       expect(noticeText()).not.toContain("wrapper");
       now += 11_000;
       await win.closeRequested!();
-      expect(noticeText()).toContain("Claude in “shell 1” did not start through raterm's claude wrapper");
+      expect(noticeText()).toContain("Claude in “shell 1” did not start through Mischief of Agents's claude wrapper");
       expect(savedSession()).toBeNull();
     });
   });
@@ -1134,7 +1148,7 @@ describe("saving tabs", () => {
     failing.add("claude_open_sessions");
     await win.closeRequested!();
     expect(lastSaved()?.tabs[0]).toMatchObject({ kind: "terminal", claudeSession: null });
-    expect(error).toHaveBeenCalledWith("raterm: could not check for Claude sessions in terminal tabs", "claude_open_sessions failed");
+    expect(error).toHaveBeenCalledWith("misag: could not check for Claude sessions in terminal tabs", "claude_open_sessions failed");
     error.mockRestore();
   });
 
@@ -1846,14 +1860,14 @@ describe("failures", () => {
   });
 
   test("the backend's store status is shown, and only dismissible notices can be dismissed", async () => {
-    storeReport.store = { state: "notSaving", reason: "the database was written by a newer raterm" };
+    storeReport.store = { state: "notSaving", reason: "the database was written by a newer Mischief of Agents" };
     await boot();
-    expect(noticeText()).toContain("Tabs are not being saved: the database was written by a newer raterm.");
+    expect(noticeText()).toContain("Tabs are not being saved: the database was written by a newer Mischief of Agents.");
     expect(dismissButton().hidden).toBe(true);
   });
 
   test("a recovery notice can be dismissed and stays dismissed", async () => {
-    storeReport.store = { state: "recovered", notice: "Saved tabs could not be read, so raterm started fresh." };
+    storeReport.store = { state: "recovered", notice: "Saved tabs could not be read, so Mischief of Agents started fresh." };
     await boot();
     expect(noticeVisible()).toBe(true);
     dismissButton().click();
@@ -1883,7 +1897,7 @@ describe("failures", () => {
     failing.add("layout_save");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await expect(win.closeRequested!()).resolves.not.toThrow();
-    expect(error).toHaveBeenCalledWith("raterm: could not save tabs", "layout_save failed");
+    expect(error).toHaveBeenCalledWith("misag: could not save tabs", "layout_save failed");
     expect(win.prevented).toBe(true);
     expect(noticeText()).toContain("Close the window again to quit without saving.");
     await win.closeRequested!();
@@ -2015,9 +2029,9 @@ describe("edge cases", () => {
   test("hook failures logged by the backend are picked up by the status check", async () => {
     await boot();
     expect(noticeVisible()).toBe(false);
-    storeReport.hookProblem = { at: 2000, message: "schema 2 in raterm.db, this binary knows 1", log: LOG };
+    storeReport.hookProblem = { at: 2000, message: "schema 2 in misag.db, this binary knows 1", log: LOG };
     await vi.advanceTimersByTimeAsync(31_000);
-    expect(noticeText()).toContain("Claude session tracking failed (schema 2 in raterm.db");
+    expect(noticeText()).toContain("Claude session tracking failed (schema 2 in misag.db");
     expect(noticeText()).toContain(`see ${LOG}.`);
   });
 
@@ -2067,7 +2081,7 @@ describe("edge cases", () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await vi.advanceTimersByTimeAsync(61_000);
     expect(noticeText()).not.toContain("has not reported");
-    expect(error).toHaveBeenCalledWith("raterm: could not check the session report", "claude_reported failed");
+    expect(error).toHaveBeenCalledWith("misag: could not check the session report", "claude_reported failed");
     failing.delete("claude_reported");
     await vi.advanceTimersByTimeAsync(31_000);
     expect(noticeText()).toContain("has not reported");
@@ -3075,85 +3089,116 @@ describe("session history", () => {
   const titles = () => rows().map((li) => li.querySelector(".title")!.textContent);
   const hint = () => box().querySelector<HTMLElement>(".hint")!;
   const OTHER = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+  const THIRD = "9b2e1f0c-1d2e-4f3a-8b4c-5d6e7f8a9b0c";
+  const FOURTH = "3d813cbb-47fb-42ba-91df-831e1593ac29";
   const past = (id: string, title: string, cwd = "/home/me/work"): Past => ({ id, title, cwd, modified: Date.now() - 60_000 });
 
   beforeEach(() => {
-    pastSessions = { "/home/me/work": [past(SESSION, "Fix the build"), past(OTHER, "Add tests")] };
+    pastSessions = [past(SESSION, "Fix the build"), past(OTHER, "Add tests")];
   });
 
-  test("lists the Claude sessions of the active tab's folder, and follows the active tab", async () => {
+  test("lists the Claude sessions of every folder, with their folders, whatever tab is active", async () => {
+    pastSessions.push(past(THIRD, "Elsewhere", "/elsewhere"), past(FOURTH, "At home", "/home/me"));
     await boot();
-    expect(rows()).toHaveLength(0);
-    expect(hint().hidden).toBe(false);
-    await openClaudeTabs(1);
     await settle();
-    expect(titles()).toEqual(["Fix the build", "Add tests"]);
-    expect(callsOf("claude_history").at(-1)!.args).toEqual({ dir: "/home/me/work", limit: 10 });
+    expect(titles()).toEqual(["Fix the build", "Add tests", "Elsewhere", "At home"]);
+    expect(rows().map((li) => li.querySelector(".folder")!.textContent)).toEqual(["work", "work", "elsewhere", "~"]);
+    expect(callsOf("claude_history").at(-1)!.args).toEqual({ limit: 10 });
+    expect(hint().hidden).toBe(true);
+    await openClaudeTabs(1);
     liveCwds = { 1: "/elsewhere" };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     await settle();
-    expect(callsOf("claude_history").at(-1)!.args).toEqual({ dir: "/elsewhere", limit: 10 });
-    expect(rows()).toHaveLength(0);
+    expect(titles()).toEqual(["Fix the build", "Add tests", "Elsewhere", "At home"]);
+  });
+
+  test("says so when Claude has no sessions saved", async () => {
+    pastSessions = [];
+    await boot();
+    await settle();
+    expect(hint().hidden).toBe(false);
     expect(hint().textContent).toContain("No Claude sessions");
   });
 
-  test("clicking a session resumes it in the active Claude tab", async () => {
+  test("clicking a session always resumes it in a new Claude tab in its folder", async () => {
+    pastSessions.push(past(THIRD, "Elsewhere", "/elsewhere"));
     await boot();
     await openClaudeTabs(1);
     await settle();
     rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
     await settle();
-    await vi.advanceTimersByTimeAsync(200);
-    expect(typed()).toEqual([`\x1b[200~/resume ${OTHER}\x1b[201~`, "\r"]);
-  });
-
-  test("in a terminal tab it starts claude at the shell prompt, or resumes in the Claude running there", async () => {
-    await boot();
-    liveCwds = { 1: "/home/me/work" };
-    await clickTerminal();
-    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    await settle();
-    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
-    await settle();
-    expect(typed()).toEqual([`claude --resume ${SESSION}\r`]);
-    openClaudes = { 1: OTHER };
-    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
-    await settle();
-    await vi.advanceTimersByTimeAsync(200);
-    expect(typed().slice(1)).toEqual([`\x1b[200~/resume ${SESSION}\x1b[201~`, "\r"]);
-  });
-
-  test("an exited tab is not typed into", async () => {
-    await boot();
-    await openClaudeTabs(1);
-    await settle();
-    spawns()[0].onExit.onmessage(0);
-    await settle();
-    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
-    await settle();
-    expect(typed()).toEqual([]);
-    expect(noticeText()).toContain("not running");
-  });
-
-  test("the new-tab button resumes the session in a new Claude tab in its folder", async () => {
-    await boot();
-    await openClaudeTabs(1);
-    await settle();
-    rows()[1].querySelector<HTMLButtonElement>("button.new-tab")!.click();
-    await settle();
     expect(spawns()[1]).toMatchObject({ kind: "claude", claudeSession: OTHER, cwd: "/home/me/work" });
-    expect(tabs()).toHaveLength(2);
+    rows()[2].querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    expect(spawns()[2]).toMatchObject({ kind: "claude", claudeSession: THIRD, cwd: "/elsewhere" });
+    expect(tabs()).toHaveLength(3);
+    expect(typed()).toEqual([]);
+  });
+
+  test("the pin button keeps a session at the top, and unpins it again", async () => {
+    pastSessions.push(past(THIRD, "Third"));
+    await boot();
+    await settle();
+    const pin = (i: number) => rows()[i].querySelector<HTMLButtonElement>("button.pin")!;
+    expect(pin(2).getAttribute("aria-pressed")).toBe("false");
+    pin(2).click();
+    // One request at a time.
+    expect(pin(2).disabled).toBe(true);
+    await settle();
+    expect(callsOf("claude_session_pin").at(-1)!.args).toEqual({ id: THIRD, pinned: true });
+    expect(titles()).toEqual(["Third", "Fix the build", "Add tests"]);
+    expect(pin(0).getAttribute("aria-pressed")).toBe("true");
+    expect(spawns()).toHaveLength(0);
+    pin(0).click();
+    await settle();
+    expect(callsOf("claude_session_pin").at(-1)!.args).toEqual({ id: THIRD, pinned: false });
+    expect(titles()).toEqual(["Fix the build", "Add tests", "Third"]);
+  });
+
+  test("a failed pin is shown and changes nothing, and the next pin clears the notice", async () => {
+    await boot();
+    await settle();
+    const pin = (i: number) => rows()[i].querySelector<HTMLButtonElement>("button.pin")!;
+    const reads = callsOf("claude_history").length;
+    failing.add("claude_session_pin");
+    pin(1).click();
+    await settle();
+    expect(noticeText()).toContain("could not be pinned");
+    expect(callsOf("claude_history")).toHaveLength(reads);
+    expect(titles()).toEqual(["Fix the build", "Add tests"]);
+    expect(pin(1).getAttribute("aria-pressed")).toBe("false");
+    expect(pin(1).disabled).toBe(false);
+    failing.delete("claude_session_pin");
+    pin(1).click();
+    await settle();
+    expect(titles()).toEqual(["Add tests", "Fix the build"]);
+    expect(notice().textContent).not.toContain("could not be pinned");
+  });
+
+  test("an answer overtaken by a later read is dropped", async () => {
+    await boot();
+    await settle();
+    let open!: () => void;
+    historyGates.push(new Promise((resolve) => (open = resolve)));
+    box().querySelector<HTMLButtonElement>(".refresh")!.click();
+    pastSessions = [past(THIRD, "Newer")];
+    box().querySelector<HTMLButtonElement>(".refresh")!.click();
+    await settle();
+    expect(titles()).toEqual(["Newer"]);
+    open();
+    await settle();
+    expect(titles()).toEqual(["Newer"]);
   });
 
   test("shows the newest 10, and Load more shows 10 more until there are none", async () => {
     const many = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
-    pastSessions = { "/home/me/work": many, "/elsewhere": many };
+    pastSessions = many;
     await boot();
     await openClaudeTabs(1);
     await settle();
     const more = () => box().querySelector<HTMLButtonElement>("button.load-more")!;
     expect(rows()).toHaveLength(10);
-    expect(callsOf("claude_history").at(-1)!.args).toEqual({ dir: "/home/me/work", limit: 10 });
+    expect(callsOf("claude_history").at(-1)!.args).toEqual({ limit: 10 });
     more().click();
     await settle();
     expect(rows()).toHaveLength(20);
@@ -3161,12 +3206,6 @@ describe("session history", () => {
     await settle();
     expect(rows()).toHaveLength(25);
     expect(more().hidden).toBe(true);
-    // Another folder starts again at 10.
-    liveCwds = { 1: "/elsewhere" };
-    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    await settle();
-    expect(rows()).toHaveLength(10);
-    expect(more().hidden).toBe(false);
   });
 
   test("a session open in a tab is marked, and clicking it shows that tab instead of resuming", async () => {
@@ -3179,36 +3218,19 @@ describe("session history", () => {
     rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
     await settle();
     expect(tabs()[0].classList.contains("active")).toBe(true);
-    rows()[1].querySelector<HTMLButtonElement>("button.new-tab")!.click();
-    await settle();
     expect(spawns()).toHaveLength(2);
     expect(typed()).toEqual([]);
-  });
-
-  test("an answer for a folder the tab has left is dropped", async () => {
-    pastSessions["/elsewhere"] = [past(OTHER, "Elsewhere", "/elsewhere")];
-    let release!: () => void;
-    historyGates["/home/me/work"] = new Promise((r) => (release = r));
-    await boot();
-    await openClaudeTabs(1);
-    await settle();
-    liveCwds = { 1: "/elsewhere" };
-    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    await settle();
-    release();
-    await settle();
-    expect(titles()).toEqual(["Elsewhere"]);
   });
 
   test("a reload that changes nothing keeps the rows, and the focus in them", async () => {
     await boot();
     await openClaudeTabs(1);
     await settle();
-    const button = rows()[1].querySelector<HTMLButtonElement>("button.new-tab")!;
+    const button = rows()[1].querySelector<HTMLButtonElement>("button.pin")!;
     button.focus();
     box().querySelector<HTMLButtonElement>(".refresh")!.click();
     await settle();
-    expect(rows()[1].querySelector("button.new-tab")).toBe(button);
+    expect(rows()[1].querySelector("button.pin")).toBe(button);
     expect(document.activeElement).toBe(button);
   });
 
@@ -3235,7 +3257,7 @@ describe("session history", () => {
   });
 
   test("a failed Load more keeps the sessions shown, and the next try asks for the same page", async () => {
-    pastSessions["/home/me/work"] = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
+    pastSessions = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
     await boot();
     await openClaudeTabs(1);
     await settle();
@@ -3262,40 +3284,11 @@ describe("session history", () => {
     expect(note.textContent).toContain("2 sessions could not be read");
   });
 
-  test("a tab running a flow is not switched to another session", async () => {
-    await boot();
-    await openClaudeTabs(1);
-    activeRuns = [{
-      id: 5, flowId: 1, flowName: "Deploy", tabId: spawns()[0].tabId, stepId: "p", step: "Fix",
-      status: "running", note: null, outputs: ["pass"], steps: 1,
-    }];
-    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    await settle();
-    rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
-    await settle();
-    await vi.advanceTimersByTimeAsync(200);
-    expect(typed()).toEqual([]);
-    expect(noticeText()).toContain("flow");
-  });
-
-  test("when a terminal tab cannot be checked for Claude, nothing is typed", async () => {
-    await boot();
-    liveCwds = { 1: "/home/me/work" };
-    await clickTerminal();
-    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
-    await settle();
-    failing.add("claude_open_sessions");
-    rows()[0].querySelector<HTMLButtonElement>("button.resume")!.click();
-    await settle();
-    expect(typed()).toEqual([]);
-    expect(noticeText()).toContain("could not tell");
-  });
-
   test("the refresh button reads the sessions again, and a failure is shown", async () => {
     await boot();
     await openClaudeTabs(1);
     await settle();
-    pastSessions["/home/me/work"].push(past("9b2e1f0c-1d2e-4f3a-8b4c-5d6e7f8a9b0c", "Third"));
+    pastSessions.push(past(THIRD, "Third"));
     box().querySelector<HTMLButtonElement>(".refresh")!.click();
     await settle();
     expect(titles()).toEqual(["Fix the build", "Add tests", "Third"]);
@@ -3403,11 +3396,11 @@ describe("toolbox order", () => {
   });
 
   test("a stored order with unknown or missing toolboxes keeps the others in place", async () => {
-    localStorage.setItem("raterm.toolboxOrder", JSON.stringify(["flows-box", "gone-box"]));
+    localStorage.setItem("misag.toolboxOrder", JSON.stringify(["flows-box", "gone-box"]));
     await boot();
     expect(order()).toEqual(["flows-box", "workspace-box", "history-box"]);
     vi.resetModules();
-    localStorage.setItem("raterm.toolboxOrder", "not json");
+    localStorage.setItem("misag.toolboxOrder", "not json");
     await boot();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
   });

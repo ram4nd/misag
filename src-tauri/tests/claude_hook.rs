@@ -1,8 +1,8 @@
-//! Runs the real `raterm` binary as Claude's hook, the way Claude invokes it: the
+//! Runs the real `misag` binary as Claude's hook, the way Claude invokes it: the
 //! hook command through a shell, with the payload on stdin.
 
-use raterm_lib::layout::{Layout, Tab, TabId, TabKind};
-use raterm_lib::{claude, db};
+use misag_lib::layout::{Layout, Tab, TabId, TabKind};
+use misag_lib::{claude, db};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -62,8 +62,8 @@ fn records_the_session_through_a_path_with_spaces() {
     // Claude runs the hook through a shell, so the binary path must survive quoting.
     let bin_dir = dir.join("my apps");
     std::fs::create_dir_all(&bin_dir).unwrap();
-    let exe = bin_dir.join("raterm");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_raterm"), &exe).unwrap();
+    let exe = bin_dir.join("misag");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_misag"), &exe).unwrap();
     let (_app, db_path) = app_db(&dir);
 
     let env = [(claude::TAB_ENV, "tab-1"), (claude::DB_ENV, db_path.to_str().unwrap())];
@@ -74,7 +74,7 @@ fn records_the_session_through_a_path_with_spaces() {
 #[test]
 fn records_the_claude_process_with_the_session() {
     let dir = temp_dir("hook-pid");
-    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let (_app, db_path) = app_db(&dir);
     let env = [(claude::TAB_ENV, "t"), (claude::DB_ENV, db_path.to_str().unwrap()), (claude::PID_ENV, "4242")];
     assert!(run_hook(exe, &env, &payload(SESSION)).success());
@@ -88,7 +88,7 @@ fn records_the_claude_process_with_the_session() {
 #[test]
 fn a_missing_claude_pid_is_recorded_and_logged() {
     let dir = temp_dir("hook-no-pid");
-    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let (_app, db_path) = app_db(&dir);
     let env = [(claude::TAB_ENV, "t"), (claude::DB_ENV, db_path.to_str().unwrap()), (claude::PID_ENV, "")];
     assert!(run_hook(exe, &env, &payload(SESSION)).success());
@@ -100,7 +100,7 @@ fn a_missing_claude_pid_is_recorded_and_logged() {
 #[test]
 fn never_fails_claude_and_logs_why() {
     let dir = temp_dir("hook-bad");
-    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let (app, db_path) = app_db(&dir);
     let db_str = db_path.to_str().unwrap();
     assert!(run_hook(exe, &[(claude::TAB_ENV, "t"), (claude::DB_ENV, db_str)], "garbage").success());
@@ -110,7 +110,7 @@ fn never_fails_claude_and_logs_why() {
     let log = std::fs::read_to_string(dir.join(claude::HOOK_LOG)).unwrap();
     let entries: Vec<_> = log.lines().map(|l| l.split_once(' ').unwrap().1).collect();
     assert!(entries[0].starts_with("t could not record") && entries[0].contains("bad hook payload"), "{log}");
-    assert!(entries[1].starts_with("- ") && entries[1].contains("RATERM_TAB"), "{log}");
+    assert!(entries[1].starts_with("- ") && entries[1].contains("MISAG_TAB"), "{log}");
     assert!(entries[2].starts_with("- "), "an invalid tab id is not logged as one: {log}");
     assert!(claude::hook_problem(&app).is_some(), "the app sees the failures");
 }
@@ -120,7 +120,7 @@ fn never_fails_claude_and_logs_why() {
 #[test]
 fn a_panic_is_logged_and_still_exits_zero() {
     let dir = temp_dir("hook-panic");
-    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let (app, db_path) = app_db(&dir);
     let env = [
         (claude::TAB_ENV, "t"),
@@ -138,7 +138,7 @@ fn a_panic_is_logged_and_still_exits_zero() {
 #[test]
 fn does_not_create_a_database_the_app_never_made() {
     let dir = temp_dir("hook-nodb");
-    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let db_path = dir.join(db::FILE);
     let env = [(claude::TAB_ENV, "t"), (claude::DB_ENV, db_path.to_str().unwrap())];
     assert!(run_hook(exe, &env, &payload(SESSION)).success());
@@ -148,7 +148,7 @@ fn does_not_create_a_database_the_app_never_made() {
 #[test]
 fn hooks_and_layout_saves_can_run_at_the_same_time() {
     let dir = temp_dir("hook-concurrent");
-    let exe = Path::new(env!("CARGO_BIN_EXE_raterm"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let (db, db_path) = app_db(&dir);
     let tabs: Vec<Tab> = (0..8)
         .map(|i| Tab {
@@ -187,7 +187,7 @@ fn run_stop_hook(env: &[(&str, &str)], reply: &str) -> String {
     let payload = serde_json::json!({
         "session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": false, "last_assistant_message": reply,
     });
-    let mut child = start_hook(Path::new(env!("CARGO_BIN_EXE_raterm")), env, &payload.to_string());
+    let mut child = start_hook(Path::new(env!("CARGO_BIN_EXE_misag")), env, &payload.to_string());
     let mut out = String::new();
     std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
     assert!(child.wait().unwrap().success());
@@ -196,7 +196,7 @@ fn run_stop_hook(env: &[(&str, &str)], reply: &str) -> String {
 
 #[test]
 fn a_stop_moves_the_tabs_flow_run_on_and_sends_the_next_prompt() {
-    use raterm_lib::{flows, runs};
+    use misag_lib::{flows, runs};
     let dir = temp_dir("hook-stop");
     let (app, db_path) = app_db(&dir);
     let graph: flows::Graph = serde_json::from_value(serde_json::json!({ "version": 1, "nodes": [
@@ -227,12 +227,12 @@ fn stop_payloads_it_cannot_use_are_logged_without_output() {
     let dir = temp_dir("hook-stop-bad");
     let (_app, db_path) = app_db(&dir);
     let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
-    let mut child = start_hook(Path::new(env!("CARGO_BIN_EXE_raterm")), &env, r#"{"hook_event_name":"Stop","last_assistant_message":7}"#);
+    let mut child = start_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, r#"{"hook_event_name":"Stop","last_assistant_message":7}"#);
     let mut out = String::new();
     std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
     assert!(child.wait().unwrap().success());
     assert_eq!(out, "");
-    assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_raterm")), &env, r#"{"hook_event_name":"Notification"}"#).success());
+    assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, r#"{"hook_event_name":"Notification"}"#).success());
     let log = std::fs::read_to_string(dir.join(claude::HOOK_LOG)).unwrap();
     assert!(log.contains("could not move the flow run on"), "{log}");
     assert!(log.contains("Notification"), "{log}");

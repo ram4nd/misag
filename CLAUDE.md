@@ -1,4 +1,4 @@
-# raterm
+# Mischief of Agents
 
 ## Git
 

@@ -1,7 +1,7 @@
-//! raterm's SQLite store (`raterm.db` in the app data directory): the open tabs,
+//! misag's SQLite store (`misag.db` in the app data directory): the open tabs,
 //! app state, and the Claude Code session each Claude tab is currently in.
 //!
-//! The app and the Claude session hook (`raterm --claude-hook`, one process per
+//! The app and the Claude session hook (`misag --claude-hook`, one process per
 //! event) write concurrently, so the database runs in WAL mode with a busy timeout.
 //! Only the app migrates the schema; the hook refuses to touch a database whose
 //! schema it does not know exactly.
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const FILE: &str = "raterm.db";
+pub const FILE: &str = "misag.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Applied in order; `PRAGMA user_version` records how many have run.
@@ -51,7 +51,7 @@ const MIGRATIONS: &[&str] = &[r#"
 "#, r#"
     -- The user's settings: one row, one column per setting. A new setting is a new
     -- migration adding a column with a default; like every schema change, it makes
-    -- older raterm versions refuse the database.
+    -- older misag versions refuse the database.
     CREATE TABLE settings (
         id               INTEGER PRIMARY KEY CHECK (id = 1),
         skip_permissions INTEGER NOT NULL DEFAULT 0 CHECK (skip_permissions IN (0, 1))
@@ -110,13 +110,20 @@ const MIGRATIONS: &[&str] = &[r#"
         at      INTEGER NOT NULL
     );
     CREATE INDEX flow_run_events_by_run ON flow_run_events (run_id);
+"#, r#"
+    -- The Claude sessions pinned to the top of the Session history box, which
+    -- orders them by activity; `pinned_at` is only kept for the record.
+    CREATE TABLE pinned_sessions (
+        session_id TEXT PRIMARY KEY,
+        pinned_at  INTEGER NOT NULL
+    );
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
 #[derive(Debug, PartialEq)]
 pub enum OpenError {
     Corrupt(String),
-    /// Written by a newer raterm; this version must not touch it.
+    /// Written by a newer misag; this version must not touch it.
     TooNew { found: i64, known: i64 },
     Other(String),
 }
@@ -127,7 +134,7 @@ impl fmt::Display for OpenError {
             OpenError::Corrupt(e) => write!(f, "the database is damaged ({e})"),
             OpenError::TooNew { found, known } => write!(
                 f,
-                "the database was written by a newer raterm (schema {found}, this version knows {known})"
+                "the database was written by a newer Mischief of Agents (schema {found}, this version knows {known})"
             ),
             OpenError::Other(e) => write!(f, "the database could not be opened ({e})"),
         }
@@ -157,7 +164,7 @@ fn configure(conn: &Connection, path: &Path) -> Result<(), OpenError> {
         .pragma_update_and_check(None, "journal_mode", "wal", |r| r.get(0))
         .map_err(|e| classify("journal mode", e))?;
     if mode != "wal" {
-        eprintln!("raterm: {} runs in {mode} journal mode, not WAL; concurrent writes may wait", path.display());
+        eprintln!("misag: {} runs in {mode} journal mode, not WAL; concurrent writes may wait", path.display());
     }
     Ok(())
 }
@@ -181,7 +188,7 @@ pub fn connect(path: &Path) -> Result<Connection, OpenError> {
 
 /// Opens an existing database without creating or migrating it, and only if its
 /// schema is exactly the one this binary knows. Used by the hook, which may be a
-/// different raterm version than the running app. Across an upgrade that adds a
+/// different misag version than the running app. Across an upgrade that adds a
 /// migration, a new hook therefore refuses the old schema (and logs it) until the
 /// app has migrated: session changes in that window are not recorded.
 pub fn connect_existing(path: &Path) -> Result<Connection, String> {
@@ -259,7 +266,7 @@ pub struct Db {
     opened: SystemTime,
 }
 
-/// Unix seconds, the one time format raterm stores and compares.
+/// Unix seconds, the one time format misag stores and compares.
 pub(crate) fn unix_secs(time: SystemTime) -> u64 {
     // Before 1970 only on a badly wrong clock; 0 then reads as "long ago".
     time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -289,7 +296,7 @@ impl Db {
     }
 
     fn in_memory(reason: String) -> Self {
-        eprintln!("raterm: {reason}; tabs will not be saved this run");
+        eprintln!("misag: {reason}; tabs will not be saved this run");
         let mut conn = Connection::open_in_memory().expect("in-memory SQLite always opens");
         enforce_foreign_keys(&conn).expect("in-memory SQLite has foreign keys");
         migrate(&mut conn).expect("migrations apply to an empty in-memory database");
@@ -311,13 +318,13 @@ impl Db {
             Err(OpenError::Corrupt(e)) => e,
             Err(other) => return Self::in_memory(other.to_string()),
         };
-        eprintln!("raterm: {damage}; moving the database aside and starting fresh");
+        eprintln!("misag: {damage}; moving the database aside and starting fresh");
         let aside = PathBuf::from(format!("{}.broken-{}", path.display(), unix_secs(SystemTime::now())));
         if let Err(e) = move_files(&database_files(&path), &database_files(&aside)) {
             return Self::in_memory(format!("the database is damaged and could not be moved aside ({e})"));
         }
         let notice = format!(
-            "Saved tabs could not be read, so raterm started fresh. The old database was kept at {}.",
+            "Saved tabs could not be read, so Mischief of Agents started fresh. The old database was kept at {}.",
             aside.display()
         );
         match Self::open_with_notice(path, Some(notice)) {
@@ -396,12 +403,12 @@ impl Db {
                 "terminal" => TabKind::Terminal {
                     command,
                     claude_session: claude_session.unwrap_or_else(|e| {
-                        eprintln!("raterm: tab {tab_id}: {e}; not reopening its Claude session");
+                        eprintln!("misag: tab {tab_id}: {e}; not reopening its Claude session");
                         None
                     }),
                 },
                 "claude" => TabKind::Claude { claude_session: claude_session.map_err(|e| format!("tab {tab_id}: {e}"))? },
-                _ => return Err(format!("tab {tab_id} has a kind this raterm does not know ({kind:?})")),
+                _ => return Err(format!("tab {tab_id} has a kind this version does not know ({kind:?})")),
             };
             tabs.push(Tab { tab_id, kind, name, renamed, cwd });
         }
@@ -409,7 +416,7 @@ impl Db {
         let active = match saved_active.as_deref().map(str::parse::<usize>) {
             Some(Ok(n)) => n,
             Some(Err(_)) => {
-                eprintln!("raterm: ignoring unreadable active tab {saved_active:?}");
+                eprintln!("misag: ignoring unreadable active tab {saved_active:?}");
                 0
             }
             None => 0,
@@ -498,6 +505,37 @@ impl Db {
         id.map(|id| SessionId::parse(&id).map_err(|e| format!("tab {tab_id}: {e}"))).transpose()
     }
 
+    /// The sessions pinned in the Session history box, in no particular order. A
+    /// row this version cannot read is left out (and logged).
+    pub fn pinned_sessions(&self) -> Result<Vec<SessionId>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT session_id FROM pinned_sessions").map_err(sql)?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).map_err(sql)?;
+        let mut pinned = Vec::new();
+        for row in rows {
+            match SessionId::parse(&row.map_err(sql)?) {
+                Ok(id) => pinned.push(id),
+                Err(e) => eprintln!("misag: pinned session: {e}"),
+            }
+        }
+        Ok(pinned)
+    }
+
+    /// Pins the session (pinning it again changes nothing) or unpins it.
+    pub fn set_session_pinned(&self, id: &SessionId, pinned: bool) -> Result<(), String> {
+        let conn = self.conn();
+        if pinned {
+            conn.execute(
+                "INSERT OR IGNORE INTO pinned_sessions (session_id, pinned_at) VALUES (?1, ?2)",
+                params![id.as_str(), now_secs()],
+            )
+        } else {
+            conn.execute("DELETE FROM pinned_sessions WHERE session_id = ?1", [id.as_str()])
+        }
+        .map(drop)
+        .map_err(sql)
+    }
+
     /// The session the hook last reported for every tab, by tab id. A row this
     /// version cannot read is left out (and logged).
     pub fn reported_sessions(&self) -> Result<HashMap<String, SessionId>, String> {
@@ -511,7 +549,7 @@ impl Db {
                 Ok(id) => {
                     sessions.insert(tab_id, id);
                 }
-                Err(e) => eprintln!("raterm: tab {tab_id}: {e}"),
+                Err(e) => eprintln!("misag: tab {tab_id}: {e}"),
             }
         }
         Ok(sessions)
@@ -549,7 +587,7 @@ impl Db {
 
     /// Drops hook reports for tabs that no longer exist, and forgets the Claude
     /// processes of the last run: they are gone, and a new process could reuse a
-    /// pid. Run at startup; the single-instance guard means no other raterm's tabs
+    /// pid. Run at startup; the single-instance guard means no other misag's tabs
     /// can be reporting.
     pub fn prune_claude_sessions(&self) -> Result<(), String> {
         self.conn()
@@ -754,7 +792,7 @@ fn move_files(from: &[PathBuf], to: &[PathBuf]) -> std::io::Result<()> {
         if let Err(e) = result {
             for (src, dst) in moved.into_iter().rev() {
                 if let Err(back) = std::fs::rename(dst, src) {
-                    eprintln!("raterm: could not move {} back: {back}", dst.display());
+                    eprintln!("misag: could not move {} back: {back}", dst.display());
                 }
             }
             return Err(e);
@@ -984,6 +1022,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn upgrading_adds_no_pinned_sessions() {
+        let path = temp_db("upgrade-pins");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.len() - 1;
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        drop(conn);
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.pinned_sessions().unwrap(), []);
+        let a = SessionId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
+        db.set_session_pinned(&a, true).unwrap();
+        assert_eq!(db.pinned_sessions().unwrap(), [a]);
+    }
+
+    #[test]
+    fn pinning_a_session_is_stored_until_it_is_unpinned() {
+        let db = Db::open(temp_db("pinned")).unwrap();
+        let a = SessionId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
+        let b = SessionId::parse("7c9e6679-7425-40de-944b-e07fc1f90ae7").unwrap();
+        assert_eq!(db.pinned_sessions().unwrap(), []);
+        db.set_session_pinned(&a, true).unwrap();
+        db.set_session_pinned(&b, true).unwrap();
+        // Pinning again changes nothing.
+        db.set_session_pinned(&a, true).unwrap();
+        assert_eq!(db.pinned_sessions().unwrap().len(), 2);
+        db.set_session_pinned(&a, false).unwrap();
+        assert_eq!(db.pinned_sessions().unwrap(), [b]);
+    }
+
+    #[test]
     fn the_schema_refuses_settings_values_it_does_not_know() {
         let path = temp_db("settings-check");
         let db = Db::open(path.clone()).unwrap();
@@ -1090,7 +1158,7 @@ pub(crate) mod tests {
         let db = Db::open(path.clone()).unwrap();
         db.save_layout(Layout { active: 0, tabs: vec![terminal_tab("a"), terminal_tab("b")] }).unwrap();
         let conn = connect(&path).unwrap();
-        // Simulates a newer raterm's kind; CHECK must be bypassed to write it.
+        // Simulates a newer misag's kind; CHECK must be bypassed to write it.
         conn.execute_batch("PRAGMA ignore_check_constraints = ON; UPDATE tabs SET kind = 'notes' WHERE tab_id = 'b';")
             .unwrap();
         assert!(db.load_layout().unwrap_err().contains("notes"));
@@ -1218,7 +1286,7 @@ pub(crate) mod tests {
         assert!(files_named(path.parent().unwrap(), &format!("{FILE}.broken-")).is_empty());
         assert_eq!(db.hook_path(), None);
         let StoreStatus::NotSaving { reason } = db.status() else { panic!("expected NotSaving") };
-        assert!(reason.contains("newer raterm"));
+        assert!(reason.contains("newer Mischief of Agents"));
     }
 
     #[test]
@@ -1310,7 +1378,7 @@ pub(crate) mod tests {
     fn a_non_utf8_path_is_not_used() {
         use std::os::unix::ffi::OsStrExt;
         let dir = crate::test_support::temp_dir("non-utf8");
-        let path = dir.join(std::ffi::OsStr::from_bytes(b"raterm-\xff.db"));
+        let path = dir.join(std::ffi::OsStr::from_bytes(b"misag-\xff.db"));
         assert!(matches!(Db::open(path.clone()), Err(OpenError::Other(_))));
         let db = Db::open_or_recover(Ok(path.clone()));
         assert_eq!(db.hook_path(), None, "the hook could not be told where it is");

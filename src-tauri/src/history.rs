@@ -12,8 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Titles are cut to this many characters.
 const MAX_TITLE: usize = 200;
-/// Claude Code cuts longer project folder names and appends a hash.
-const MAX_PROJECT_NAME: usize = 200;
+/// A listing that takes longer is logged, as the box reads every transcript's
+/// metadata every few seconds while it can be seen.
+const SLOW_LIST: std::time::Duration = std::time::Duration::from_millis(500);
 /// Longer transcript lines (tool output, pasted files) are skipped unread: the
 /// lines a title comes from are far shorter.
 const MAX_LINE: usize = 1 << 20;
@@ -24,14 +25,15 @@ const MAX_LINE: usize = 1 << 20;
 pub struct Past {
     pub id: SessionId,
     pub title: String,
-    /// The folder it was listed for, which is where Claude ran (a transcript that
-    /// names another folder is left out), and where `claude --resume` finds it.
+    /// The folder Claude ran in, as its transcript names it: where `claude --resume` finds it.
     pub cwd: String,
     /// When the transcript last changed, in unix milliseconds.
     pub modified: u64,
+    /// Pinned to the top of the box.
+    pub pinned: bool,
 }
 
-/// The newest conversations of a folder, as many as asked for.
+/// The pinned conversations, then the newest others, as many as asked for.
 #[derive(Serialize, Debug, PartialEq)]
 pub struct Page {
     pub sessions: Vec<Past>,
@@ -39,6 +41,10 @@ pub struct Page {
     pub more: bool,
     /// Transcripts left out because they could not be read.
     pub unreadable: usize,
+    /// Pinned conversations whose transcript is gone (Claude deletes old ones), so
+    /// their pins can be dropped. Empty when a folder could not be read in full.
+    #[serde(skip)]
+    pub gone_pins: Vec<SessionId>,
 }
 
 /// What a transcript says about its conversation.
@@ -80,33 +86,32 @@ enum Entry {
 #[derive(Default)]
 pub struct Cache(Mutex<HashMap<PathBuf, Entry>>);
 
-/// The name of Claude's project folder for `cwd`: every character other than an
-/// ASCII letter or digit becomes `-`.
-fn project_name(cwd: &str) -> String {
-    // Per UTF-16 unit, as Claude Code (JavaScript) does: a character outside the
-    // Basic Multilingual Plane becomes two dashes.
-    cwd.encode_utf16()
-        .map(|u| match char::from_u32(u32::from(u)) {
-            Some(c) if c.is_ascii_alphanumeric() => c,
-            _ => '-',
-        })
-        .collect()
-}
-
-/// The project folders that can hold `cwd`'s conversations. A name too long for
-/// Claude is cut and given a hash, so any folder with the cut name counts.
-fn project_dirs(projects: &Path, cwd: &str) -> Result<Vec<PathBuf>, String> {
-    let name = project_name(cwd);
-    if name.len() <= MAX_PROJECT_NAME {
-        return Ok(vec![projects.join(name)]);
-    }
-    let prefix = format!("{}-", &name[..MAX_PROJECT_NAME]);
+/// Every project folder (following links), and how many entries could not be read.
+fn project_dirs(projects: &Path) -> Result<(Vec<PathBuf>, usize), String> {
     let entries = match std::fs::read_dir(projects) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(format!("cannot read {}: {e}", projects.display())),
     };
-    Ok(entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&prefix)).map(|e| e.path()).collect())
+    let mut dirs = Vec::new();
+    let mut unreadable = 0;
+    for entry in entries {
+        match entry.and_then(|e| Ok((std::fs::metadata(e.path())?.is_dir(), e.path()))) {
+            Ok((true, path)) => dirs.push(path),
+            Ok((false, _)) => {}
+            Err(e) => {
+                eprintln!("misag: cannot read an entry of {}: {e}", projects.display());
+                unreadable += 1;
+            }
+        }
+    }
+    Ok((dirs, unreadable))
+}
+
+/// `cwd` without trailing slashes, the root staying `/`.
+fn trimmed(cwd: &str) -> &str {
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() { "/" } else { cwd }
 }
 
 /// One line of text: control characters and runs of whitespace become one space.
@@ -249,16 +254,14 @@ impl Cache {
         read.map(|(_, summary)| summary).map_err(|message| Unreadable { new: true, message })
     }
 
-    /// The newest `limit` conversations Claude saved in `cwd`, newest first.
-    /// Ones with no name, title or typed prompt, and ones of another folder whose
-    /// name maps to the same project folder, are left out. A missing projects
-    /// folder lists nothing.
-    pub fn list(&self, projects: &Path, cwd: &str, limit: usize) -> Result<Page, String> {
-        let cwd = cwd.trim_end_matches('/');
-        let cwd = if cwd.is_empty() { "/" } else { cwd };
-        let dirs = project_dirs(projects, cwd)?;
+    /// The `pinned` conversations Claude saved in any folder, then the newest
+    /// `limit` others, each newest first. Ones with no name, title or typed prompt
+    /// are left out, and so are ones that name no folder to resume them in. A
+    /// missing projects folder lists nothing.
+    pub fn list(&self, projects: &Path, limit: usize, pinned: &[SessionId]) -> Result<Page, String> {
+        let started = std::time::Instant::now();
+        let (dirs, mut unreadable) = project_dirs(projects)?;
         let mut files = Vec::new();
-        let mut unreadable = 0;
         for dir in &dirs {
             let entries = match std::fs::read_dir(dir) {
                 Ok(entries) => entries,
@@ -269,7 +272,7 @@ impl Cache {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
-                        eprintln!("raterm: cannot read {}: {e}", dir.display());
+                        eprintln!("misag: cannot read {}: {e}", dir.display());
                         unreadable += 1;
                         continue;
                     }
@@ -281,43 +284,56 @@ impl Cache {
                     Ok((true, modified, size)) => files.push((modified, size, id, path)),
                     Ok((false, ..)) => {}
                     Err(e) => {
-                        eprintln!("raterm: cannot read {}: {e}", path.display());
+                        eprintln!("misag: cannot read {}: {e}", path.display());
                         unreadable += 1;
                     }
                 }
             }
         }
+        // Only a complete listing tells that a pinned transcript is gone.
+        let gone_pins = if unreadable > 0 {
+            Vec::new()
+        } else {
+            pinned.iter().filter(|id| !files.iter().any(|f| &f.2 == *id)).cloned().collect()
+        };
         // Transcripts that have gone leave the cache.
         let seen: HashSet<&Path> = files.iter().map(|f| f.3.as_path()).collect();
-        self.entries().retain(|path, _| !path.parent().is_some_and(|p| dirs.iter().any(|d| d == p)) || seen.contains(path.as_path()));
+        self.entries().retain(|path, _| seen.contains(path.as_path()));
         files.sort_by_key(|f| std::cmp::Reverse(f.0));
-        let mut found = Vec::new();
-        for (modified, size, id, path) in files {
-            // One past the limit, to tell whether there are more.
-            if found.len() > limit {
-                break;
-            }
+        let (pins, files): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| pinned.contains(&f.2));
+        let mut past = |(modified, size, id, path): (SystemTime, u64, SessionId, PathBuf), is_pinned: bool| {
             // One unreadable transcript should not hide the others.
             let summary = match self.summary(&path, modified, size) {
                 Ok(summary) => summary,
                 Err(e) => {
                     if e.new {
-                        eprintln!("raterm: {}", e.message);
+                        eprintln!("misag: {}", e.message);
                     }
                     unreadable += 1;
-                    continue;
+                    return None;
                 }
             };
-            if summary.cwd.as_deref().is_some_and(|c| c.trim_end_matches('/') != cwd) {
-                continue;
-            }
-            let Some(title) = summary.title() else { continue };
+            let cwd = trimmed(summary.cwd.as_deref()?);
+            let title = summary.title()?;
             let ms = modified.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-            found.push(Past { id, title: title.to_owned(), cwd: cwd.to_owned(), modified: ms });
+            Some(Past { id, title: title.to_owned(), cwd: cwd.to_owned(), modified: ms, pinned: is_pinned })
+        };
+        let mut sessions: Vec<Past> = pins.into_iter().filter_map(|f| past(f, true)).collect();
+        let mut found = Vec::new();
+        for file in files {
+            // One past the limit, to tell whether there are more.
+            if found.len() > limit {
+                break;
+            }
+            found.extend(past(file, false));
         }
         let more = found.len() > limit;
         found.truncate(limit);
-        Ok(Page { sessions: found, more, unreadable })
+        sessions.append(&mut found);
+        if started.elapsed() > SLOW_LIST {
+            eprintln!("misag: listing Claude's sessions in {} took {:?}", projects.display(), started.elapsed());
+        }
+        Ok(Page { sessions, more, unreadable, gone_pins })
     }
 }
 
@@ -344,15 +360,14 @@ mod tests {
         file.set_modified(SystemTime::now() - Duration::from_secs(age)).unwrap();
     }
 
-    fn titles(list: &[Past]) -> Vec<&str> {
-        list.iter().map(|p| p.title.as_str()).collect()
+    /// The name of Claude's project folder for `cwd`: every character other than an
+    /// ASCII letter or digit becomes `-`.
+    fn project_name(cwd: &str) -> String {
+        cwd.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
     }
 
-    #[test]
-    fn names_project_folders_like_claude() {
-        assert_eq!(project_name("/home/me/my.app_x"), "-home-me-my-app-x");
-        // Claude replaces UTF-16 units, so a character outside the BMP becomes two dashes.
-        assert_eq!(project_name("/a\u{1F600}b/é"), "-a--b--");
+    fn titles(list: &[Past]) -> Vec<&str> {
+        list.iter().map(|p| p.title.as_str()).collect()
     }
 
     fn cached(cache: &Cache) -> usize {
@@ -375,14 +390,14 @@ mod tests {
         transcript(&projects, "/w", A, &[user("/w", r#""one""#)], 50);
         let path = path_of(&projects, "/w", A);
         let mtime = fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["one"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["one"]);
         // Same size and time: the cached title stays.
         fs::write(&path, user("/w", r#""two""#) + "\n").unwrap();
         set_mtime(&path, mtime);
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["one"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["one"]);
         // Only the time changed: read again.
         set_mtime(&path, mtime + Duration::from_secs(1));
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["two"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["two"]);
     }
 
     #[test]
@@ -390,23 +405,23 @@ mod tests {
         let projects = crate::test_support::temp_dir("history-tail").join("projects");
         let cache = Cache::default();
         transcript(&projects, "/w", A, &[user("/w", r#""first""#)], 50);
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["first"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["first"]);
         // The start is not read again: a changed first line goes unnoticed.
         let path = path_of(&projects, "/w", A);
         let lines = [user("/w", r#""other""#), r#"{"type":"assistant","message":{}}"#.into()];
         fs::write(&path, lines.join("\n") + "\n").unwrap();
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["first"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["first"]);
         // A line still being written is read again once it is complete.
         let mut text = fs::read_to_string(&path).unwrap();
         text.push_str(r#"{"type":"ai-title","aiTi"#);
         fs::write(&path, &text).unwrap();
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["first"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["first"]);
         text.push_str("tle\":\"Done\"}\n");
         fs::write(&path, &text).unwrap();
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["Done"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["Done"]);
         // A shorter file was replaced, so it is read from the start.
         transcript(&projects, "/w", A, &[user("/w", r#""new""#)], 0);
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["new"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["new"]);
     }
 
     #[test]
@@ -418,7 +433,7 @@ mod tests {
             r#"{"type":"custom-title","customTitle":"new"}"#.into(),
         ];
         transcript(&projects, "/w", A, &lines, 0);
-        assert_eq!(titles(&Cache::default().list(&projects, "/w", 100).unwrap().sessions), ["new"]);
+        assert_eq!(titles(&Cache::default().list(&projects, 100, &[]).unwrap().sessions), ["new"]);
     }
 
     #[test]
@@ -427,7 +442,7 @@ mod tests {
         let huge = format!(r#"{{"type":"ai-title","aiTitle":"{}"}}"#, "x".repeat(MAX_LINE));
         let lines = [user("/w", r#""prompt""#), huge, r#"{"type":"last-prompt","lastPrompt":"after"}"#.into()];
         transcript(&projects, "/w", A, &lines, 0);
-        assert_eq!(titles(&Cache::default().list(&projects, "/w", 100).unwrap().sessions), ["after"]);
+        assert_eq!(titles(&Cache::default().list(&projects, 100, &[]).unwrap().sessions), ["after"]);
     }
 
     #[test]
@@ -442,7 +457,7 @@ mod tests {
         fs::set_permissions(path_of(&projects, "/w", B), fs::Permissions::from_mode(0o000)).unwrap();
         let cache = Cache::default();
         for _ in 0..2 {
-            let page = cache.list(&projects, "/w", 100).unwrap();
+            let page = cache.list(&projects, 100, &[]).unwrap();
             assert_eq!(titles(&page.sessions), ["fine"]);
             assert_eq!(page.unreadable, 1);
         }
@@ -452,12 +467,12 @@ mod tests {
     fn deleted_transcripts_leave_the_cache() {
         let projects = crate::test_support::temp_dir("history-evict").join("projects");
         transcript(&projects, "/w", A, &[user("/w", r#""a""#)], 10);
-        transcript(&projects, "/w", B, &[user("/w", r#""b""#)], 0);
+        transcript(&projects, "/v", B, &[user("/v", r#""b""#)], 0);
         let cache = Cache::default();
-        cache.list(&projects, "/w", 100).unwrap();
+        cache.list(&projects, 100, &[]).unwrap();
         assert_eq!(cached(&cache), 2);
-        fs::remove_file(path_of(&projects, "/w", B)).unwrap();
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["a"]);
+        fs::remove_file(path_of(&projects, "/v", B)).unwrap();
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["a"]);
         assert_eq!(cached(&cache), 1);
     }
 
@@ -472,11 +487,26 @@ mod tests {
             r#"{"type":"ai-title","aiTitle":"Build fix"}"#.into(),
         ];
         transcript(&projects, "/w", B, &titled, 10);
-        let list = Cache::default().list(&projects, "/w/", 100).unwrap().sessions;
+        let list = Cache::default().list(&projects, 100, &[]).unwrap().sessions;
         assert_eq!(titles(&list), ["Build fix", "fix the build please"]);
         assert_eq!(list[0].id.as_str(), B);
         assert_eq!(list[0].cwd, "/w");
         assert!(list[0].modified > list[1].modified);
+    }
+
+    #[test]
+    fn without_a_folder_lists_every_folders_conversations_in_the_folder_they_ran_in() {
+        let projects = crate::test_support::temp_dir("history-all").join("projects");
+        transcript(&projects, "/w", A, &[user("/w", r#""in w""#)], 10);
+        transcript(&projects, "/v/x", B, &[user("/v/x", r#""in v""#)], 0);
+        // A transcript that names no folder cannot be resumed anywhere known.
+        let nowhere = [r#"{"type":"ai-title","aiTitle":"Lost"}"#.to_string()];
+        transcript(&projects, "/u", "9b2e1f0c-1d2e-4f3a-8b4c-5d6e7f8a9b0c", &nowhere, 5);
+        fs::write(projects.join("stray.jsonl"), user("/s", r#""stray""#)).unwrap();
+        let page = Cache::default().list(&projects, 100, &[]).unwrap();
+        assert_eq!(titles(&page.sessions), ["in v", "in w"]);
+        assert_eq!((page.sessions[0].cwd.as_str(), page.sessions[1].cwd.as_str()), ("/v/x", "/w"));
+        assert!(Cache::default().list(&projects, 1, &[]).unwrap().more);
     }
 
     #[test]
@@ -488,11 +518,11 @@ mod tests {
             r#"{"type":"agent-name","agentName":"my-session"}"#.into(),
         ];
         transcript(&projects, "/w", A, &lines, 0);
-        assert_eq!(titles(&Cache::default().list(&projects, "/w", 100).unwrap().sessions), ["my-session"]);
+        assert_eq!(titles(&Cache::default().list(&projects, 100, &[]).unwrap().sessions), ["my-session"]);
     }
 
     #[test]
-    fn leaves_out_commands_meta_notes_empty_sessions_and_other_folders() {
+    fn leaves_out_commands_meta_notes_and_empty_sessions() {
         let projects = crate::test_support::temp_dir("history-skip").join("projects");
         let lines = [
             r#"{"type":"user","isMeta":true,"cwd":"/w","message":{"content":"caveat"}}"#.into(),
@@ -504,28 +534,14 @@ mod tests {
         transcript(&projects, "/w", A, &lines, 0);
         // Only Claude Code's own entries: nothing to show.
         transcript(&projects, "/w", B, &[user("/w", r#""<command-name>/clear</command-name>""#)], 0);
-        // `/w-x` and `/w/x` share a project folder; each lists only its own.
-        transcript(&projects, "/w/x", "9b2e1f0c-1d2e-4f3a-8b4c-5d6e7f8a9b0c", &[user("/w-x", r#""other""#)], 0);
         fs::write(projects.join(project_name("/w")).join("notes.jsonl"), "").unwrap();
-        assert_eq!(titles(&Cache::default().list(&projects, "/w", 100).unwrap().sessions), ["real prompt"]);
-        assert!(Cache::default().list(&projects, "/w/x", 100).unwrap().sessions.is_empty());
-        assert_eq!(titles(&Cache::default().list(&projects, "/w-x", 100).unwrap().sessions), ["other"]);
+        assert_eq!(titles(&Cache::default().list(&projects, 100, &[]).unwrap().sessions), ["real prompt"]);
     }
 
     #[test]
     fn a_missing_projects_folder_lists_nothing() {
         let base = crate::test_support::temp_dir("history-missing");
-        assert_eq!(Cache::default().list(&base.join("projects"), "/w", 100).unwrap().sessions, []);
-    }
-
-    #[test]
-    fn long_folder_names_match_claudes_cut_and_hashed_folders() {
-        let projects = crate::test_support::temp_dir("history-long").join("projects");
-        let cwd = format!("/{}", "a".repeat(250));
-        let dir = projects.join(format!("{}-1abc", &project_name(&cwd)[..MAX_PROJECT_NAME]));
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(format!("{A}.jsonl")), user(&cwd, r#""long""#)).unwrap();
-        assert_eq!(titles(&Cache::default().list(&projects, &cwd, 100).unwrap().sessions), ["long"]);
+        assert_eq!(Cache::default().list(&base.join("projects"), 100, &[]).unwrap().sessions, []);
     }
 
     #[test]
@@ -533,10 +549,10 @@ mod tests {
         let projects = crate::test_support::temp_dir("history-cache").join("projects");
         let cache = Cache::default();
         transcript(&projects, "/w", A, &[user("/w", r#""one""#)], 50);
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["one"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["one"]);
         let lines = [user("/w", r#""one""#), r#"{"type":"ai-title","aiTitle":"Two"}"#.into()];
         transcript(&projects, "/w", A, &lines, 0);
-        assert_eq!(titles(&cache.list(&projects, "/w", 100).unwrap().sessions), ["Two"]);
+        assert_eq!(titles(&cache.list(&projects, 100, &[]).unwrap().sessions), ["Two"]);
     }
 
     #[test]
@@ -549,11 +565,49 @@ mod tests {
         // The oldest has nothing typed in it, so it does not count as more.
         transcript(&projects, "/w", A, &[user("/w", r#""<command-name>/clear</command-name>""#)], 5000);
         let cache = Cache::default();
-        let page = cache.list(&projects, "/w", 10).unwrap();
+        let page = cache.list(&projects, 10, &[]).unwrap();
         assert_eq!(titles(&page.sessions), (2..12).rev().map(|i| format!("p{i}")).collect::<Vec<_>>());
         assert!(page.more);
-        let page = cache.list(&projects, "/w", 12).unwrap();
+        let page = cache.list(&projects, 12, &[]).unwrap();
         assert_eq!(page.sessions.len(), 12);
         assert!(!page.more);
+    }
+
+    #[test]
+    fn pinned_conversations_come_first_and_do_not_count_against_the_limit() {
+        let projects = crate::test_support::temp_dir("history-pinned").join("projects");
+        for i in 0..3u64 {
+            let id = format!("00000000-0000-4000-8000-{i:012}");
+            transcript(&projects, "/w", &id, &[user("/w", &format!(r#""p{i}""#))], 100 - i);
+        }
+        transcript(&projects, "/w", A, &[user("/w", r#""old""#)], 5000);
+        transcript(&projects, "/elsewhere", B, &[user("/elsewhere", r#""older""#)], 6000);
+        let pinned = [SessionId::parse(B).unwrap(), SessionId::parse(A).unwrap()];
+        let page = Cache::default().list(&projects, 2, &pinned).unwrap();
+        assert_eq!(titles(&page.sessions), ["old", "older", "p2", "p1"]);
+        assert_eq!(page.sessions.iter().map(|p| p.pinned).collect::<Vec<_>>(), [true, true, false, false]);
+        assert!(page.more);
+        assert_eq!(page.gone_pins, []);
+    }
+
+    #[test]
+    fn pins_whose_transcript_is_gone_are_reported_but_not_unreadable_ones() {
+        let projects = crate::test_support::temp_dir("history-gone-pins").join("projects");
+        // Unreadable: a pin with no title is left out, but its transcript is there.
+        transcript(&projects, "/w", A, &[user("/w", r#""<command-name>/clear</command-name>""#)], 0);
+        let gone = SessionId::parse(B).unwrap();
+        let page = Cache::default().list(&projects, 10, &[SessionId::parse(A).unwrap(), gone.clone()]).unwrap();
+        assert_eq!(page.sessions, []);
+        assert_eq!(page.gone_pins, [gone]);
+    }
+
+    #[test]
+    fn pins_are_not_reported_gone_when_a_folder_could_not_be_read() {
+        let projects = crate::test_support::temp_dir("history-pins-incomplete").join("projects");
+        transcript(&projects, "/w", A, &[user("/w", r#""a""#)], 0);
+        std::os::unix::fs::symlink(projects.join("nowhere"), projects.join("dangling")).unwrap();
+        let page = Cache::default().list(&projects, 10, &[SessionId::parse(B).unwrap()]).unwrap();
+        assert_eq!(page.unreadable, 1);
+        assert_eq!(page.gone_pins, []);
     }
 }

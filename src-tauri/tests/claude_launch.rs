@@ -1,8 +1,8 @@
-//! Runs the real `raterm` binary in `--claude-launch` mode, as the `claude` wrapper
+//! Runs the real `misag` binary in `--claude-launch` mode, as the `claude` wrapper
 //! in terminal tabs does, with a stand-in `claude` that prints its arguments.
 
-use raterm_lib::settings::Settings;
-use raterm_lib::{claude, db};
+use misag_lib::settings::Settings;
+use misag_lib::{claude, db};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -10,7 +10,7 @@ use std::process::{Command, Output};
 mod common;
 use common::temp_dir;
 
-const EXE: &str = env!("CARGO_BIN_EXE_raterm");
+const EXE: &str = env!("CARGO_BIN_EXE_misag");
 
 /// A directory holding a `claude` that prints its arguments, one per line.
 fn real_claude(dir: &Path) -> PathBuf {
@@ -21,8 +21,8 @@ fn real_claude(dir: &Path) -> PathBuf {
     bin
 }
 
-/// Runs `raterm --claude-launch <args>` with `PATH` set to `path`. A `db` of None
-/// leaves `RATERM_DB` unset.
+/// Runs `misag --claude-launch <args>` with `PATH` set to `path`. A `db` of None
+/// leaves `MISAG_DB` unset.
 fn launch(path: &Path, db: Option<&Path>, args: &[&str]) -> Output {
     let mut command = Command::new(EXE);
     command
@@ -88,7 +88,7 @@ fn an_unusable_database_starts_claude_cautiously_and_untracked() {
     let corrupt = dir.join("corrupt.db");
     std::fs::write(&corrupt, "not a database").unwrap();
     assert_eq!(lines(&launch(&bin, Some(&corrupt), &[])), cautious);
-    // A schema this binary does not know, as after an upgrade by another raterm.
+    // A schema this binary does not know, as after an upgrade by another misag.
     let newer = dir.join(db::FILE);
     drop(db::Db::open(newer.clone()).unwrap());
     db::connect_existing(&newer).unwrap().pragma_update(None, "user_version", 999).unwrap();

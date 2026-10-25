@@ -144,7 +144,7 @@ mod tests {
         assert_eq!(back["tabs"][0]["claudeSession"], SESSION);
         assert_eq!(back["tabs"][0]["kind"], "claude");
         assert_eq!(back["tabs"][2]["claudeSession"], SESSION);
-        // Saved by a raterm from before terminal tabs could hold a session.
+        // Saved by a misag from before terminal tabs could hold a session.
         let older = r#"{"tabId":"a","kind":"terminal","command":null,"name":"x","renamed":false,"cwd":null}"#;
         assert_eq!(serde_json::from_str::<Tab>(older).unwrap().kind, TabKind::Terminal { command: None, claude_session: None });
     }

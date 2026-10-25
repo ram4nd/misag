@@ -24,8 +24,8 @@ describe("untypeable", () => {
 
 describe("folderLabel", () => {
   test("is the last folder of the path, ~ for home and / for the root", () => {
-    expect(folderLabel("/home/me/src/raterm", "/home/me")).toBe("raterm");
-    expect(folderLabel("/home/me/src/raterm/", "/home/me")).toBe("raterm");
+    expect(folderLabel("/home/me/src/misag", "/home/me")).toBe("misag");
+    expect(folderLabel("/home/me/src/misag/", "/home/me")).toBe("misag");
     expect(folderLabel("/home/me", "/home/me")).toBe("~");
     expect(folderLabel("/home/me/", "/home/me")).toBe("~");
     expect(folderLabel("/home/me", null)).toBe("me");

@@ -3,7 +3,7 @@ export function remember(key: string, on: boolean) {
   try {
     localStorage.setItem(key, on ? "1" : "0");
   } catch (err) {
-    console.debug("raterm: could not remember", key, err);
+    console.debug("misag: could not remember", key, err);
   }
 }
 
@@ -11,7 +11,7 @@ export function remembered(key: string): boolean {
   try {
     return localStorage.getItem(key) === "1";
   } catch (err) {
-    console.debug("raterm: could not recall", key, err);
+    console.debug("misag: could not recall", key, err);
     return false;
   }
 }
@@ -20,12 +20,12 @@ function forget(key: string) {
   try {
     localStorage.removeItem(key);
   } catch (err) {
-    console.debug("raterm: could not forget", key, err);
+    console.debug("misag: could not forget", key, err);
   }
 }
 
 /** The toolboxes' order, as their ids, in localStorage. */
-const ORDER_KEY = "raterm.toolboxOrder";
+const ORDER_KEY = "misag.toolboxOrder";
 /** How far (px) the mouse must move with a header held down before it drags the toolbox. */
 const DRAG_THRESHOLD = 4;
 /** How long toolboxes take to slide into place while one is dragged, and the dragged one after it is dropped. */
@@ -45,7 +45,7 @@ function slide(el: HTMLElement, from: number): Animation | undefined {
   return el.animate([{ transform: `translateY(${from}px)` }, { transform: "none" }], { duration: SLIDE_MS, easing: EASING });
 }
 
-const collapsedKey = (box: HTMLElement) => `raterm.toolbox.${box.id.replace(/-box$/, "")}.collapsed`;
+const collapsedKey = (box: HTMLElement) => `misag.toolbox.${box.id.replace(/-box$/, "")}.collapsed`;
 
 export interface Toolboxes {
   /** Puts the toolboxes back in their first order, all open, and forgets the remembered layout. */
@@ -72,7 +72,7 @@ export function setupToolboxes(sidebar: HTMLElement, onToggle: (box: HTMLElement
     try {
       localStorage.setItem(ORDER_KEY, JSON.stringify(boxes().map((b) => b.id)));
     } catch (err) {
-      console.debug("raterm: could not remember the toolbox order", err);
+      console.debug("misag: could not remember the toolbox order", err);
     }
   }
 
@@ -89,7 +89,7 @@ export function setupToolboxes(sidebar: HTMLElement, onToggle: (box: HTMLElement
     try {
       ids = JSON.parse(localStorage.getItem(ORDER_KEY) ?? "[]");
     } catch (err) {
-      console.debug("raterm: could not recall the toolbox order", err);
+      console.debug("misag: could not recall the toolbox order", err);
       return;
     }
     if (!Array.isArray(ids)) return;

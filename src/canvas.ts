@@ -56,7 +56,7 @@ export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
     if (startSelected()) e.stopImmediatePropagation();
   });
   /** Logs an event that does not match what was drawn: the canvas and the flow have drifted apart. */
-  const dropped = (what: string, detail: unknown) => console.error(`raterm: ignored a canvas ${what}`, detail);
+  const dropped = (what: string, detail: unknown) => console.error(`misag: ignored a canvas ${what}`, detail);
   df.start();
   df.on("connectionCreated", (e) => {
     if (rendering) return;

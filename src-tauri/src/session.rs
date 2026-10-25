@@ -72,7 +72,7 @@ impl Session {
     /// alive after `grace`. The returned thread ends as soon as the child is reaped.
     fn kill(&self, grace: Duration) -> Option<std::thread::JoinHandle<()>> {
         if let Err(e) = lock(&self.killer).kill() {
-            eprintln!("raterm: SIGHUP to pid {:?} failed: {e}", self.pid);
+            eprintln!("misag: SIGHUP to pid {:?} failed: {e}", self.pid);
         }
         let pid = self.pid?;
         // The foreground job may sit in its own process group under job control.
@@ -127,9 +127,9 @@ fn is_posix_shell(shell: &str) -> bool {
 }
 
 /// Variables that only a running Claude Code session sets, to mark its own
-/// process and its children (seen in Claude Code 2.1), plus the ones raterm sets
-/// on its own tabs. They describe whatever launched raterm, such as a Claude Code
-/// session running a dev build or another raterm's tab, not the user's
+/// process and its children (seen in Claude Code 2.1), plus the ones misag sets
+/// on its own tabs. They describe whatever launched misag, such as a Claude Code
+/// session running a dev build or another misag's tab, not the user's
 /// environment, so tabs never inherit them; otherwise a `claude` in a tab would
 /// behave as a child of that session. Update when Claude Code adds markers.
 /// User settings (`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_*`,
@@ -144,17 +144,17 @@ pub const LAUNCHER_ENV: &[&str] = &[
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
     "CLAUDE_PID",
-    // Set by raterm on its own tabs. A raterm started from one of them must not
-    // pass on the outer raterm's tab and database (`launch_plan` also drops the
+    // Set by misag on its own tabs. A misag started from one of them must not
+    // pass on the outer misag's tab and database (`launch_plan` also drops the
     // outer wrapper directory from PATH).
-    "RATERM_TAB",
-    "RATERM_DB",
-    "RATERM_WRAPPER",
+    "MISAG_TAB",
+    "MISAG_DB",
+    "MISAG_WRAPPER",
 ];
 
 /// Variables Claude Code also sets for the commands it runs (for example
 /// `GIT_EDITOR=true`, which makes `git commit` without `-m` abort). A user may set
-/// these on purpose, so they are dropped only when raterm itself was started from
+/// these on purpose, so they are dropped only when misag itself was started from
 /// Claude Code (`CLAUDECODE` is set), which is where they then came from.
 pub const CLAUDE_CODE_SHELL_ENV: &[&str] = &[
     "CLAUDE_EFFORT",
@@ -166,14 +166,14 @@ pub const CLAUDE_CODE_SHELL_ENV: &[&str] = &[
     "NoDefaultCurrentDirectoryInExePath",
 ];
 
-/// The variables tabs must not inherit, given whether raterm was started from Claude Code.
+/// The variables tabs must not inherit, given whether misag was started from Claude Code.
 pub fn launcher_vars(started_from_claude_code: bool) -> Vec<&'static str> {
     let extra = if started_from_claude_code { CLAUDE_CODE_SHELL_ENV } else { &[] };
     LAUNCHER_ENV.iter().chain(extra).copied().collect()
 }
 
-/// Environment variable carrying the program and arguments for `raterm --exec`.
-pub const EXEC_ENV: &str = "RATERM_EXEC";
+/// Environment variable carrying the program and arguments for `misag --exec`.
+pub const EXEC_ENV: &str = "MISAG_EXEC";
 pub const EXEC_FLAG: &str = "--exec";
 
 /// Whether `path` can be single-quoted the same way in every common shell (POSIX
@@ -184,7 +184,7 @@ fn quotable_everywhere(path: &str) -> bool {
 
 pub struct Sessions {
     shell: String,
-    /// raterm's own binary, which runs `Launch::Program` under non-POSIX shells.
+    /// misag's own binary, which runs `Launch::Program` under non-POSIX shells.
     trampoline: Option<String>,
     kill_grace: Duration,
     /// Inherited variables removed from every tab (see `launcher_vars`).
@@ -196,7 +196,7 @@ pub struct Sessions {
 impl Default for Sessions {
     fn default() -> Self {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            eprintln!("raterm: $SHELL is not set, falling back to /bin/sh");
+            eprintln!("misag: $SHELL is not set, falling back to /bin/sh");
             "/bin/sh".into()
         });
         Self::new(shell, KILL_GRACE)
@@ -258,15 +258,15 @@ impl Sessions {
                 cmd.args(args);
             }
             // Other shells (fish, csh, ...) spell that differently, so the login shell
-            // runs raterm itself, which execs the program from an environment variable.
+            // runs misag itself, which execs the program from an environment variable.
             Launch::Program { program, args } => {
                 let exe = self.trampoline.as_deref().ok_or_else(|| {
-                    format!("cannot launch {program} under {shell}: no raterm binary to run it through")
+                    format!("cannot launch {program} under {shell}: no misag binary to run it through")
                 })?;
                 if !quotable_everywhere(exe) {
                     return Err(format!(
-                        "cannot launch {program} under {shell}: raterm's path {exe:?} contains a quote, \
-                         backslash, ! or newline, which {shell} cannot be given safely; install raterm elsewhere"
+                        "cannot launch {program} under {shell}: misag's path {exe:?} contains a quote, \
+                         backslash, ! or newline, which {shell} cannot be given safely; install misag elsewhere"
                     )
                     .into());
                 }
@@ -306,7 +306,7 @@ impl Sessions {
         std::thread::spawn(move || {
             for data in input_rx {
                 if let Err(e) = writer.write_all(&data).and_then(|_| writer.flush()) {
-                    eprintln!("raterm: session {id} write failed: {e}");
+                    eprintln!("misag: session {id} write failed: {e}");
                     break;
                 }
             }
@@ -321,7 +321,7 @@ impl Sessions {
                     Ok(0) => break,
                     Ok(n) => {
                         if !on_data(&buf[..n]) {
-                            eprintln!("raterm: session {id} lost its frontend, killing it");
+                            eprintln!("misag: session {id} lost its frontend, killing it");
                             detached = true;
                             break;
                         }
@@ -330,7 +330,7 @@ impl Sessions {
                     Err(e) => {
                         // EIO is how Linux reports the slave side closing.
                         if e.raw_os_error() != Some(libc::EIO) {
-                            eprintln!("raterm: session {id} read failed: {e}");
+                            eprintln!("misag: session {id} read failed: {e}");
                         }
                         break;
                     }
@@ -342,7 +342,7 @@ impl Sessions {
             let code = match child.wait() {
                 Ok(status) => status.exit_code() as i32,
                 Err(e) => {
-                    eprintln!("raterm: session {id} wait failed: {e}");
+                    eprintln!("misag: session {id} wait failed: {e}");
                     -1
                 }
             };
@@ -388,13 +388,13 @@ impl Sessions {
             Ok(path) => path,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("raterm: cannot read {link}: {e}");
+                    eprintln!("misag: cannot read {link}: {e}");
                 }
                 return None;
             }
         };
         let path = live_path(path);
-        path.into_os_string().into_string().map_err(|p| eprintln!("raterm: non-UTF-8 directory {p:?}")).ok()
+        path.into_os_string().into_string().map_err(|p| eprintln!("misag: non-UTF-8 directory {p:?}")).ok()
     }
 
     /// The leader of the session's foreground process group, when that is not the
@@ -410,7 +410,7 @@ impl Sessions {
         let leader = unsafe { libc::tcgetpgrp(fd) };
         if leader <= 0 {
             let e = format!("session {id}: cannot read the foreground process: {}", std::io::Error::last_os_error());
-            eprintln!("raterm: {e}");
+            eprintln!("misag: {e}");
             return Err(e);
         }
         let leader = leader as u32;
@@ -574,9 +574,9 @@ mod tests {
     #[test]
     fn delivers_output_before_exit() {
         let s = sessions();
-        let p = spawn(&s, "echo hello-raterm");
+        let p = spawn(&s, "echo hello-misag");
         assert_eq!(p.exit_code(), 0);
-        assert!(p.text().contains("hello-raterm"), "output: {:?}", p.text());
+        assert!(p.text().contains("hello-misag"), "output: {:?}", p.text());
     }
 
     #[test]
@@ -726,8 +726,8 @@ mod tests {
     #[test]
     fn sets_extra_environment() {
         let s = sessions();
-        let env = vec![("RATERM_TAB".to_string(), "tab-7".to_string())];
-        let p = spawn_with(&s, Launch::Command("echo tab=$RATERM_TAB".into()), None, env);
+        let env = vec![("MISAG_TAB".to_string(), "tab-7".to_string())];
+        let p = spawn_with(&s, Launch::Command("echo tab=$MISAG_TAB".into()), None, env);
         p.exit_code();
         assert!(p.text().contains("tab=tab-7"), "output: {:?}", p.text());
     }
@@ -810,13 +810,13 @@ mod tests {
         let claude = || SpawnRequest { launch: Launch::Program { program: "claude".into(), args: vec![] }, ..req() };
         let s = Sessions::new("/usr/bin/fish", Duration::from_millis(300));
         let err = s.spawn(claude(), |_| true, |_| {}).unwrap_err();
-        assert!(matches!(&err, SpawnError::Failed(m) if m.contains("no raterm binary")), "{err}");
-        assert!(!quotable_everywhere("/opt/it's/raterm"));
-        assert!(quotable_everywhere("/opt/my apps/raterm"));
+        assert!(matches!(&err, SpawnError::Failed(m) if m.contains("no misag binary")), "{err}");
+        assert!(!quotable_everywhere("/opt/it's/misag"));
+        assert!(quotable_everywhere("/opt/my apps/misag"));
 
-        let unquotable = Sessions::new("/usr/bin/fish", Duration::from_millis(300)).with_trampoline("/opt/it's/raterm".into());
+        let unquotable = Sessions::new("/usr/bin/fish", Duration::from_millis(300)).with_trampoline("/opt/it's/misag".into());
         let err = unquotable.spawn(claude(), |_| true, |_| {}).unwrap_err();
-        assert!(matches!(&err, SpawnError::Failed(m) if m.contains("install raterm elsewhere")), "{err}");
+        assert!(matches!(&err, SpawnError::Failed(m) if m.contains("install misag elsewhere")), "{err}");
     }
 
     #[test]

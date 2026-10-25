@@ -21,9 +21,9 @@ pub const START_OUTPUT: &str = "next";
 /// an output, so no step may use it as one.
 pub const ATTENTION: &str = "attention";
 
-/// The newest graph format this raterm reads; `check` refuses newer ones, which it
+/// The newest graph format this misag reads; `check` refuses newer ones, which it
 /// could misread. A graph is stored as the oldest format that holds it (see
-/// `stored`), so older raterms keep reading the flows they can run correctly.
+/// `stored`), so older misags keep reading the flows they can run correctly.
 /// Version 2 added step run limits (`Node::max_runs`).
 pub const GRAPH_VERSION: u32 = 2;
 
@@ -176,7 +176,7 @@ fn check_node(node: &Node) -> Result<(), String> {
     check_outputs(node)
 }
 
-/// `graph` as stored: in the oldest format that holds it, so a raterm that would
+/// `graph` as stored: in the oldest format that holds it, so a misag that would
 /// ignore a newer field refuses the graph rather than run it differently.
 pub fn stored(mut graph: Graph) -> Graph {
     graph.version = if graph.nodes.iter().any(|n| n.max_runs.is_some()) { 2 } else { 1 };
@@ -187,7 +187,7 @@ pub fn stored(mut graph: Graph) -> Graph {
 pub fn check(graph: &Graph) -> Result<(), String> {
     if graph.version > GRAPH_VERSION {
         return Err(format!(
-            "this flow was saved by a newer raterm (format {}, this one knows {GRAPH_VERSION})",
+            "this flow was saved by a newer Mischief of Agents (format {}, this one knows {GRAPH_VERSION})",
             graph.version
         ));
     }
@@ -373,7 +373,7 @@ pub(crate) mod tests {
         assert_eq!(read.max_runs, Some(3));
         assert_eq!(parsed.version, 1, "graphs stored before versions are version 1");
         let newer = serde_json::json!({ "version": 3, "nodes": [], "edges": [] });
-        assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer raterm"));
+        assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer Mischief of Agents"));
     }
 
     #[test]
@@ -484,7 +484,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_graph_with_run_limits_is_a_newer_format() {
-        // An older raterm would ignore the limits, so it must refuse such a graph.
+        // An older misag would ignore the limits, so it must refuse such a graph.
         let mut g = runnable();
         assert_eq!(stored(g.clone()).version, 1);
         g.nodes[1].max_runs = Some(2);

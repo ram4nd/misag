@@ -82,7 +82,7 @@ export function createFlows(opts: FlowsOptions): Flows {
       boxError.hidden = true;
       opts.onChange(flows);
     } catch (err) {
-      console.error("raterm: could not read the flows", err);
+      console.error("misag: could not read the flows", err);
       showBoxError(`Flows could not be read: ${opts.errorText(err)}`);
       throw err;
     } finally {
@@ -101,7 +101,7 @@ export function createFlows(opts: FlowsOptions): Flows {
       try {
         await task();
       } catch (err) {
-        console.error(`raterm: could not ${what}`, err);
+        console.error(`misag: could not ${what}`, err);
         error = `Could not ${what}: ${opts.errorText(err)}. `;
       }
       try {
