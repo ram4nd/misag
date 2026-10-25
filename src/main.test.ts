@@ -719,6 +719,16 @@ describe("tab icons", () => {
     expect(busy()).toEqual([false]);
   });
 
+  test("a working Claude tab shows a loader in place of the Claude icon", async () => {
+    await boot();
+    await clickClaude();
+    renameTab(0, "build");
+    terms()[0].onTitle!("◐ Claude Code");
+    expect(kind(0)).toBe("loader");
+    terms()[0].onTitle!("✳ Claude Code");
+    expect(kind(0)).toBe("claude");
+  });
+
   test.each([
     ["◐ a", true],
     ["◓ a", true],

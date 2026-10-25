@@ -325,8 +325,11 @@ async function spawn(opts: SpawnOptions) {
     );
   };
   term.onTitle = (title) => {
-    s.busy = BUSY_TITLE.test(title);
-    tabsEl.children[sessions.indexOf(s)]?.classList.toggle("busy", showsBusy(s));
+    const busy = BUSY_TITLE.test(title);
+    if (busy !== s.busy) {
+      s.busy = busy;
+      updateTab(s);
+    }
     if (!title || s.renamed || title === s.name) return;
     s.name = title;
     updateTab(s);
@@ -640,13 +643,14 @@ function showsBusy(s: Session): boolean {
   return s.busy && !s.exited && (s.run.kind === "claude" || s.inClaude);
 }
 
-/** The tab's icon: Claude's while Claude runs in it, else a terminal. */
+/** The tab's icon: a loader while Claude works in it, Claude's while Claude runs in it, else a terminal. */
 function tabIcon(s: Session): HTMLElement {
   const mark = document.createElement("span");
   mark.className = "icon";
   const claude = s.run.kind === "claude" || s.inClaude;
-  mark.dataset.kind = claude ? "claude" : "terminal";
-  if (claude) mark.innerHTML = CLAUDE_ICON;
+  mark.dataset.kind = showsBusy(s) ? "loader" : claude ? "claude" : "terminal";
+  if (showsBusy(s)) mark.append(icon("loader-circle"));
+  else if (claude) mark.innerHTML = CLAUDE_ICON;
   else mark.append(icon("square-terminal"));
   return mark;
 }
