@@ -690,6 +690,33 @@ describe("tab icons", () => {
     expect(kind(0)).toBe("terminal");
   });
 
+  test("a tab shows Claude working while its title has a spinner", async () => {
+    await boot();
+    await clickClaude();
+    await clickTerminal();
+    const busy = () => tabs().map((t) => t.classList.contains("busy"));
+    terms()[0].handlers.title("✳ Claude Code");
+    expect(busy()).toEqual([false, false]);
+    terms()[0].handlers.title("◐ Claude Code");
+    terms()[1].handlers.title("⠂ Fix the build");
+    expect(busy()).toEqual([true, true]);
+    terms()[0].handlers.title("◑ Greeting reply");
+    expect(busy()).toEqual([true, true]);
+    terms()[0].handlers.title("✳ Greeting reply");
+    terms()[1].handlers.title("me@host: ~/work");
+    expect(busy()).toEqual([false, false]);
+  });
+
+  test("a renamed or exited tab still stops showing Claude working", async () => {
+    await boot();
+    await clickClaude();
+    renameTab(0, "build");
+    terms()[0].handlers.title("◐ Claude Code");
+    expect(tabs()[0].classList.contains("busy")).toBe(true);
+    spawns()[0].onExit.onmessage(0);
+    expect(tabs()[0].classList.contains("busy")).toBe(false);
+  });
+
   test("a claude that bypassed the wrapper also counts", async () => {
     await boot();
     await clickTerminal();

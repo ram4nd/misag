@@ -67,6 +67,12 @@ body { display: flex; flex-direction: column; }
 #tab-actions button { display: grid; place-items: center; }
 .tab .icon { flex: none; display: grid; place-items: center; }
 .tab.exited .icon { opacity: .5; }
+.tab.busy .icon { animation: tab-busy 1.2s linear infinite; }
+@keyframes tab-busy { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .tab.busy .icon { animation: tab-busy-pulse 1.6s ease-in-out infinite alternate; }
+}
+@keyframes tab-busy-pulse { to { opacity: .35; } }
 
 /* ---------- notice ---------- */
 #notice {

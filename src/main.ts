@@ -49,6 +49,8 @@ interface Session {
   name: string;
   /** True once the user renamed the tab, so terminal titles stop overwriting it. */
   renamed: boolean;
+  /** Claude is working: its terminal title starts with a spinner frame. */
+  busy: boolean;
   /** Directory the tab was opened in; saves use its live directory when they can. */
   cwd?: string;
   /** The process's current directory, last time it was checked. */
@@ -290,6 +292,9 @@ function createView(): { el: HTMLDivElement; term: Terminal; fit: FitAddon } {
 }
 
 /** Opens a tab and starts its process. */
+/** Claude titles the terminal `✳ <task>` while idle, and with a spinner frame (`◐ <task>`, `⠂ <task>`) while working. */
+const BUSY_TITLE = /^[\u25D0-\u25D3\u2801-\u28FF] /;
+
 async function spawn(opts: SpawnOptions) {
   const { el, term, fit } = createView();
 
@@ -301,7 +306,7 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, fit, el, exited: false, closing: false, skipsPermissions: false, inClaude: false,
+    id: null, starts: 0, term, fit, el, exited: false, closing: false, busy: false, skipsPermissions: false, inClaude: false,
     claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
@@ -328,6 +333,11 @@ async function spawn(opts: SpawnOptions) {
     );
   });
   term.onTitleChange((title) => {
+    const busy = BUSY_TITLE.test(title);
+    if (busy !== s.busy) {
+      s.busy = busy;
+      tabsEl.children[sessions.indexOf(s)]?.classList.toggle("busy", busy);
+    }
     if (!title || s.renamed || title === s.name) return;
     s.name = title;
     updateTab(s);
@@ -462,6 +472,7 @@ function write(s: Session, data: Uint8Array) {
 function markExited(s: Session, message: string, error = false) {
   if (s.closing) return;
   s.exited = true;
+  s.busy = false;
   if (s.run.kind === "terminal") {
     s.inClaude = false;
     s.skipsPermissions = false;
@@ -565,6 +576,7 @@ function renderSessions() {
       tab.title = tabTitle(s);
       tab.classList.toggle("active", s === active && shownPage === null);
       tab.classList.toggle("exited", s.exited);
+      tab.classList.toggle("busy", s.busy);
 
       const name = document.createElement("span");
       name.className = "name";
