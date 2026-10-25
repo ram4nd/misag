@@ -18,6 +18,9 @@ const SLOW_LIST: std::time::Duration = std::time::Duration::from_millis(500);
 /// Longer transcript lines (tool output, pasted files) are skipped unread: the
 /// lines a title comes from are far shorter.
 const MAX_LINE: usize = 1 << 20;
+/// A transcript that could not be read is tried again after this long, even
+/// unchanged: fixing its permissions does not change it.
+const RETRY_FAILED: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A conversation Claude saved, as the box lists it.
 #[derive(Serialize, Debug, PartialEq, Clone)]
@@ -77,20 +80,22 @@ struct Scan {
 #[derive(Clone)]
 enum Entry {
     Read(Scan),
-    /// Reading failed; it is tried again (and logged again) only once the file changes.
-    Failed { modified: SystemTime, size: u64 },
+    /// Reading failed at `at`; it is tried again (and logged again) once the file
+    /// changes or `RETRY_FAILED` has passed.
+    Failed { modified: SystemTime, size: u64, at: std::time::Instant },
 }
 
 /// Transcripts as last read, so a refresh reads only what changed: nothing for an
 /// unchanged one, and only the new lines of one Claude has appended to.
 #[derive(Default)]
-pub struct Cache(Mutex<HashMap<PathBuf, Entry>>);
+pub struct Cache(Mutex<HashMap<PathBuf, Entry>>, Mutex<HashSet<SessionId>>);
 
-/// Every project folder (following links), and how many entries could not be read.
-fn project_dirs(projects: &Path) -> Result<(Vec<PathBuf>, usize), String> {
+/// Every project folder (following links), and how many entries could not be
+/// read; None when there is no projects folder.
+fn project_dirs(projects: &Path) -> Result<Option<(Vec<PathBuf>, usize)>, String> {
     let entries = match std::fs::read_dir(projects) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read {}: {e}", projects.display())),
     };
     let mut dirs = Vec::new();
@@ -105,7 +110,7 @@ fn project_dirs(projects: &Path) -> Result<(Vec<PathBuf>, usize), String> {
             }
         }
     }
-    Ok((dirs, unreadable))
+    Ok(Some((dirs, unreadable)))
 }
 
 /// `cwd` without trailing slashes, the root staying `/`.
@@ -231,6 +236,11 @@ impl Cache {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// True the first time pin `id` turns out to have nothing to show.
+    fn hidden_pin(&self, id: &SessionId) -> bool {
+        self.1.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone())
+    }
+
     /// The summary of the transcript at `path`. An unchanged one is not read; one
     /// that grew is read from where the last read stopped. The file is read with
     /// the cache unlocked.
@@ -238,7 +248,7 @@ impl Cache {
         let known = self.entries().get(path).cloned();
         let (offset, summary) = match known {
             Some(Entry::Read(scan)) if scan.modified == modified && scan.size == size => return Ok(scan.summary),
-            Some(Entry::Failed { modified: m, size: s }) if m == modified && s == size => {
+            Some(Entry::Failed { modified: m, size: s, at }) if m == modified && s == size && at.elapsed() < RETRY_FAILED => {
                 return Err(Unreadable { new: false, message: String::new() });
             }
             // Claude only appends; a file that did not grow was replaced.
@@ -248,7 +258,7 @@ impl Cache {
         let read = scan(path, offset, summary);
         let entry = match &read {
             Ok((offset, summary)) => Entry::Read(Scan { modified, size, offset: *offset, summary: summary.clone() }),
-            Err(_) => Entry::Failed { modified, size },
+            Err(_) => Entry::Failed { modified, size, at: std::time::Instant::now() },
         };
         self.entries().insert(path.to_owned(), entry);
         read.map(|(_, summary)| summary).map_err(|message| Unreadable { new: true, message })
@@ -257,16 +267,24 @@ impl Cache {
     /// The `pinned` conversations Claude saved in any folder, then the newest
     /// `limit` others, each newest first. Ones with no name, title or typed prompt
     /// are left out, and so are ones that name no folder to resume them in. A
-    /// missing projects folder lists nothing.
+    /// missing projects folder lists nothing, and reports no pin gone: it may only
+    /// be looked for in the wrong place.
     pub fn list(&self, projects: &Path, limit: usize, pinned: &[SessionId]) -> Result<Page, String> {
         let started = std::time::Instant::now();
-        let (dirs, mut unreadable) = project_dirs(projects)?;
+        let found_projects = project_dirs(projects)?;
+        let complete = found_projects.is_some();
+        let (dirs, mut unreadable) = found_projects.unwrap_or_default();
         let mut files = Vec::new();
         for dir in &dirs {
             let entries = match std::fs::read_dir(dir) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("cannot read {}: {e}", dir.display())),
+                // One unreadable folder should not hide the others.
+                Err(e) => {
+                    eprintln!("misag: cannot read {}: {e}", dir.display());
+                    unreadable += 1;
+                    continue;
+                }
             };
             for entry in entries {
                 let entry = match entry {
@@ -291,7 +309,7 @@ impl Cache {
             }
         }
         // Only a complete listing tells that a pinned transcript is gone.
-        let gone_pins = if unreadable > 0 {
+        let gone_pins = if !complete || unreadable > 0 {
             Vec::new()
         } else {
             pinned.iter().filter(|id| !files.iter().any(|f| &f.2 == *id)).cloned().collect()
@@ -313,8 +331,14 @@ impl Cache {
                     return None;
                 }
             };
-            let cwd = trimmed(summary.cwd.as_deref()?);
-            let title = summary.title()?;
+            let (Some(cwd), Some(title)) = (summary.cwd.as_deref(), summary.title()) else {
+                // A pin the box cannot show stays pinned; say so once.
+                if is_pinned && self.hidden_pin(&id) {
+                    eprintln!("misag: pinned session {} has no folder or title in its transcript, so it is not listed", id.as_str());
+                }
+                return None;
+            };
+            let cwd = trimmed(cwd);
             let ms = modified.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
             Some(Past { id, title: title.to_owned(), cwd: cwd.to_owned(), modified: ms, pinned: is_pinned })
         };
@@ -542,6 +566,57 @@ mod tests {
     fn a_missing_projects_folder_lists_nothing() {
         let base = crate::test_support::temp_dir("history-missing");
         assert_eq!(Cache::default().list(&base.join("projects"), 100, &[]).unwrap().sessions, []);
+    }
+
+    #[test]
+    fn a_missing_projects_folder_drops_no_pins() {
+        // A wrong CLAUDE_CONFIG_DIR or an unmounted ~/.claude must not unpin everything.
+        let base = crate::test_support::temp_dir("history-missing-pins");
+        let page = Cache::default().list(&base.join("projects"), 100, &[SessionId::parse(A).unwrap()]).unwrap();
+        assert_eq!(page.gone_pins, []);
+    }
+
+    #[test]
+    fn an_unreadable_project_folder_is_counted_and_the_others_listed() {
+        if crate::test_support::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let projects = crate::test_support::temp_dir("history-locked-folder").join("projects");
+        transcript(&projects, "/w", A, &[user("/w", r#""fine""#)], 0);
+        transcript(&projects, "/locked", B, &[user("/locked", r#""hidden""#)], 0);
+        let locked = projects.join(project_name("/locked"));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let page = Cache::default().list(&projects, 100, &[SessionId::parse(B).unwrap()]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let page = page.unwrap();
+        assert_eq!(titles(&page.sessions), ["fine"]);
+        assert_eq!(page.unreadable, 1);
+        assert_eq!(page.gone_pins, []);
+    }
+
+    #[test]
+    fn a_failed_read_is_tried_again_after_a_while() {
+        if crate::test_support::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let projects = crate::test_support::temp_dir("history-retry").join("projects");
+        transcript(&projects, "/w", A, &[user("/w", r#""later""#)], 0);
+        let path = path_of(&projects, "/w", A);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let cache = Cache::default();
+        assert_eq!(cache.list(&projects, 100, &[]).unwrap().unreadable, 1);
+        // Fixing the permissions does not change the file, so the failure stands for now.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(cache.list(&projects, 100, &[]).unwrap().unreadable, 1);
+        for entry in cache.0.lock().unwrap().values_mut() {
+            if let Entry::Failed { at, .. } = entry {
+                *at -= RETRY_FAILED;
+            }
+        }
+        let page = cache.list(&projects, 100, &[]).unwrap();
+        assert_eq!((titles(&page.sessions), page.unreadable), (vec!["later"], 0));
     }
 
     #[test]

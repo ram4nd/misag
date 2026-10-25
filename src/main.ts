@@ -49,7 +49,7 @@ interface Session {
   name: string;
   /** True once the user renamed the tab, so terminal titles stop overwriting it. */
   renamed: boolean;
-  /** Claude is working: its terminal title starts with a spinner frame. */
+  /** The terminal title starts with a spinner frame: Claude is working, if it runs in the tab (see `showsBusy`). */
   busy: boolean;
   /** Directory the tab was opened in; saves use its live directory when they can. */
   cwd?: string;
@@ -291,10 +291,10 @@ function createView(): { el: HTMLDivElement; term: Terminal; fit: FitAddon } {
   }
 }
 
-/** Opens a tab and starts its process. */
 /** Claude titles the terminal `✳ <task>` while idle, and with a spinner frame (`◐ <task>`, `⠂ <task>`) while working. */
 const BUSY_TITLE = /^[\u25D0-\u25D3\u2801-\u28FF] /;
 
+/** Opens a tab and starts its process. */
 async function spawn(opts: SpawnOptions) {
   const { el, term, fit } = createView();
 
@@ -333,11 +333,8 @@ async function spawn(opts: SpawnOptions) {
     );
   });
   term.onTitleChange((title) => {
-    const busy = BUSY_TITLE.test(title);
-    if (busy !== s.busy) {
-      s.busy = busy;
-      tabsEl.children[sessions.indexOf(s)]?.classList.toggle("busy", busy);
-    }
+    s.busy = BUSY_TITLE.test(title);
+    tabsEl.children[sessions.indexOf(s)]?.classList.toggle("busy", showsBusy(s));
     if (!title || s.renamed || title === s.name) return;
     s.name = title;
     updateTab(s);
@@ -576,7 +573,7 @@ function renderSessions() {
       tab.title = tabTitle(s);
       tab.classList.toggle("active", s === active && shownPage === null);
       tab.classList.toggle("exited", s.exited);
-      tab.classList.toggle("busy", s.busy);
+      tab.classList.toggle("busy", showsBusy(s));
 
       const name = document.createElement("span");
       name.className = "name";
@@ -624,6 +621,11 @@ function tabTitle(s: Session): string {
   return s.skipsPermissions ? `${text}\n(Claude runs tools without asking: --dangerously-skip-permissions)` : text;
 }
 
+/** Whether the tab shows Claude working: another tool's spinner in a plain shell does not count. */
+function showsBusy(s: Session): boolean {
+  return s.busy && !s.exited && (s.run.kind === "claude" || s.inClaude);
+}
+
 /** The tab's icon: Claude's while Claude runs in it, else a terminal. */
 function tabIcon(s: Session): HTMLElement {
   const mark = document.createElement("span");
@@ -646,6 +648,7 @@ function updateTab(s: Session) {
   const mark = tab?.querySelector(".icon");
   if (!(tab instanceof HTMLElement) || !label || !mark) return;
   tab.title = tabTitle(s);
+  tab.classList.toggle("busy", showsBusy(s));
   label.textContent = tabLabel(s);
   mark.replaceWith(tabIcon(s));
 }
@@ -1017,6 +1020,8 @@ function followClaude(s: Session, state: ClaudeState | undefined) {
 /** Shows whether Claude runs in a terminal tab, and whether it skips permissions, in its icon and tooltip. */
 function showClaudeIn(s: Session, inClaude: boolean, skipsPermissions: boolean) {
   if (inClaude === s.inClaude && skipsPermissions === s.skipsPermissions) return;
+  // A Claude that quit mid-turn leaves its spinner in the title.
+  if (!inClaude) s.busy = false;
   s.inClaude = inClaude;
   s.skipsPermissions = skipsPermissions;
   updateTab(s);
@@ -1433,11 +1438,16 @@ function showHistory() {
 let reportedSessions: Record<string, string> = {};
 
 /** Reads which session each tab is in; if that fails, the last answer is kept. */
+/** The failure last logged by `readTabSessions`, so one that lasts is logged once. */
+let tabSessionsFailure: string | null = null;
+
 async function readTabSessions() {
   try {
     reportedSessions = await invoke<Record<string, string>>("claude_tab_sessions");
+    tabSessionsFailure = null;
   } catch (err) {
-    console.error("misag: could not read the tabs' Claude sessions", err);
+    if (errorText(err) !== tabSessionsFailure) console.error("misag: could not read the tabs' Claude sessions", err);
+    tabSessionsFailure = errorText(err);
   }
 }
 

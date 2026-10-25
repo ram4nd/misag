@@ -150,6 +150,10 @@ pub const LAUNCHER_ENV: &[&str] = &[
     "MISAG_TAB",
     "MISAG_DB",
     "MISAG_WRAPPER",
+    // The same, from tabs of raterm (misag's old name) still open after the switch.
+    "RATERM_TAB",
+    "RATERM_DB",
+    "RATERM_WRAPPER",
 ];
 
 /// Variables Claude Code also sets for the commands it runs (for example
@@ -721,6 +725,14 @@ mod tests {
         assert!(!launcher_vars(false).contains(&"GIT_EDITOR"), "a user's own GIT_EDITOR is kept");
         assert!(launcher_vars(true).contains(&"GIT_EDITOR"));
         assert!(LAUNCHER_ENV.iter().all(|k| launcher_vars(false).contains(k)), "session markers always go");
+    }
+
+    #[test]
+    fn the_markers_of_raterm_tabs_are_dropped_too() {
+        // A misag started from a tab of raterm, its old name, during the switch.
+        for k in ["RATERM_TAB", "RATERM_DB", "RATERM_WRAPPER"] {
+            assert!(launcher_vars(false).contains(&k), "{k} is kept");
+        }
     }
 
     #[test]

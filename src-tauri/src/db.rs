@@ -13,13 +13,15 @@ use crate::layout::{Layout, Tab, TabId, TabKind};
 use crate::settings::Settings;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const FILE: &str = "misag.db";
+/// The database of raterm, misag's old name, which misag copies on its first start.
+pub const RATERM_FILE: &str = "raterm.db";
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Applied in order; `PRAGMA user_version` records how many have run.
@@ -264,6 +266,8 @@ pub struct Db {
     backing: Backing,
     conn: Mutex<Connection>,
     opened: SystemTime,
+    /// Messages already logged, for problems every refresh would log again.
+    logged: Mutex<HashSet<String>>,
 }
 
 /// Unix seconds, the one time format misag stores and compares.
@@ -292,7 +296,7 @@ impl Db {
     }
 
     fn with(backing: Backing, conn: Connection) -> Self {
-        Self { backing, conn: Mutex::new(conn), opened: SystemTime::now() }
+        Self { backing, conn: Mutex::new(conn), opened: SystemTime::now(), logged: Mutex::default() }
     }
 
     fn in_memory(reason: String) -> Self {
@@ -330,6 +334,28 @@ impl Db {
         match Self::open_with_notice(path, Some(notice)) {
             Ok(db) => db,
             Err(e) => Self::in_memory(format!("{e}; the damaged database was kept at {}", aside.display())),
+        }
+    }
+
+    /// Like `open_or_recover`, but on the first start, while there is no database
+    /// at `path` yet, raterm's at `old` is copied there first, so saved tabs,
+    /// settings and flows carry over the rename. raterm's own is left as it was.
+    pub fn open_or_import(path: Result<PathBuf, String>, old: Option<PathBuf>) -> Self {
+        let imported = match (&path, old) {
+            (Ok(path), Some(old)) => import(path, &old),
+            _ => None,
+        };
+        let mut db = Self::open_or_recover(path);
+        if let (Some(notice), Backing::File { recovered_notice: slot @ None, .. }) = (imported, &mut db.backing) {
+            *slot = Some(notice);
+        }
+        db
+    }
+
+    /// Logs `message` unless it already was this run.
+    pub fn log_once(&self, message: String) {
+        if self.logged.lock().unwrap_or_else(|e| e.into_inner()).insert(message.clone()) {
+            eprintln!("misag: {message}");
         }
     }
 
@@ -515,7 +541,7 @@ impl Db {
         for row in rows {
             match SessionId::parse(&row.map_err(sql)?) {
                 Ok(id) => pinned.push(id),
-                Err(e) => eprintln!("misag: pinned session: {e}"),
+                Err(e) => self.log_once(format!("pinned session: {e}")),
             }
         }
         Ok(pinned)
@@ -549,7 +575,7 @@ impl Db {
                 Ok(id) => {
                     sessions.insert(tab_id, id);
                 }
-                Err(e) => eprintln!("misag: tab {tab_id}: {e}"),
+                Err(e) => self.log_once(format!("tab {tab_id}: {e}")),
             }
         }
         Ok(sessions)
@@ -777,6 +803,41 @@ impl Db {
     }
 }
 
+/// Copies the database at `old`, with its WAL files, to `path` if there is no
+/// database there yet, and returns the notice that says so. A failed copy is
+/// logged and leaves nothing at `path`, so the app starts fresh.
+fn import(path: &Path, old: &Path) -> Option<String> {
+    if !matches!(path.try_exists(), Ok(false)) || !matches!(old.try_exists(), Ok(true)) {
+        return None;
+    }
+    // Copied under another name first, so a copy cut short is never opened.
+    let copying = PathBuf::from(format!("{}.importing", path.display()));
+    let copied = (|| {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        for (src, dst) in database_files(old).iter().zip(&database_files(&copying)) {
+            match std::fs::copy(src, dst) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        move_files(&database_files(&copying), &database_files(path))
+    })();
+    if let Err(e) = copied {
+        eprintln!("misag: could not copy raterm's database from {}: {e}; starting fresh", old.display());
+        for file in database_files(&copying) {
+            let _ = std::fs::remove_file(file);
+        }
+        return None;
+    }
+    eprintln!("misag: copied raterm's database from {} to {}", old.display(), path.display());
+    Some(format!(
+        "Saved tabs, settings and flows were copied from raterm, the app's old name. raterm's own database was left at {}.",
+        old.display()
+    ))
+}
+
 /// Renames each existing `from` file to the matching `to`, putting back whatever
 /// was already moved if one fails. Sidecars come first, so a failure does not leave
 /// a stale WAL next to a fresh database (unless putting it back fails too, which
@@ -909,6 +970,41 @@ pub(crate) mod tests {
     /// A report with only a tab and a session (source `clear`).
     pub(crate) fn report<'a>(tab_id: &'a TabId, session_id: &'a SessionId) -> SessionReport<'a> {
         SessionReport { tab_id, session_id, source: Some("clear"), cwd: None, transcript_path: None, claude_pid: None }
+    }
+
+    #[test]
+    fn a_raterm_database_is_copied_when_there_is_none_yet() {
+        let old = crate::test_support::temp_dir("import-old").join(RATERM_FILE);
+        let raterm = Db::open(old.clone()).unwrap();
+        raterm.save_layout(Layout { active: 0, tabs: vec![claude_tab("a", None)] }).unwrap();
+        // Left open, so the tab may still be only in the WAL.
+        let path = crate::test_support::temp_dir("import-new").join("sub").join(FILE);
+        let db = Db::open_or_import(Ok(path.clone()), Some(old.clone()));
+        assert_eq!(db.load_layout().unwrap().tabs.len(), 1);
+        assert_eq!(db.hook_path(), Some(path.as_path()));
+        let StoreStatus::Recovered { notice } = db.status() else { panic!("expected a notice") };
+        assert!(notice.contains(&old.display().to_string()));
+        // The old database is left as it was, for raterm itself.
+        assert_eq!(raterm.load_layout().unwrap().tabs.len(), 1);
+        assert!(files_named(path.parent().unwrap(), &format!("{FILE}.")).is_empty());
+    }
+
+    #[test]
+    fn a_raterm_database_never_replaces_an_existing_one() {
+        let old = crate::test_support::temp_dir("import-kept-old").join(RATERM_FILE);
+        Db::open(old.clone()).unwrap().save_layout(Layout { active: 0, tabs: vec![claude_tab("a", None)] }).unwrap();
+        let path = temp_db("import-kept-new");
+        drop(Db::open(path.clone()).unwrap());
+        let db = Db::open_or_import(Ok(path), Some(old));
+        assert_eq!(db.load_layout().unwrap().tabs.len(), 0);
+        assert_eq!(db.status(), StoreStatus::Saving);
+    }
+
+    #[test]
+    fn without_a_raterm_database_a_fresh_one_starts_quietly() {
+        let missing = crate::test_support::temp_dir("import-none").join(RATERM_FILE);
+        let db = Db::open_or_import(Ok(temp_db("import-none-new")), Some(missing));
+        assert_eq!(db.status(), StoreStatus::Saving);
     }
 
     fn files_named(dir: &Path, prefix: &str) -> Vec<String> {

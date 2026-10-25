@@ -68,7 +68,7 @@ pub const PANIC_TEST_ENV: &str = "MISAG_HOOK_TEST_PANIC";
 
 /// A Claude Code session id. Only canonical lowercase UUIDs are accepted, since
 /// the id ends up in a command line and a file path; holding one proves that.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SessionId(String);
 

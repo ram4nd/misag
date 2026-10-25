@@ -128,16 +128,21 @@ export function createHistory(opts: HistoryOptions): History {
     hint.textContent = "No Claude sessions saved yet.";
   }
 
+  /** The failure last logged, so one that lasts is not logged on every poll. */
+  let logged: string | null = null;
+
   /** Reads the sessions; false if that failed (the last ones read stay shown). */
   async function reload(): Promise<boolean> {
     const read = ++reads;
     try {
       const next = await opts.list(limit);
+      logged = null;
       if (read === reads) render((page = next), (failure = null));
       return true;
     } catch (err) {
-      console.error("misag: could not read the Claude sessions", err);
       const message = `Sessions could not be read: ${opts.errorText(err)}. The reload button tries again.`;
+      if (message !== logged) console.error("misag: could not read the Claude sessions", err);
+      logged = message;
       if (read === reads) render(page, (failure = message));
       return false;
     }

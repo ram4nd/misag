@@ -573,7 +573,7 @@ pub fn claude_history(
     for id in &page.gone_pins {
         // The listing stands without it; the next one tries again.
         if let Err(e) = db.set_session_pinned(id, false) {
-            eprintln!("misag: could not unpin {}, whose transcript is gone: {e}", id.as_str());
+            db.log_once(format!("could not unpin {}, whose transcript is gone: {e}", id.as_str()));
         }
     }
     Ok(page)

@@ -1,5 +1,5 @@
 # Maintainer: Ra Mänd
-# Repackages the .deb from `pnpm tauri build --bundles deb`; build.sh copies it here first.
+# Repackages the .deb from `pnpm tauri build --bundles deb`; build.sh builds it from a copy in build/.
 pkgname=misag-bin
 pkgver=0.1.0
 pkgrel=1

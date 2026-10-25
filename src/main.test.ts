@@ -690,21 +690,54 @@ describe("tab icons", () => {
     expect(kind(0)).toBe("terminal");
   });
 
+  const busy = () => tabs().map((t) => t.classList.contains("busy"));
+
   test("a tab shows Claude working while its title has a spinner", async () => {
     await boot();
     await clickClaude();
-    await clickTerminal();
-    const busy = () => tabs().map((t) => t.classList.contains("busy"));
     terms()[0].handlers.title("✳ Claude Code");
-    expect(busy()).toEqual([false, false]);
+    expect(busy()).toEqual([false]);
     terms()[0].handlers.title("◐ Claude Code");
-    terms()[1].handlers.title("⠂ Fix the build");
-    expect(busy()).toEqual([true, true]);
+    expect(busy()).toEqual([true]);
     terms()[0].handlers.title("◑ Greeting reply");
-    expect(busy()).toEqual([true, true]);
+    expect(busy()).toEqual([true]);
     terms()[0].handlers.title("✳ Greeting reply");
-    terms()[1].handlers.title("me@host: ~/work");
-    expect(busy()).toEqual([false, false]);
+    expect(busy()).toEqual([false]);
+  });
+
+  test.each([
+    ["◐ a", true],
+    ["◓ a", true],
+    ["⠁ a", true],
+    ["⣿ a", true],
+    ["◔ a", false],
+    ["⠀ a", false],
+    ["◐a", false],
+    ["✳ a", false],
+  ])("the title %j shows Claude working: %s", async (title, working) => {
+    await boot();
+    await clickClaude();
+    terms()[0].handlers.title(title);
+    expect(busy()).toEqual([working]);
+  });
+
+  test("a terminal tab shows Claude working only while Claude runs in it", async () => {
+    await boot();
+    await clickTerminal();
+    // Another tool's spinner in a plain shell.
+    terms()[0].handlers.title("⠂ Installing");
+    expect(busy()).toEqual([false]);
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    terms()[0].handlers.title("◐ Fix the build");
+    expect(busy()).toEqual([true]);
+    // Claude quit mid-turn and the shell set no title.
+    delete openClaudes[1];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
   });
 
   test("a renamed or exited tab still stops showing Claude working", async () => {
@@ -3299,6 +3332,28 @@ describe("session history", () => {
     expect(callsOf("claude_history").at(-1)!.args).toMatchObject({ limit: 20 });
     expect(rows()).toHaveLength(20);
     expect(box().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
+  });
+
+  test("a read that keeps failing is logged once, not on every poll", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await openClaudeTabs(1);
+    await settle();
+    failing.add("claude_history");
+    failing.add("claude_tab_sessions");
+    await vi.advanceTimersByTimeAsync(30_000);
+    const logged = (text: string) => error.mock.calls.filter((c) => String(c[0]).includes(text)).length;
+    expect(logged("could not read the Claude sessions")).toBe(1);
+    expect(logged("could not read the tabs' Claude sessions")).toBe(1);
+    // Logged again once it failed anew after working.
+    failing.delete("claude_history");
+    failing.delete("claude_tab_sessions");
+    await vi.advanceTimersByTimeAsync(10_000);
+    failing.add("claude_history");
+    failing.add("claude_tab_sessions");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(logged("could not read the Claude sessions")).toBe(2);
+    expect(logged("could not read the tabs' Claude sessions")).toBe(2);
   });
 
   test("transcripts that could not be read are counted in the box", async () => {

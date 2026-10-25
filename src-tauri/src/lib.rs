@@ -88,10 +88,11 @@ fn own_exe() -> commands::AppExe {
     )
 }
 
-/// The app's database, ready to use. Problems are logged and shown to the user,
-/// never fatal: the app must start even if saved state cannot be read.
-fn open_store(dir: Result<PathBuf, String>) -> db::Db {
-    let db = db::Db::open_or_recover(dir.map(|d| d.join(db::FILE)));
+/// The app's database, ready to use, taken over from raterm's in `old_dir` on the
+/// first start. Problems are logged and shown to the user, never fatal: the app
+/// must start even if saved state cannot be read.
+fn open_store(dir: Result<PathBuf, String>, old_dir: Option<PathBuf>) -> db::Db {
+    let db = db::Db::open_or_import(dir.map(|d| d.join(db::FILE)), old_dir.map(|d| d.join(db::RATERM_FILE)));
     if let Err(e) = db.prune_claude_sessions() {
         eprintln!("misag: could not prune Claude sessions: {e}");
     }
@@ -99,6 +100,14 @@ fn open_store(dir: Result<PathBuf, String>) -> db::Db {
         eprintln!("misag: could not resume the flow runs: {e}");
     }
     db
+}
+
+/// Where raterm, misag's old name, kept its data, given misag's app data directory:
+/// the same place under raterm's identifier.
+fn raterm_data_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    let name = dir.file_name()?.to_str()?;
+    let suffix = name.strip_prefix("io.github.ram4nd.misag")?;
+    Some(dir.with_file_name(format!("com.tag1.raterm{suffix}")))
 }
 
 /// The `claude` wrapper for terminal tabs. Without it, `claude` in a terminal tab
@@ -145,8 +154,9 @@ pub fn run() {
             // Debug builds keep their data in a subdirectory, so even a dev build run
             // without the dev config's identifier never touches an installed misag's.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string());
-            let dir = dir.map(|d| if cfg!(debug_assertions) { d.join("dev") } else { d });
-            let store = open_store(dir);
+            let old_dir = dir.as_deref().ok().and_then(raterm_data_dir);
+            let in_build = |d: PathBuf| if cfg!(debug_assertions) { d.join("dev") } else { d };
+            let store = open_store(dir.map(in_build), old_dir.map(in_build));
             app.manage(install_wrapper(&store, &app.state::<commands::AppExe>()));
             app.manage(store);
             Ok(())
@@ -243,7 +253,7 @@ mod tests {
         }
         drop(previous);
 
-        let store = open_store(Ok(dir.clone()));
+        let store = open_store(Ok(dir.clone()), None);
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM claude_sessions", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 1);
         let loaded = store.load_layout().unwrap();
@@ -252,8 +262,16 @@ mod tests {
     }
 
     #[test]
+    fn raterm_kept_its_data_next_to_misags() {
+        let old = |dir: &str| raterm_data_dir(std::path::Path::new(dir));
+        assert_eq!(old("/d/io.github.ram4nd.misag"), Some(PathBuf::from("/d/com.tag1.raterm")));
+        assert_eq!(old("/d/io.github.ram4nd.misag.dev"), Some(PathBuf::from("/d/com.tag1.raterm.dev")));
+        assert_eq!(old("/d/somebody.else"), None);
+    }
+
+    #[test]
     fn a_store_without_a_directory_still_works() {
-        let store = open_store(Err("no data dir".into()));
+        let store = open_store(Err("no data dir".into()), None);
         assert!(matches!(store.status(), db::StoreStatus::NotSaving { .. }));
     }
 }
