@@ -3913,6 +3913,122 @@ describe("session history", () => {
   });
 });
 
+describe("tab order", () => {
+  const mouse = (target: EventTarget, type: string, clientX: number) =>
+    target.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0, clientX }));
+
+  beforeEach(() => {
+    // Each tab is 100px wide, side by side in its current order from 0.
+    vi.spyOn(HTMLElement.prototype, "offsetLeft", "get").mockImplementation(function (this: HTMLElement) {
+      return Math.max(tabs().indexOf(this), 0) * 100;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(100);
+  });
+
+  /** Drags tab `i` to `x`, then releases it, with the click a browser sends after. */
+  function drag(i: number, x: number) {
+    const tab = tabs()[i];
+    const start = i * 100 + 10;
+    mouse(tab.querySelector(".name")!, "mousedown", start);
+    mouse(document, "mousemove", start + 2);
+    mouse(document, "mousemove", x);
+    mouse(document, "mouseup", x);
+    tab.click();
+  }
+
+  test("a tab dragged along the tab bar moves there and is saved in its new place", async () => {
+    await boot();
+    for (let i = 0; i < 3; i++) await clickTerminal();
+    drag(2, 10);
+    expect(tabNames()).toEqual(["shell 3", "shell 1", "shell 2"]);
+    // Let go, it settles into its place.
+    expect(tabs()[0].style.transform).toBe("");
+    drag(1, 290);
+    expect(tabNames()).toEqual(["shell 3", "shell 2", "shell 1"]);
+    // The tab clicked last is the one let go last.
+    expect(tabs()[2].classList.contains("active")).toBe(true);
+    await win.closeRequested!();
+    expect(lastSaved()!.tabs.map((t) => t.name)).toEqual(["shell 3", "shell 2", "shell 1"]);
+    expect(lastSaved()!.active).toBe(2);
+  });
+
+  test("a terminal tab stays before the page tabs", async () => {
+    await boot();
+    for (let i = 0; i < 2; i++) await clickTerminal();
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    for (let i = 0; i < 6; i++) await flush();
+    drag(0, 290);
+    expect(tabNames()).toEqual(["shell 2", "shell 1", "Settings"]);
+  });
+
+  test("a tab grabbed again while it settles stays marked as dragged", async () => {
+    // Like the Web Animations API: a cancelled animation reports it later.
+    const running = new Map<Element, Animation[]>();
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    proto.animate = function (this: HTMLElement) {
+      const a = {
+        onfinish: null as ((e: AnimationPlaybackEvent) => void) | null,
+        oncancel: null as ((e: AnimationPlaybackEvent) => void) | null,
+        cancel() {
+          queueMicrotask(() => a.oncancel?.(new Event("cancel") as AnimationPlaybackEvent));
+        },
+      } as unknown as Animation;
+      running.set(this, [...(running.get(this) ?? []), a]);
+      return a;
+    };
+    proto.getAnimations = function (this: HTMLElement) {
+      const list = running.get(this) ?? [];
+      running.delete(this);
+      return list;
+    };
+    try {
+      await boot();
+      for (let i = 0; i < 3; i++) await clickTerminal();
+      // Let go 20px off its place, it slides back into it.
+      drag(2, 30);
+      mouse(tabs()[0].querySelector(".name")!, "mousedown", 30);
+      mouse(document, "mousemove", 40);
+      await flush();
+      expect(tabs()[0].classList.contains("dragging")).toBe(true);
+      mouse(document, "mouseup", 40);
+    } finally {
+      delete proto.animate;
+      delete proto.getAnimations;
+    }
+  });
+
+  test("a drag ends where it is when the tab bar is drawn again", async () => {
+    await boot();
+    for (let i = 0; i < 2; i++) await clickTerminal();
+    mouse(tabs()[0].querySelector(".name")!, "mousedown", 10);
+    mouse(document, "mousemove", 20);
+    expect(document.body.classList.contains("dragging-tab")).toBe(true);
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    for (let i = 0; i < 6; i++) await flush();
+    mouse(document, "mousemove", 190);
+    expect(document.body.classList.contains("dragging-tab")).toBe(false);
+    expect(tabNames()).toEqual(["shell 1", "shell 2", "Settings"]);
+    // The drag no longer follows the mouse.
+    mouse(document, "mousemove", 190);
+    expect(tabNames()).toEqual(["shell 1", "shell 2", "Settings"]);
+    expect(tabs().some((t) => t.classList.contains("dragging"))).toBe(false);
+  });
+
+  test("pressing the close button or a short click does not move the tab", async () => {
+    await boot();
+    for (let i = 0; i < 2; i++) await clickTerminal();
+    mouse(tabs()[0].querySelector(".x")!, "mousedown", 90);
+    mouse(document, "mousemove", 190);
+    mouse(document, "mouseup", 190);
+    expect(tabNames()).toEqual(["shell 1", "shell 2"]);
+    mouse(tabs()[1], "mousedown", 110);
+    mouse(document, "mouseup", 111);
+    tabs()[1].click();
+    expect(tabNames()).toEqual(["shell 1", "shell 2"]);
+    expect(tabs()[1].classList.contains("active")).toBe(true);
+  });
+});
+
 describe("toolbox order", () => {
   const order = () => [...document.querySelectorAll<HTMLElement>("#sidebar .toolbox")].map((b) => b.id);
   const header = (id: string) => document.querySelector<HTMLElement>(`#${id} header .toggle`)!;

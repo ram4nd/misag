@@ -11,7 +11,7 @@ import { createTree, type Listing } from "./tree";
 import { createFlows, type Flow, type Run } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
 import { createHistory, type Page as HistoryPage, type Past } from "./history";
-import { remember, remembered, setupToolboxes } from "./toolbox";
+import { DRAG_THRESHOLD, remember, remembered, setupToolboxes, slide } from "./toolbox";
 
 /**
  * What a tab runs, tagged by `kind`; each kind has only its own fields.
@@ -637,6 +637,9 @@ function renderSessions() {
       tab.append(tabIcon(s), name, x);
       tab.onclick = () => activate(s);
       tab.ondblclick = () => rename(s, tab);
+      tab.onmousedown = (e) => {
+        if (e.button === 0 && !(e.target instanceof Element && e.target.closest(".x, input"))) dragTab(s, e);
+      };
       // Middle-click closes the tab.
       tab.onauxclick = (e) => {
         if (e.button === 1) close(s);
@@ -648,6 +651,82 @@ function renderSessions() {
     pageOf(id).tabEl = renderPageTab(id);
     tabsEl.append(pageOf(id).tabEl!);
   }
+}
+
+/** The tab being dragged, if any. */
+let draggedTab: HTMLElement | null = null;
+
+/** The terminal tab of `s` in the tab bar, if it is still open. */
+const tabOf = (s: Session) => tabsEl.children[sessions.indexOf(s)] as HTMLElement | undefined;
+
+/** Moves the tab of `s` to place `to` among the terminal tabs, sliding the tab it passes into its new place. */
+function moveTab(s: Session, to: number) {
+  const from = sessions.indexOf(s);
+  const tab = tabOf(s)!;
+  const passed = tabsEl.children[to] as HTMLElement;
+  const before = passed.offsetLeft;
+  for (const a of passed.getAnimations?.() ?? []) a.cancel();
+  sessions.splice(from, 1);
+  sessions.splice(to, 0, s);
+  if (to < from) passed.before(tab);
+  else passed.after(tab);
+  slide(passed, before - passed.offsetLeft, "X");
+}
+
+/**
+ * Drags the tab of `s` along the tab bar once the mouse has moved far enough, among
+ * the terminal tabs only (pages stay after them). The new order is saved when it is let go.
+ */
+function dragTab(s: Session, down: MouseEvent) {
+  const startTab = tabOf(s)!;
+  /** Where in the tab it was grabbed, so it stays under the mouse at that point. */
+  const grab = down.clientX - startTab.offsetLeft;
+  let tab: HTMLElement | null = null;
+  /** How far the dragged tab is drawn off its place, to follow the mouse. */
+  let shift = 0;
+
+  const move = (e: MouseEvent) => {
+    if (!tab && Math.abs(e.clientX - down.clientX) < DRAG_THRESHOLD) return;
+    // Re-rendered or closed meanwhile: the drag ends where it is.
+    if (startTab !== tabOf(s)) return up();
+    if (!tab) {
+      tab = draggedTab = startTab;
+      for (const a of tab.getAnimations?.() ?? []) a.cancel();
+      tab.classList.add("dragging");
+      document.body.classList.add("dragging-tab");
+    }
+    e.preventDefault();
+    const left = e.clientX - grab;
+    for (;;) {
+      const i = sessions.indexOf(s);
+      const prev = tabsEl.children[i - 1] as HTMLElement | undefined;
+      const next = i + 1 < sessions.length ? (tabsEl.children[i + 1] as HTMLElement) : undefined;
+      if (prev && left < prev.offsetLeft + prev.offsetWidth / 2) moveTab(s, i - 1);
+      else if (next && left + tab.offsetWidth > next.offsetLeft + next.offsetWidth / 2) moveTab(s, i + 1);
+      else break;
+    }
+    shift = left - tab.offsetLeft;
+    tab.style.transform = `translateX(${shift}px)`;
+  };
+
+  const up = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    if (!tab) return;
+    const dropped = tab;
+    draggedTab = null;
+    // Settles into its place from where it was let go.
+    dropped.style.transform = "";
+    document.body.classList.remove("dragging-tab");
+    const settle = slide(dropped, shift, "X");
+    // Not when it was grabbed again meanwhile, which cancels this animation.
+    const done = () => draggedTab !== dropped && dropped.classList.remove("dragging");
+    if (settle) settle.onfinish = settle.oncancel = done;
+    else done();
+    scheduleSave();
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
 }
 
 /** The tab's directory: its live one, else the one it was opened in. */

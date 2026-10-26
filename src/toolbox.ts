@@ -26,8 +26,8 @@ function forget(key: string) {
 
 /** The toolboxes' order, as their ids, in localStorage. */
 const ORDER_KEY = "misag.toolboxOrder";
-/** How far (px) the mouse must move with a header held down before it drags the toolbox. */
-const DRAG_THRESHOLD = 4;
+/** How far (px) the mouse must move with a header (or a tab) held down before it drags it. */
+export const DRAG_THRESHOLD = 4;
 /** How long toolboxes take to slide into place while one is dragged, and the dragged one after it is dropped. */
 const SLIDE_MS = 180;
 const EASING = "cubic-bezier(.2, 0, 0, 1)";
@@ -37,12 +37,12 @@ const DRAG_CLICK_MS = 300;
 const reducedMotion = () => window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
 /**
- * Slides `el` into its place from `from` px off it (positive: below). Does nothing
- * when `from` is 0, without animation support, or when reduced motion is asked for.
+ * Slides `el` into its place from `from` px off it (positive: below, or right along X). Does
+ * nothing when `from` is 0, without animation support, or when reduced motion is asked for.
  */
-function slide(el: HTMLElement, from: number): Animation | undefined {
+export function slide(el: HTMLElement, from: number, axis: "X" | "Y" = "Y"): Animation | undefined {
   if (!from || !el.animate || reducedMotion()) return undefined;
-  return el.animate([{ transform: `translateY(${from}px)` }, { transform: "none" }], { duration: SLIDE_MS, easing: EASING });
+  return el.animate([{ transform: `translate${axis}(${from}px)` }, { transform: "none" }], { duration: SLIDE_MS, easing: EASING });
 }
 
 const collapsedKey = (box: HTMLElement) => `misag.toolbox.${box.id.replace(/-box$/, "")}.collapsed`;

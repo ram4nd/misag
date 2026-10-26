@@ -11,6 +11,7 @@ How every part of Mischief of Agents (`misag`) behaves. For an overview, buildin
 | New Claude tab in a folder | Hover the folder (or the workspace folder at the top) in the Workspace box and click its Claude icon |
 | Rename a tab | Double-click it |
 | Close a tab | Click ✕ or middle-click the tab |
+| Reorder tabs | Drag a tab along the tab bar; Settings, Workspace, Flows and flow editor tabs stay after the terminal tabs |
 | Restart a tab whose process exited or failed to start | Press Enter in it |
 | Paste the selection | Middle-click a terminal: it pastes what is selected anywhere on the desktop (the primary selection), bracketed if the program asked for it. A program that tracks the mouse (tmux, vim) gets the click instead; Shift+middle-click pastes there. misag reads it through GTK itself, as WebKitGTK 2.54 crashes the app pasting a middle click on its own |
 | Open a link | Ctrl+click a link a program marks as one (OSC 8 hyperlinks, as Claude Code and `ls --hyperlink` print); it opens in the system browser. Plain URLs in the output are not clickable |
