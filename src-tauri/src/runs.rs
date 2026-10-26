@@ -345,8 +345,9 @@ pub fn proceed(conn: &mut Connection, run_id: i64, output: &str) -> Result<Optio
 
 /// The person has seen to a prompt step that needs attention (answered Claude, or
 /// fixed what it asked for): the run goes back to running the step, and the
-/// returned text has Claude go on with it (see `Resume`). Refused where that cannot
-/// help, as at a step limit, where the person picks an output instead.
+/// returned text has Claude go on with it (see `Resume`), logged in
+/// `flow_run_resumes`. Refused where that cannot help, as at a step limit, where the
+/// person picks an output instead.
 pub fn resume(conn: &mut Connection, run_id: i64) -> Result<String, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
@@ -357,6 +358,12 @@ pub fn resume(conn: &mut Connection, run_id: i64) -> Result<String, String> {
     let Some(how) = run.resume else {
         return Err(format!("Claude going on with \"{}\" would not help; pick an output instead", node.name()));
     };
+    // Logged with why it waited, before going on clears that.
+    tx.execute(
+        "INSERT INTO flow_run_resumes (run_id, node_id, note, at) SELECT id, node_id, note, ?2 FROM flow_runs WHERE id = ?1",
+        params![run.id, now()],
+    )
+    .map_err(sql)?;
     set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
     let prompt = match how {
         Resume::Remind => flows::resume_text(node),
@@ -783,6 +790,25 @@ mod tests {
         assert!(!run.resumable);
         assert!(resume(&mut conn, run.id).is_err());
         assert_eq!(only_run(&conn), run);
+    }
+
+    #[test]
+    fn a_continue_is_logged_with_why_the_run_waited_but_is_not_a_run_of_the_step() {
+        let g = review_loop();
+        let (_db, mut conn, flow) = setup("runs-resume-log", &g);
+        let t = tab("t1");
+        start(&mut conn, flow, &t).unwrap();
+        on_stop(&mut conn, &t, Some("Which files?\nFLOW: attention")).unwrap();
+        let id = only_run(&conn).id;
+        resume(&mut conn, id).unwrap();
+        let log: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = conn.prepare("SELECT run_id, node_id, note FROM flow_run_resumes ORDER BY id").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(Result::unwrap).collect()
+        };
+        assert_eq!(log, [(id, "review".to_string(), Some("Claude asked for a person; see its last reply.".to_string()))]);
+        // Review may run twice: the Continue was the same run of it, so a second round is still allowed.
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix"));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), prompt_of(&g, "review"));
     }
 
     #[test]

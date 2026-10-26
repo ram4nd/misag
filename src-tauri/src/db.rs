@@ -127,6 +127,18 @@ const MIGRATIONS: &[&str] = &[r#"
     -- How Continue goes on with a run that needs attention (see runs::Resume);
     -- NULL when it cannot help, and the person picks an output.
     ALTER TABLE flow_runs ADD COLUMN resume TEXT CHECK (resume IN ('remind', 'prompt'));
+"#, r#"
+    -- The times a person had Claude go on with a step that needed attention
+    -- (Continue), and why it waited. Apart from flow_run_events, as going on is
+    -- not another run of the step (see runs::runs_of).
+    CREATE TABLE flow_run_resumes (
+        id      INTEGER PRIMARY KEY,
+        run_id  INTEGER NOT NULL REFERENCES flow_runs (id) ON DELETE CASCADE,
+        node_id TEXT NOT NULL,
+        note    TEXT,
+        at      INTEGER NOT NULL
+    );
+    CREATE INDEX flow_run_resumes_by_run ON flow_run_resumes (run_id);
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
