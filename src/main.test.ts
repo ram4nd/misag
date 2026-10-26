@@ -3251,6 +3251,24 @@ describe("flow editor", () => {
     expect(node("Start").querySelector(".clears")).toBeNull();
   });
 
+  test("Start has an optional base info text, saved with the flow", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    await select("Start");
+    const text = field("text") as HTMLTextAreaElement;
+    expect(text.closest("label")!.hidden).toBe(false);
+    expect(panel().querySelector(".text-label")!.textContent).toBe("Base info");
+    expect(field("outputs").closest("label")!.hidden).toBe(true);
+    text.value = "The app is in src/.";
+    text.dispatchEvent(new Event("input", { bubbles: true }));
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "start")).toMatchObject({ text: "The app is in src/." });
+    await select("P");
+    expect(panel().querySelector(".text-label")!.textContent).toBe("Prompt");
+  });
+
   test("▶ saves a change to the flow first, so a just-ticked /clear counts", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
@@ -3328,13 +3346,12 @@ describe("flow editor", () => {
     expect(saved()!.nodes[1].id).not.toBe(first);
   });
 
-  test("Start and End have no fields for prompts or outputs, and Start cannot be deleted", async () => {
+  test("Start and End have no fields for outputs, End none for a prompt, and Start cannot be deleted", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
     await boot();
     await openFromBox("Deploy");
     await select("Start");
-    expect(field("text").closest("label")!.hidden).toBe(true);
     expect(field("outputs").closest("label")!.hidden).toBe(true);
     expect(panel().querySelector<HTMLButtonElement>("button.delete-step")!.hidden).toBe(true);
     editor().querySelector(".canvas")!.firstElementChild!.dispatchEvent(new KeyboardEvent("keydown", { key: "Delete", bubbles: true }));

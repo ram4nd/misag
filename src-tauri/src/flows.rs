@@ -25,8 +25,8 @@ pub const ATTENTION: &str = "attention";
 /// could misread. A graph is stored as the oldest format that holds it (see
 /// `stored`), so older misags keep reading the flows they can run correctly.
 /// Version 2 added step run limits (`Node::max_runs`), version 3 clearing the
-/// conversation at Start (`Node::clear`).
-pub const GRAPH_VERSION: u32 = 3;
+/// conversation at Start (`Node::clear`), version 4 Start's base info (its `text`).
+pub const GRAPH_VERSION: u32 = 4;
 
 /// Mirrored by `Graph` in src/flowEditor.ts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -61,6 +61,9 @@ pub struct Node {
     pub kind: Kind,
     #[serde(default)]
     pub title: String,
+    /// A prompt step's prompt, or what the person does at a manual step. For Start:
+    /// optional base info (where things are and the like), sent ahead of the run's
+    /// first prompt.
     #[serde(default)]
     pub text: String,
     /// The ways the step can end, each leading to at most one next step.
@@ -210,6 +213,7 @@ fn check_node(node: &Node) -> Result<(), String> {
 pub fn stored(mut graph: Graph) -> Graph {
     // The format each step needs, by the newest field it uses.
     let needs = |n: &Node| match n {
+        Node { kind: Kind::Start, text, .. } if !text.trim().is_empty() => 4,
         Node { kind: Kind::Start, clear: true, .. } => 3,
         Node { max_runs: Some(_), .. } => 2,
         _ => 1,
@@ -285,6 +289,16 @@ pub fn parse_marker(reply: &str) -> Option<String> {
 /// are hidden ones, which `check` refuses, in case a flow stored before holds some.
 pub fn prompt_text(node: &Node) -> String {
     typeable(format!("{}\n\n{}", node.text.trim_end(), reply_rule(node)))
+}
+
+/// `prompt_text` for the first prompt Claude gets in a run, or after the run's
+/// conversation was cleared: led by Start's base info, if it has any.
+pub fn first_prompt_text(graph: &Graph, node: &Node) -> String {
+    let info = graph.nodes.iter().find(|n| n.kind == Kind::Start).map_or("", |n| n.text.trim());
+    if info.is_empty() {
+        return prompt_text(node);
+    }
+    typeable(format!("{info}\n\n{}", prompt_text(node)))
 }
 
 /// What is sent to Claude to go on with a prompt step that needs attention, once
@@ -425,7 +439,7 @@ pub(crate) mod tests {
         let read: Node = serde_json::from_value(serde_json::json!({ "id": "start", "kind": "start", "clear": true, "x": 0, "y": 0 })).unwrap();
         assert!(read.clear);
         assert_eq!(parsed.version, 1, "graphs stored before versions are version 1");
-        let newer = serde_json::json!({ "version": 4, "nodes": [], "edges": [] });
+        let newer = serde_json::json!({ "version": 5, "nodes": [], "edges": [] });
         assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer Mischief of Agents"));
     }
 
@@ -568,6 +582,26 @@ pub(crate) mod tests {
         let mut g = runnable();
         g.nodes[0].clear = true;
         assert!(clears(&g));
+    }
+
+    #[test]
+    fn a_graph_whose_start_has_base_info_is_a_newer_format() {
+        // An older misag would ignore Start's text and run without it.
+        let mut g = runnable();
+        g.nodes[0].text = "  \n".into();
+        assert_eq!(stored(g.clone()).version, 1, "blank text is no base info");
+        g.nodes[0].text = "The app is in src/.".into();
+        assert_eq!(stored(g.clone()).version, 4);
+        check(&stored(g)).unwrap();
+    }
+
+    #[test]
+    fn the_first_prompt_carries_start_s_base_info() {
+        let mut g = runnable();
+        assert_eq!(first_prompt_text(&g, &g.nodes[1]), prompt_text(&g.nodes[1]));
+        g.nodes[0].text = "The app is in src/.\u{1b}\n\n".into();
+        let text = first_prompt_text(&g, &g.nodes[1]);
+        assert_eq!(text, format!("The app is in src/.\n\n{}", prompt_text(&g.nodes[1])));
     }
 
     #[test]

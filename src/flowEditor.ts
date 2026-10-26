@@ -10,6 +10,7 @@ export interface Step {
   id: string;
   kind: StepKind;
   title: string;
+  /** A prompt, what the person does, or for Start: optional base info sent ahead of the first prompt. */
   text: string;
   outputs: string[];
   /** How many times a run may take the step before it waits for the person; absent: no limit. */
@@ -208,13 +209,14 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     outputs.value = s.outputs.join(", ");
     maxRuns.value = s.maxRuns === undefined ? "" : String(s.maxRuns);
     const words = s.kind === "prompt" || s.kind === "manual";
-    text.closest("label")!.hidden = !words;
+    text.closest("label")!.hidden = !words && s.kind !== "start";
     outputs.closest("label")!.hidden = !words;
     // Leaving a manual step is always your pick, which no limit holds back.
     maxRuns.closest("label")!.hidden = s.kind !== "prompt";
     clear.checked = s.clear === true;
     clear.closest("label")!.hidden = s.kind !== "start";
-    $(".text-label").textContent = s.kind === "prompt" ? "Prompt" : "What the person does";
+    $(".text-label").textContent = { start: "Base info", prompt: "Prompt", manual: "What the person does", end: "" }[s.kind];
+    text.placeholder = s.kind === "start" ? "Optional: where things are and what Claude should know, sent ahead of the first prompt" : "";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
 

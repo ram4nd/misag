@@ -86,6 +86,8 @@ Steps ("nodes"):
               no outputs. Not needed: an output that leads nowhere ends it.
   title     The step's name on the canvas (up to 200 characters).
   text      The prompt, or what the person does (up to 20000 characters).
+            Optional on Start: base info, such as where things are, sent
+            ahead of the run's first prompt (and again after a /clear).
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
             and _, starting with a letter or digit, up to 24 characters).
             "attention" is reserved: Claude ends with it to ask for the person.

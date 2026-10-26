@@ -296,6 +296,19 @@ fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
     Ok(earlier + i64::from(run.node_id == step))
 }
 
+/// Whether the run has left a prompt step, so Claude has had Start's base info.
+fn sent_a_prompt(tx: &Transaction, run: &Stored) -> Result<bool, String> {
+    let mut stmt = tx.prepare_cached("SELECT DISTINCT node_id FROM flow_run_events WHERE run_id = ?1").map_err(sql)?;
+    let ids = stmt.query_map([run.id], |r| r.get::<_, String>(0)).map_err(sql)?;
+    for id in ids {
+        let id = id.map_err(sql)?;
+        if run.graph.nodes.iter().any(|n| n.id == id && n.kind == Kind::Prompt) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Moves the run from `from` along `output` to the step it leads to, if any, with
 /// the run's step count at `steps`; returns the prompt to send when that is a
 /// prompt step. The run instead waits at `from` for the person when going on
@@ -319,6 +332,7 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
             }
         }
     }
+    let first = from.kind != Kind::Prompt && !sent_a_prompt(tx, run)?;
     left(tx, run.id, &from.id, output)?;
     let Some(next) = next else {
         // The output leads nowhere: the flow is done.
@@ -328,7 +342,7 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
     match next.kind {
         Kind::Prompt => {
             set(tx, run.id, &next.id, Status::Running, steps + 1, None)?;
-            Ok(Some(flows::prompt_text(next)))
+            Ok(Some(if first { flows::first_prompt_text(&run.graph, next) } else { flows::prompt_text(next) }))
         }
         Kind::Manual => set(tx, run.id, &next.id, Status::Manual, steps, None).map(|()| None),
         Kind::End | Kind::Start => set(tx, run.id, &next.id, Status::Done, steps, None).map(|()| None),
@@ -499,7 +513,8 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Strin
     set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
     let prompt = match how {
         Resume::Remind => flows::resume_text(node),
-        Resume::Prompt => flows::prompt_text(node),
+        // The clear took Start's base info too.
+        Resume::Prompt => flows::first_prompt_text(&run.graph, node),
     };
     tx.commit().map_err(sql)?;
     Ok(prompt)
@@ -729,6 +744,32 @@ mod tests {
             ("F", "t1", "P", Status::Running, 1)
         );
         assert_eq!(run.outputs, ["pass", "fail"]);
+    }
+
+    #[test]
+    fn start_s_base_info_goes_with_the_first_prompt_only() {
+        let mut g = runnable();
+        g.nodes[0].text = "The app is in src/.".into();
+        let (_db, mut conn, flow) = setup("runs-base-info", &g);
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!(started.prompt, Some(flows::first_prompt_text(&g, &g.nodes[1])));
+        assert!(started.prompt.unwrap().starts_with("The app is in src/.\n\ndo p"));
+        // Looping back to the step, Claude already has it.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), prompt_of(&g, "p"));
+        // After a clear, Claude has lost it with the step.
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(go_on(&mut conn, started.run_id).unwrap(), flows::first_prompt_text(&g, &g.nodes[1]));
+    }
+
+    #[test]
+    fn start_s_base_info_waits_for_the_first_prompt_after_manual_steps() {
+        let mut g = manual_first();
+        g.nodes[0].text = "The app is in src/.".into();
+        let (_db, mut conn, flow) = setup("runs-base-info-manual", &g);
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!(started.prompt, None);
+        assert_eq!(pick(&mut conn, started.run_id, "redo").unwrap(), None);
+        assert_eq!(pick(&mut conn, started.run_id, "ok").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
     }
 
     #[test]
