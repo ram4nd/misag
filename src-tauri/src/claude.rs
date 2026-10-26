@@ -328,8 +328,9 @@ fn record(input: &str, tab_id: &TabId, db_path: &Path, claude_pid: Option<u32>) 
     let event: SessionStart = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
     let mut conn = db::connect_existing(db_path)?;
     if event.source.as_deref() == Some("clear") {
-        // Claude no longer has the running step's prompt, so it will not answer it.
-        crate::runs::pause_tab(
+        // A run waiting for this clear goes on; a running step's prompt is gone, so
+        // Claude will not answer it.
+        crate::runs::clear_tab(
             &mut conn,
             tab_id,
             "The conversation was cleared, so Claude no longer has this step's prompt. Pick an output to go on.",
@@ -971,6 +972,21 @@ mod tests {
         record(&payload, &tid("tab-1"), &path, None).unwrap();
         let layout = db.load_layout().unwrap();
         assert_eq!(layout.tabs[0].kind, TabKind::Claude { claude_session: Some(id()) });
+    }
+
+    #[test]
+    fn a_clear_lets_a_run_waiting_for_it_take_its_first_step() {
+        let path = temp_db("hook-clear-run");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        let mut g = crate::flows::tests::runnable();
+        g.nodes[0].clear = true;
+        db.save_flow_graph(flow, &g).unwrap();
+        let mut conn = db::connect_existing(&path).unwrap();
+        let run = crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap().run_id;
+        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"clear"}}"#);
+        record(&payload, &tid("tab-1"), &path, None).unwrap();
+        assert!(matches!(crate::runs::cleared(&mut conn, run).unwrap(), crate::runs::Cleared::Ready { prompt: Some(_) }));
     }
 
     #[test]

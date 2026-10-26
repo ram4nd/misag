@@ -16,7 +16,7 @@ export function remembered(key: string): boolean {
   }
 }
 
-function forget(key: string) {
+export function forget(key: string) {
   try {
     localStorage.removeItem(key);
   } catch (err) {

@@ -85,6 +85,8 @@ Steps ("nodes"):
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run
             waits for the person.
+  clear     Optional, Start only: true begins each run by typing /clear, so
+            Claude starts the flow in a new conversation.
   x, y      Optional position on the canvas: give both or neither. Steps
             without one are laid out in columns from Start.
 

@@ -18,7 +18,7 @@ const ROW: f64 = 180.0;
 /// The fields each part of a file may have, as `write` writes them.
 const FILE_FIELDS: &[&str] = &["misagFlow", "name", "graph"];
 const GRAPH_FIELDS: &[&str] = &["version", "nodes", "edges"];
-const STEP_FIELDS: &[&str] = &["id", "kind", "title", "text", "outputs", "maxRuns", "x", "y"];
+const STEP_FIELDS: &[&str] = &["id", "kind", "title", "text", "outputs", "maxRuns", "clear", "x", "y"];
 const EDGE_FIELDS: &[&str] = &["from", "output", "to"];
 
 /// The flow in `text` as its name and steps, checked like an edit (see `flows::check`).
@@ -163,6 +163,15 @@ mod tests {
         let graph = flows::stored(runnable());
         let (name, read) = parse(&write("Deploy", &graph)).unwrap();
         assert_eq!((name.as_str(), read), ("Deploy", graph));
+    }
+
+    #[test]
+    fn a_flow_that_clears_reads_back_the_same() {
+        let mut graph = runnable();
+        graph.nodes[0].clear = true;
+        let graph = flows::stored(graph);
+        assert!(write("Deploy", &graph).contains("\"clear\": true"));
+        assert_eq!(parse(&write("Deploy", &graph)).unwrap().1, graph);
     }
 
     #[test]

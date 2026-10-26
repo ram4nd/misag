@@ -28,6 +28,8 @@ export interface Flow {
   id: number;
   name: string;
   archived: boolean;
+  /** Whether a run begins by typing /clear; absent: it does not. */
+  clear?: boolean;
 }
 
 export interface FlowsOptions {
@@ -244,8 +246,9 @@ export function createFlows(opts: FlowsOptions): Flows {
         }
         if (run) li.classList.add("running", orphan ? "orphan" : run.status);
         const attention = mine?.status === "attention";
-        const mark = icon(attention ? "circle-alert" : "workflow", 14);
+        const mark = icon(attention ? "circle-alert" : flow.clear ? "eraser" : "workflow", 14);
         if (attention) mark.classList.add("needs-attention");
+        else if (flow.clear) mark.classList.add("clears");
         li.append(mark, nameSpan(flow));
         if (mine?.resumable) {
           const resume = button("resume", "step-forward", "Continue: have Claude go on with this step", () => opts.onResume(mine));

@@ -139,6 +139,10 @@ const MIGRATIONS: &[&str] = &[r#"
         at      INTEGER NOT NULL
     );
     CREATE INDEX flow_run_resumes_by_run ON flow_run_resumes (run_id);
+"#, r#"
+    -- For a run whose Start clears, while it waits at Start for Claude's /clear
+    -- (see runs::Clear); NULL otherwise.
+    ALTER TABLE flow_runs ADD COLUMN clear TEXT CHECK (clear IN ('pending', 'done'));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -662,6 +666,9 @@ pub struct FlowSummary {
     pub id: i64,
     pub name: String,
     pub archived: bool,
+    /// Whether a run begins by clearing the conversation (`flows::clears`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub clear: bool,
 }
 
 /// A flow's name as stored: trimmed, not empty, and plain text, as it is printed in
@@ -693,9 +700,19 @@ impl Db {
     /// Every flow in order, archived ones included.
     pub fn list_flows(&self) -> Result<Vec<FlowSummary>, String> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id, name, archived FROM flows ORDER BY position, id").map_err(sql)?;
+        // Read in SQL, so listing does not parse every flow's steps; it must agree
+        // with `flows::clears` (a test checks), and a graph that is not JSON does not clear.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, archived, CASE WHEN json_valid(graph) THEN EXISTS (
+                    SELECT 1 FROM json_each(graph, '$.nodes')
+                    WHERE json_extract(value, '$.kind') = 'start' AND json_extract(value, '$.clear') = 1
+                 ) ELSE 0 END
+                 FROM flows ORDER BY position, id",
+            )
+            .map_err(sql)?;
         let flows = stmt
-            .query_map([], |r| Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)? }))
+            .query_map([], |r| Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)?, clear: r.get(3)? }))
             .map_err(sql)?
             .collect::<Result<_, _>>()
             .map_err(sql);
@@ -716,6 +733,7 @@ impl Db {
 
     fn add_flow(&self, name: &str, graph: &Graph) -> Result<FlowSummary, String> {
         let name = flow_name(name)?;
+        let clear = flows::clears(graph);
         let graph = graph_json(graph)?;
         let conn = self.conn();
         let now = now_secs();
@@ -725,7 +743,7 @@ impl Db {
             params![name, now, graph],
         )
         .map_err(sql)?;
-        Ok(FlowSummary { id: conn.last_insert_rowid(), name: name.into(), archived: false })
+        Ok(FlowSummary { id: conn.last_insert_rowid(), name: name.into(), archived: false, clear })
     }
 
     pub fn rename_flow(&self, id: i64, name: &str) -> Result<(), String> {
@@ -782,7 +800,7 @@ impl Db {
         let graph: Graph = serde_json::from_str(&graph)
             .map_err(|e| format!("the steps of \"{name}\" cannot be read ({e})"))?;
         let graph = if graph.nodes.is_empty() && graph.edges.is_empty() { Graph::default() } else { graph };
-        Ok((FlowSummary { id, name, archived }, graph))
+        Ok((FlowSummary { id, name, archived, clear: flows::clears(&graph) }, graph))
     }
 
     /// Stores the flow's steps if they pass `flows::check`.
@@ -831,8 +849,12 @@ impl Db {
         runs::stop_tab(&self.conn(), tab_id)
     }
 
-    pub fn start_run(&self, flow_id: i64, tab_id: &TabId) -> Result<Option<String>, String> {
+    pub fn start_run(&self, flow_id: i64, tab_id: &TabId) -> Result<runs::Started, String> {
         runs::start(&mut self.conn(), flow_id, tab_id)
+    }
+
+    pub fn cleared_run(&self, run_id: i64) -> Result<runs::Cleared, String> {
+        runs::cleared(&mut self.conn(), run_id)
     }
 
     pub fn proceed_run(&self, run_id: i64, output: &str) -> Result<Option<String>, String> {
@@ -1742,6 +1764,39 @@ pub(crate) mod tests {
         db.save_flow_graph(id, &g).unwrap();
         let (_, loaded) = db.load_flow(id).unwrap();
         assert_eq!((loaded.version, loaded.nodes[1].max_runs), (2, Some(2)));
+    }
+
+    #[test]
+    fn the_list_says_which_flows_start_with_clear() {
+        let db = Db::open(temp_db("flows-clear")).unwrap();
+        let plain = db.create_flow("Deploy").unwrap().id;
+        let clears = db.create_flow("Review").unwrap().id;
+        let mut g = crate::flows::tests::runnable();
+        g.nodes[0].clear = true;
+        db.save_flow_graph(clears, &g).unwrap();
+        let listed: Vec<_> = db.list_flows().unwrap().into_iter().map(|f| (f.id, f.clear)).collect();
+        assert_eq!(listed, vec![(plain, false), (clears, true)]);
+    }
+
+    #[test]
+    fn the_list_reads_clear_as_flows_clears_does() {
+        let db = Db::open(temp_db("flows-clear-parity")).unwrap();
+        let id = db.create_flow("Deploy").unwrap().id;
+        let listed = || db.list_flows().unwrap()[0].clear;
+        let mut g = crate::flows::tests::runnable();
+        for clear in [false, true] {
+            g.nodes[0].clear = clear;
+            db.save_flow_graph(id, &g).unwrap();
+            assert_eq!(listed(), crate::flows::clears(&g));
+        }
+        // Rows check would refuse, which only a hand edit or an older bug could store.
+        let raw = |json: &str| db.conn().execute("UPDATE flows SET graph = ?1 WHERE id = ?2", params![json, id]).unwrap();
+        raw(r#"{"nodes":[{"id":"p","kind":"prompt","clear":true,"x":0,"y":0}],"edges":[]}"#);
+        assert!(!listed(), "only Start clears");
+        raw(r#"{"nodes":[{"id":"start","kind":"start","clear":"yes","x":0,"y":0}],"edges":[]}"#);
+        assert!(!listed());
+        raw("not json");
+        assert!(!listed());
     }
 
     #[test]

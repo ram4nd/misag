@@ -671,8 +671,14 @@ pub fn flow_save_graph(db: State<'_, Db>, id: i64, graph: Graph) -> Result<Vec<S
 }
 
 #[tauri::command(async)]
-pub fn flow_start(db: State<'_, Db>, flow_id: i64, tab_id: TabId) -> Result<Option<String>, CommandError> {
+pub fn flow_start(db: State<'_, Db>, flow_id: i64, tab_id: TabId) -> Result<crate::runs::Started, CommandError> {
     Ok(db.start_run(flow_id, &tab_id)?)
+}
+
+/// How a run that cleared at its start is getting on (see `runs::cleared`).
+#[tauri::command(async)]
+pub fn flow_cleared(db: State<'_, Db>, run_id: i64) -> Result<crate::runs::Cleared, CommandError> {
+    Ok(db.cleared_run(run_id)?)
 }
 
 #[tauri::command(async)]
@@ -803,7 +809,7 @@ mod tests {
 
     #[test]
     fn a_loaded_flow_is_one_flat_object() {
-        let flow = FlowSummary { id: 3, name: "Deploy".into(), archived: false };
+        let flow = FlowSummary { id: 3, name: "Deploy".into(), archived: false, clear: false };
         let detail = FlowDetail { flow, graph: Graph::default(), problems: vec!["x".into()] };
         let json = serde_json::to_value(detail).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();

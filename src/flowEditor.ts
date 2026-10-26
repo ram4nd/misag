@@ -14,6 +14,8 @@ export interface Step {
   outputs: string[];
   /** How many times a run may take the step before it waits for the person; absent: no limit. */
   maxRuns?: number;
+  /** For Start: a run begins by typing /clear, in a new conversation; absent: it does not. */
+  clear?: boolean;
   x: number;
   y: number;
 }
@@ -98,6 +100,9 @@ function editorMarkup(): string {
               <label>Run at most (times) <input name="maxRuns" type="number" min="1" placeholder="no limit" />
                 <span class="hint">For a step a loop comes back to, such as a review after a fix: once it has run this many times, the run waits for you before taking it again. Leave empty for no limit.</span>
               </label>
+              <label class="check"><input name="clear" type="checkbox" /> Start with /clear
+                <span class="hint">Each run first clears the conversation, so Claude begins the flow without what came before.</span>
+              </label>
               <p class="invalid" role="alert" hidden></p>
               <p class="invalid runs-invalid" role="alert" hidden></p>
               <button type="button" class="delete-step">Delete step</button>
@@ -124,6 +129,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   const text = $<HTMLTextAreaElement>("[name=text]");
   const outputs = $<HTMLInputElement>("[name=outputs]");
   const maxRuns = $<HTMLInputElement>("[name=maxRuns]");
+  const clear = $<HTMLInputElement>("[name=clear]");
   maxRuns.max = String(MAX_RUNS);
   const invalidRuns = $<HTMLElement>(".runs-invalid");
   const invalid = $<HTMLElement>(".invalid:not(.runs-invalid)");
@@ -206,6 +212,8 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     outputs.closest("label")!.hidden = !words;
     // Leaving a manual step is always your pick, which no limit holds back.
     maxRuns.closest("label")!.hidden = s.kind !== "prompt";
+    clear.checked = s.clear === true;
+    clear.closest("label")!.hidden = s.kind !== "start";
     $(".text-label").textContent = s.kind === "prompt" ? "Prompt" : "What the person does";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
@@ -314,6 +322,13 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     changed(true);
   }
   outputs.onchange = commitOutputs;
+  clear.onchange = () => {
+    const s = find(selected);
+    if (!s || s.kind !== "start") return;
+    if (clear.checked) s.clear = true;
+    else delete s.clear;
+    changed(true);
+  };
   /** Applies the run limit field to the selected prompt step, or says why it cannot. */
   function commitMaxRuns() {
     const s = find(selected);

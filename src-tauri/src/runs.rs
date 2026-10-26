@@ -9,6 +9,10 @@
 //! was interrupted) or, at a prompt step, has Claude go on with it. An output with
 //! no next step ends the run.
 //!
+//! A flow whose Start clears begins in the tab's new conversation: its run holds
+//! the tab at Start while the app types `/clear`, the SessionStart hook reports the
+//! clear (`clear_tab`), and the app then takes the first step (`cleared`).
+//!
 //! Any turn that ends while a step runs counts as its reply, including one the
 //! person started by chatting with Claude.
 //!
@@ -89,6 +93,48 @@ impl Resume {
     }
 }
 
+/// Where a run whose Start clears is with the clear, while it is at Start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Clear {
+    /// `/clear` is being typed; Claude has not reported it yet.
+    Pending,
+    /// Claude has cleared; the app takes the first step.
+    Done,
+}
+
+impl Clear {
+    fn parse(s: Option<String>) -> Option<Self> {
+        match s.as_deref() {
+            Some("pending") => Some(Clear::Pending),
+            Some("done") => Some(Clear::Done),
+            _ => None,
+        }
+    }
+}
+
+/// A run just started. Mirrored by `Started` in src/main.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Started {
+    pub run_id: i64,
+    /// Type `/clear`, then wait for `cleared` to give the first prompt.
+    pub clear: bool,
+    /// The first prompt to send, if the flow begins with a prompt step and does not clear.
+    pub prompt: Option<String>,
+}
+
+/// How a run whose Start clears is getting on. Mirrored in src/main.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Cleared {
+    /// Claude has not reported the clear yet.
+    Pending,
+    /// Claude has cleared and the run took its first step; send `prompt`, if any.
+    Ready { prompt: Option<String> },
+    /// The run is not waiting for a clear (anymore): stopped, or moved on otherwise.
+    Gone,
+}
+
 /// Statuses in which a run holds its tab, as SQL. The `one_active_run_per_tab`
 /// index in migration 7 lists the same ones; a test checks they agree.
 pub(crate) const ACTIVE: &str = "('running', 'manual', 'attention')";
@@ -136,6 +182,7 @@ struct Stored {
     status: Status,
     steps: i64,
     resume: Option<Resume>,
+    clear: Option<Clear>,
 }
 
 impl Stored {
@@ -149,23 +196,39 @@ impl Stored {
 fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, String> {
     let row = tx
         .query_row(
-            &format!("SELECT id, graph, node_id, status, steps, resume FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
+            &format!("SELECT id, graph, node_id, status, steps, resume, clear FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
             [key],
             |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get(4)?, r.get(5)?))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
             },
         )
         .optional()
         .map_err(sql)?;
-    row.map(|(id, graph, node_id, status, steps, resume)| {
-        Ok(Stored { id, graph: parse_graph(&graph)?, node_id, status: Status::parse(&status)?, steps, resume: Resume::parse(resume) })
+    row.map(|(id, graph, node_id, status, steps, resume, clear)| {
+        Ok(Stored {
+            id,
+            graph: parse_graph(&graph)?,
+            node_id,
+            status: Status::parse(&status)?,
+            steps,
+            resume: Resume::parse(resume),
+            clear: Clear::parse(clear),
+        })
     })
     .transpose()
 }
 
 fn set(tx: &Transaction, run: i64, node_id: &str, status: Status, steps: i64, note: Option<&str>) -> Result<(), String> {
     tx.execute(
-        "UPDATE flow_runs SET node_id = ?2, status = ?3, steps = ?4, note = ?5, resume = NULL, updated_at = ?6 WHERE id = ?1",
+        "UPDATE flow_runs SET node_id = ?2, status = ?3, steps = ?4, note = ?5, resume = NULL, clear = NULL, updated_at = ?6 WHERE id = ?1",
         params![run, node_id, status.as_str(), steps, note, now()],
     )
     .map(drop)
@@ -248,9 +311,10 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
     }
 }
 
-/// Starts flow `flow_id` in tab `tab_id`; returns the first prompt to send, if
-/// the flow begins with a prompt step.
-pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Option<String>, String> {
+/// Starts flow `flow_id` in tab `tab_id`: with the first prompt to send, if the
+/// flow begins with a prompt step, or, if its Start clears, at Start until Claude
+/// has cleared (see the module docs).
+pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Started, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let graph: String = tx
         .query_row("SELECT graph FROM flows WHERE id = ?1", [flow_id], |r| r.get(0))
@@ -264,10 +328,18 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Opti
     }
     let start = graph.nodes.iter().find(|n| n.kind == Kind::Start).ok_or("the flow has no Start step")?.clone();
     let now = now();
+    let clear = flows::clears(&graph);
     let inserted = tx.execute(
-        "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, ?5)",
-        params![flow_id, tab_id.as_str(), serde_json::to_string(&graph).map_err(|e| e.to_string())?, start.id, now],
+        "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, clear, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, ?6, ?6)",
+        params![
+            flow_id,
+            tab_id.as_str(),
+            serde_json::to_string(&graph).map_err(|e| e.to_string())?,
+            start.id,
+            clear.then_some("pending"),
+            now
+        ],
     );
     match inserted {
         // The flow exists and the values are checked, so the constraint is the one-run index.
@@ -276,10 +348,32 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Opti
         }
         other => other.map_err(sql)?,
     };
-    let run = Stored { id: tx.last_insert_rowid(), graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None };
+    let run_id = tx.last_insert_rowid();
+    if clear {
+        tx.commit().map_err(sql)?;
+        return Ok(Started { run_id, clear, prompt: None });
+    }
+    let run = Stored { id: run_id, graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None, clear: None };
     let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, By::Flow)?;
     tx.commit().map_err(sql)?;
-    Ok(prompt)
+    Ok(Started { run_id, clear, prompt })
+}
+
+/// How run `run_id`, which clears at its start, is getting on; once Claude has
+/// cleared, takes its first step (once: later calls are `Gone`).
+pub fn cleared(conn: &mut Connection, run_id: i64) -> Result<Cleared, String> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+    let Some(run) = active_run(&tx, "id = ?1", &run_id)? else { return Ok(Cleared::Gone) };
+    match run.clear {
+        None => Ok(Cleared::Gone),
+        Some(Clear::Pending) => Ok(Cleared::Pending),
+        Some(Clear::Done) => {
+            let start = run.node()?.clone();
+            let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, By::Flow)?;
+            tx.commit().map_err(sql)?;
+            Ok(Cleared::Ready { prompt })
+        }
+    }
 }
 
 /// Claude in tab `tab_id` ended its turn with `reply` (None when Claude Code did
@@ -302,7 +396,9 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(None) };
-    if run.status == Status::Manual {
+    // A turn that ends before the clear (one Claude was in when ▶ was pressed) is
+    // not the reply to any step.
+    if run.status == Status::Manual || run.clear.is_some() {
         return Ok(None);
     }
     let node = run.node()?.clone();
@@ -334,6 +430,9 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
 pub fn proceed(conn: &mut Connection, run_id: i64, output: &str) -> Result<Option<String>, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
+    if run.clear.is_some() {
+        return Err("the run is clearing the conversation before its first step; wait for it, or stop the run".into());
+    }
     let node = run.node()?.clone();
     if !node.outputs.iter().any(|o| o == output) {
         return Err(format!("\"{}\" has no output {output:?}", node.name()));
@@ -373,12 +472,26 @@ pub fn resume(conn: &mut Connection, run_id: i64) -> Result<String, String> {
     Ok(prompt)
 }
 
+/// Claude in tab `tab_id` cleared its conversation: a run waiting for that clear
+/// can take its first step (see `cleared`); a running step will get no reply, so
+/// its run waits for the person, saying `why` (see `pause_tab`).
+pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE flow_runs SET clear = 'done', updated_at = ?2 WHERE tab_id = ?1 AND status = 'running' AND clear = 'pending'",
+            params![tab_id.as_str(), now()],
+        )
+        .map_err(sql)?;
+    if changed == 0 { pause_tab(conn, tab_id, why) } else { Ok(()) }
+}
+
 /// Makes the tab's running run wait for the person, saying why: Claude will not
 /// reply to its step (the conversation was cleared, or the hook failed), so
-/// Continue sends the step's prompt again.
+/// Continue sends the step's prompt again. A run still at Start waiting for its
+/// clear has no step to reply to, and is left alone.
 pub fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     conn.execute(
-        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
+        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running' AND clear IS NULL",
         params![tab_id.as_str(), why, now()],
     )
     .map(drop)
@@ -406,6 +519,13 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
     };
     for tab in tabs {
         if open_tabs.iter().any(|open| open.as_str() == tab) {
+            // The app that would have taken the first step after the clear is gone.
+            tx.execute(
+                "UPDATE flow_runs SET status = 'attention', note = ?2, resume = NULL, clear = NULL, updated_at = ?3
+                 WHERE tab_id = ?1 AND status = 'running' AND clear IS NOT NULL",
+                params![tab, "Mischief of Agents was restarted before the conversation was cleared. Pick an output to go on without clearing, or stop the run and press ▶ again.", now()],
+            )
+            .map_err(sql)?;
             tx.execute(
                 // Claude comes back in its conversation, so it can be reminded.
                 "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'remind', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
@@ -437,20 +557,32 @@ pub fn stop(conn: &Connection, run_id: i64) -> Result<(), String> {
 pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume
+            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume, r.clear
              FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE r.status IN {ACTIVE} ORDER BY r.id"
         ))
         .map_err(sql)?;
-    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64, Option<String>);
+    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64, Option<String>, Option<String>);
     let rows = stmt
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+                r.get(10)?,
+            ))
         })
         .map_err(sql)?
         .collect::<Result<Vec<Row>, _>>()
         .map_err(sql)?;
     rows.into_iter()
-        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume)| {
+        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume, clear)| {
             // A run that cannot be read is still listed, saying why, so it can be stopped.
             let node = parse_graph(&graph).and_then(|graph| {
                 let node = graph.nodes.into_iter().find(|n| n.id == step_id);
@@ -461,7 +593,13 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
                 Ok(node) => {
                     // The same test as `resume`'s.
                     let resumable = status == Status::Attention && node.kind == Kind::Prompt && Resume::parse(resume).is_some();
-                    (node.name().to_owned(), node.outputs, note, resumable)
+                    if Clear::parse(clear).is_some() {
+                        // Nothing to pick until the first step is taken (see `proceed`).
+                        let note = Some("Clearing the conversation before the first step.".to_owned());
+                        (node.name().to_owned(), Vec::new(), note, false)
+                    } else {
+                        (node.name().to_owned(), node.outputs, note, resumable)
+                    }
                 }
                 Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false),
             };
@@ -519,8 +657,10 @@ mod tests {
     fn a_run_starts_with_the_first_prompt() {
         let g = runnable();
         let (_db, mut conn, flow) = setup("runs-start", &g);
-        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap(), prompt_of(&g, "p"));
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!((started.clear, started.prompt), (false, prompt_of(&g, "p")));
         let run = only_run(&conn);
+        assert_eq!(started.run_id, run.id);
         assert_eq!(
             (run.flow_name.as_str(), run.tab_id.as_str(), run.step.as_str(), run.status, run.steps),
             ("F", "t1", "P", Status::Running, 1)
@@ -603,7 +743,7 @@ mod tests {
     fn a_manual_step_waits_for_the_person() {
         let g = manual_first();
         let (_db, mut conn, flow) = setup("runs-manual", &g);
-        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap(), None);
+        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap().prompt, None);
         let run = only_run(&conn);
         assert_eq!((run.status, run.outputs.clone()), (Status::Manual, vec!["ok".to_string(), "redo".to_string()]));
         // Claude ending a turn (the person chatting) does not move a manual step.
@@ -663,6 +803,61 @@ mod tests {
         pause_tab(&mut conn, &tab("t2"), "cleared").unwrap();
         assert_eq!((only_run(&conn).status, only_run(&conn).note), (Status::Manual, None));
         pause_tab(&mut conn, &tab("t9"), "no run").unwrap();
+    }
+
+    fn clearing() -> Graph {
+        let mut g = runnable();
+        g.nodes[0].clear = true;
+        g
+    }
+
+    #[test]
+    fn a_run_that_clears_takes_its_first_step_once_claude_has_cleared() {
+        let g = clearing();
+        let (_db, mut conn, flow) = setup("runs-clear-first", &g);
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        // The run holds the tab before anything is typed, so a second start is refused.
+        assert_eq!((started.clear, started.prompt), (true, None));
+        assert!(start(&mut conn, flow, &tab("t1")).unwrap_err().contains("already running"));
+        let run = only_run(&conn);
+        assert_eq!((run.step_id.as_str(), run.status, run.steps), ("start", Status::Running, 0));
+        assert!(run.outputs.is_empty(), "nothing to pick while it clears");
+        assert!(run.note.unwrap().contains("Clearing"));
+        assert_eq!(cleared(&mut conn, started.run_id).unwrap(), Cleared::Pending);
+        // A turn that ends before the clear is not the first step's reply.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap(), None);
+        assert!(proceed(&mut conn, started.run_id, "next").unwrap_err().contains("clearing"));
+        // The clear does not make the run wait, as it would a running step.
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Running);
+        assert_eq!(cleared(&mut conn, started.run_id).unwrap(), Cleared::Ready { prompt: prompt_of(&g, "p") });
+        let run = only_run(&conn);
+        assert_eq!((run.step_id.as_str(), run.status, run.steps, run.note), ("p", Status::Running, 1, None));
+        // Taken once; a clear after that makes the running step wait, as before.
+        assert_eq!(cleared(&mut conn, started.run_id).unwrap(), Cleared::Gone);
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Attention);
+    }
+
+    #[test]
+    fn a_stopped_run_that_clears_is_gone() {
+        let (_db, mut conn, flow) = setup("runs-clear-stopped", &clearing());
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        stop(&conn, started.run_id).unwrap();
+        assert_eq!(cleared(&mut conn, started.run_id).unwrap(), Cleared::Gone);
+    }
+
+    #[test]
+    fn a_restart_while_clearing_waits_for_the_person() {
+        let (_db, mut conn, flow) = setup("runs-clear-restart", &clearing());
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        after_restart(&mut conn, &[tab("t1")]).unwrap();
+        let run = only_run(&conn);
+        assert_eq!((run.step_id.as_str(), run.status, run.outputs.clone()), ("start", Status::Attention, vec!["next".to_string()]));
+        assert!(run.note.unwrap().contains("before the conversation was cleared"));
+        assert_eq!(cleared(&mut conn, started.run_id).unwrap(), Cleared::Gone);
+        // The person goes on without the clear.
+        assert!(proceed(&mut conn, started.run_id, "next").unwrap().is_some());
     }
 
     #[test]
@@ -871,7 +1066,7 @@ mod tests {
         let g = review_loop();
         let (_db, mut conn, flow) = setup("runs-max", &g);
         let t = tab("t1");
-        assert_eq!(start(&mut conn, flow, &t).unwrap(), prompt_of(&g, "review"));
+        assert_eq!(start(&mut conn, flow, &t).unwrap().prompt, prompt_of(&g, "review"));
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix"));
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), prompt_of(&g, "review"));
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap(), prompt_of(&g, "fix"));
@@ -941,7 +1136,7 @@ mod tests {
     fn a_flow_that_starts_at_its_end_finishes_at_once() {
         let g = graph(vec![node("e", Kind::End, &[])], vec![edge("start", "next", "e")]);
         let (_db, mut conn, flow) = setup("runs-empty", &g);
-        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap(), None);
+        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap().prompt, None);
         assert!(active(&conn).unwrap().is_empty());
     }
 }

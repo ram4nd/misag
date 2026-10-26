@@ -11,7 +11,7 @@ import { createTree, type Listing } from "./tree";
 import { createFlows, type Flow, type Run } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
 import { createHistory, type Page as HistoryPage, type Past } from "./history";
-import { DRAG_THRESHOLD, remember, remembered, setupToolboxes, slide } from "./toolbox";
+import { DRAG_THRESHOLD, forget, remember, remembered, setupToolboxes, slide } from "./toolbox";
 
 /**
  * What a tab runs, tagged by `kind`; each kind has only its own fields.
@@ -1380,9 +1380,10 @@ $<HTMLButtonElement>("#new-terminal").onclick = (e) => {
 fillIcons();
 for (const el of document.querySelectorAll(".claude-icon")) el.innerHTML = CLAUDE_ICON;
 $<HTMLButtonElement>("#open-settings").onclick = () => openPage("settings");
-// A hidden terminal has no size to fit to; it is fitted when shown again.
+// A hidden terminal has no size to fit to; it is fitted when shown again. While the
+// sidebar's edge is dragged, it is fitted once let go, so the PTY is not resized at every move.
 new ResizeObserver(() => {
-  if (shownPage === null) active?.term.fit();
+  if (shownPage === null && !document.body.classList.contains("resizing-sidebar")) active?.term.fit();
 }).observe(termsEl);
 
 const SIDEBAR_KEY = "misag.sidebarCollapsed";
@@ -1391,6 +1392,100 @@ function setSidebar(collapsed: boolean) {
   remember(SIDEBAR_KEY, collapsed);
 }
 setSidebar(remembered(SIDEBAR_KEY));
+/** The sidebar's width (px) in localStorage, and its default and limits. */
+const SIDEBAR_WIDTH_KEY = "misag.sidebarWidth";
+const SIDEBAR_WIDTH = 240;
+const SIDEBAR_MIN = 160;
+const SIDEBAR_MAX = 600;
+/** The narrowest (px) the sidebar may squeeze the terminals to. */
+const TERMINALS_MIN = 320;
+/** The width chosen for the sidebar; a narrow window shows it narrower, until the window grows again. */
+let chosenSidebarWidth = SIDEBAR_WIDTH;
+/** The width the sidebar is shown at. */
+let sidebarWidth = SIDEBAR_WIDTH;
+const sidebarResizer = $<HTMLElement>("#sidebar-resizer");
+sidebarResizer.setAttribute("aria-valuemin", String(SIDEBAR_MIN));
+/** The widest the sidebar may be in this window. */
+const sidebarMax = () => Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - TERMINALS_MIN));
+/** Shows the sidebar at `px`, kept within its limits. */
+function showSidebarWidth(px: number) {
+  const max = sidebarMax();
+  sidebarWidth = Math.round(Math.min(max, Math.max(SIDEBAR_MIN, px)));
+  $("#sidebar").style.setProperty("--sidebar-width", `${sidebarWidth}px`);
+  sidebarResizer.setAttribute("aria-valuenow", String(sidebarWidth));
+  sidebarResizer.setAttribute("aria-valuetext", `${sidebarWidth} pixels`);
+  sidebarResizer.setAttribute("aria-valuemax", String(max));
+}
+/** Sets the sidebar's width and remembers it. */
+function chooseSidebarWidth(px: number) {
+  showSidebarWidth(px);
+  chosenSidebarWidth = sidebarWidth;
+  try {
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+  } catch (err) {
+    console.debug("misag: could not remember the sidebar width", err);
+  }
+}
+/** Puts the sidebar back at its default width and forgets the one chosen. */
+function resetSidebarWidth() {
+  forget(SIDEBAR_WIDTH_KEY);
+  chosenSidebarWidth = SIDEBAR_WIDTH;
+  showSidebarWidth(SIDEBAR_WIDTH);
+}
+{
+  let stored: string | null = null;
+  try {
+    stored = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  } catch (err) {
+    console.debug("misag: could not recall the sidebar width", err);
+  }
+  const px = stored ? Number(stored) : NaN;
+  chosenSidebarWidth = Number.isFinite(px) ? Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, px)) : SIDEBAR_WIDTH;
+  showSidebarWidth(chosenSidebarWidth);
+}
+window.addEventListener("resize", () => showSidebarWidth(chosenSidebarWidth));
+sidebarResizer.onmousedown = (down) => {
+  if (down.button !== 0) return;
+  down.preventDefault();
+  const start = sidebarWidth;
+  // The terminals are fitted once it is let go (see the ResizeObserver above), not at every move.
+  document.body.classList.add("resizing-sidebar");
+  const move = (e: MouseEvent) => {
+    // Let go outside the window, where the mouseup went elsewhere.
+    if (!(e.buttons & 1)) return end();
+    showSidebarWidth(start + e.clientX - down.clientX);
+  };
+  const end = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    window.removeEventListener("blur", end);
+    document.body.classList.remove("resizing-sidebar");
+    chooseSidebarWidth(sidebarWidth);
+    if (shownPage === null) active?.term.fit();
+    active?.term.focus();
+  };
+  const up = (e: MouseEvent) => {
+    showSidebarWidth(start + e.clientX - down.clientX);
+    end();
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+  window.addEventListener("blur", end);
+};
+/** Left and Right move the edge 16px; Home and End take it to the narrowest and widest. */
+const SIDEBAR_KEYS: Record<string, () => number> = {
+  ArrowLeft: () => sidebarWidth - 16,
+  ArrowRight: () => sidebarWidth + 16,
+  Home: () => SIDEBAR_MIN,
+  End: sidebarMax,
+};
+sidebarResizer.onkeydown = (e) => {
+  const to = SIDEBAR_KEYS[e.key];
+  if (!to) return;
+  e.preventDefault();
+  chooseSidebarWidth(to());
+};
+sidebarResizer.ondblclick = resetSidebarWidth;
 $("#toggle-sidebar").onclick = () => {
   setSidebar(!document.body.classList.contains("sidebar-collapsed"));
   reloadHistoryIfShown();
@@ -1445,6 +1540,15 @@ async function pasteFrom(term: WTerm, source: keyof typeof PASTE_SOURCES) {
 
 /** How long after pasting a prompt Claude gets the Enter that sends it, so the paste is not taken as typing. */
 const PASTE_SUBMIT_MS = 150;
+/**
+ * For a flow whose Start clears: how often to ask whether Claude has reported the
+ * clear (the SessionStart hook does), and how long to wait for it before the run
+ * is stopped.
+ */
+const CLEAR_POLL_MS = 250;
+const CLEAR_TIMEOUT_MS = 30_000;
+/** Tabs a flow is being started in (through its clear), so ▶ is not taken twice. */
+const startingTabs = new Set<string>();
 /** Tabs whose flow run waits for the person, marked in the tab bar. */
 const waitingTabs = new Set<string>();
 /** The active runs, as last read. */
@@ -1467,19 +1571,35 @@ function showTabRuns() {
  * Types `text` into the tab as one paste and sends it, as if the person had. The
  * backend drops control characters from prompts, so the text cannot end the paste.
  * If Claude is busy (mid-turn, or in a menu), the paste lands there instead. Claude
- * is checked again before the Enter: in a terminal tab it may have been suspended
- * or quit meanwhile, and the shell must not run a flow's text.
+ * is checked before the paste and again before the Enter: in a terminal tab it may
+ * have been suspended or quit meanwhile, and the shell must not run a flow's text.
+ * Resolves to whether it was sent; false if Claude had left, when it was not.
  */
-function typePrompt(s: Session, text: string) {
+async function typePrompt(s: Session, text: string): Promise<boolean> {
+  const left = () => {
+    console.warn(`misag: Claude left ${tabLabel(s)} before its flow prompt was sent; it was not sent`);
+    return false;
+  };
+  if (!(await claudeLive(s))) return left();
   write(s, encoder.encode(`\x1b[200~${text}\x1b[201~`));
-  setTimeout(async () => {
-    if (!(await claudeLive(s))) {
-      console.warn(`misag: Claude left ${tabLabel(s)} before its flow prompt was sent; it was not sent`);
-      return;
-    }
-    write(s, encoder.encode("\r"));
-  }, PASTE_SUBMIT_MS);
+  await new Promise((resolve) => setTimeout(resolve, PASTE_SUBMIT_MS));
+  if (!(await claudeLive(s))) return left();
+  write(s, encoder.encode("\r"));
+  return true;
 }
+
+/** Why a prompt typed into `s` was not sent, for the person. */
+const notSent = (s: Session) => `Claude left ${tabLabel(s)} before the prompt was sent, so it was not sent`;
+
+/** Mirrors `runs::Started` in src-tauri/src/runs.rs. */
+interface Started {
+  runId: number;
+  clear: boolean;
+  prompt: string | null;
+}
+
+/** Mirrors `runs::Cleared`. */
+type Cleared = { state: "pending" | "gone" } | { state: "ready"; prompt: string | null };
 
 /**
  * Whether Claude runs in the tab right now, so a prompt typed there goes to Claude
@@ -1492,20 +1612,84 @@ async function claudeLive(s: Session): Promise<boolean> {
 }
 
 async function startFlow(flow: Flow) {
-  const s = active && (await claudeLive(active)) ? active : null;
-  if (!s) {
+  const s = active;
+  // A start already under way here (it may be waiting for its clear) is the one.
+  if (!s || startingTabs.has(s.tabId)) return;
+  startingTabs.add(s.tabId);
+  try {
+    await startIn(s, flow);
+  } finally {
+    startingTabs.delete(s.tabId);
+  }
+  await pollRuns();
+}
+
+async function startIn(s: Session, flow: Flow) {
+  if (!(await claudeLive(s))) {
     flows.showBoxError("Flows run in a Claude tab: select one (or a terminal tab running claude) and press ▶ again.");
     return;
   }
+  let started: Started;
   try {
-    const prompt = await invoke<string | null>("flow_start", { flowId: flow.id, tabId: s.tabId });
-    flows.showBoxError(null);
-    if (prompt !== null) typePrompt(s, prompt);
+    // The run starts from the stored flow, so the editor's latest change goes first;
+    // one that cannot be saved says so in the editor.
+    await editorPages.get(`flow:${flow.id}`)?.editor.flush();
+    // The backend takes the tab before anything is typed, so a start it refuses
+    // (the tab runs a flow, the flow is not ready) clears nothing.
+    started = await invoke<Started>("flow_start", { flowId: flow.id, tabId: s.tabId });
   } catch (err) {
     console.error("misag: could not start the flow", err);
     flows.showBoxError(`Could not start "${flow.name}": ${errorText(err)}`);
+    return;
+  }
+  flows.showBoxError(null);
+  if (!started.clear) {
+    if (started.prompt !== null && !(await typePrompt(s, started.prompt))) {
+      flows.showBoxError(`${notSent(s)}. Start Claude there and pick an output to go on, or stop the run.`);
+    }
+    return;
   }
   await pollRuns();
+  if (showsBusy(s)) {
+    // Claude would take /clear only after its turn, which may outlast the wait.
+    await stopStart(started.runId, `Claude is working in ${tabLabel(s)}, so "${flow.name}" was not started; press ▶ again when it is idle.`);
+    return;
+  }
+  if (!(await typePrompt(s, "/clear"))) {
+    await stopStart(started.runId, `Claude left ${tabLabel(s)} before /clear was sent, so "${flow.name}" was stopped.`);
+    return;
+  }
+  for (let waited = 0; waited < CLEAR_TIMEOUT_MS; waited += CLEAR_POLL_MS) {
+    await new Promise((resolve) => setTimeout(resolve, CLEAR_POLL_MS));
+    let cleared: Cleared;
+    try {
+      cleared = await invoke<Cleared>("flow_cleared", { runId: started.runId });
+    } catch (err) {
+      console.error("misag: could not check the flow's clear", err);
+      flows.showBoxError(`Could not go on with "${flow.name}" after /clear: ${errorText(err)}. Stop the run and press ▶ again.`);
+      return;
+    }
+    // Stopped meanwhile: nothing to do.
+    if (cleared.state === "gone") return;
+    if (cleared.state === "ready") {
+      if (cleared.prompt !== null && !(await typePrompt(s, cleared.prompt))) {
+        flows.showBoxError(`${notSent(s)}. Start Claude there and pick an output to go on, or stop the run.`);
+      }
+      return;
+    }
+  }
+  await stopStart(started.runId, `Claude did not clear the conversation in ${tabLabel(s)} within ${CLEAR_TIMEOUT_MS / 1000} seconds, so "${flow.name}" was stopped; press ▶ again when it is idle.`);
+}
+
+/** Stops a run whose start could not go through its clear, saying why. */
+async function stopStart(runId: number, why: string) {
+  try {
+    await invoke("flow_stop", { runId });
+    flows.showBoxError(why);
+  } catch (err) {
+    console.error("misag: could not stop the run", err);
+    flows.showBoxError(`${why} It could not be stopped (${errorText(err)}); stop it with ■.`);
+  }
 }
 
 /**
@@ -1520,7 +1704,7 @@ async function goOn(run: Run, go: () => Promise<string | null>): Promise<string 
   } else {
     try {
       const prompt = await go();
-      if (prompt !== null) typePrompt(s, prompt);
+      if (prompt !== null && !(await typePrompt(s, prompt))) error = `${notSent(s)}; start Claude there and go on again.`;
     } catch (err) {
       console.error("misag: could not continue the run", err);
       error = `Could not go on: ${errorText(err)}`;
@@ -1661,7 +1845,10 @@ function resumeInNewTab(past: Past) {
 const toolboxes = setupToolboxes($<HTMLElement>("#sidebar"), (box) => {
   if (box === historyBox) reloadHistoryIfShown();
 });
-$<HTMLButtonElement>("#settings .reset-sidebar").onclick = () => toolboxes.reset();
+$<HTMLButtonElement>("#settings .reset-sidebar").onclick = () => {
+  toolboxes.reset();
+  resetSidebarWidth();
+};
 historyBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => void sessionHistory.reload();
 
 /** Marks again which sessions the active tab and the others have open. */

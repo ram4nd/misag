@@ -162,6 +162,9 @@ type Layout = {
 
 /** How often main.ts checks tab directories; mirrors TAB_POLL_MS there. */
 const TAB_POLL_MS = 2_000;
+/** How often main.ts asks whether Claude has cleared, and for how long; mirrors CLEAR_POLL_MS and CLEAR_TIMEOUT_MS there. */
+const CLEAR_POLL_MS = 250;
+const CLEAR_TIMEOUT_MS = 30_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SESSION = "0f8fad5b-d9cb-469f-a165-70867728950e";
 const LOG = "/home/me/.local/share/io.github.ram4nd.misag/hook.log";
@@ -191,6 +194,8 @@ let reported: Set<string>;
 let missingDirs: Set<string>;
 type Settings = Record<string, unknown>;
 let storedSettings: Settings;
+/** The callbacks of every ResizeObserver the app made, to report a resize to. */
+let resizeObservers: ResizeObserverCallback[];
 /** fs_list for a directory waits for its promise here, so a test can hold it back. */
 let fsGates: Record<string, Promise<void>>;
 /** How many hidden entries fs_list reports per directory. */
@@ -205,7 +210,7 @@ type Flow = { id: number; name: string; archived: boolean };
 let storedFlows: Flow[];
 /** Flows that flow_delete refuses, as the runner will for running ones. */
 let busyFlows: Set<number>;
-type Step = { id: string; kind: string; title: string; text: string; outputs: string[]; x: number; y: number };
+type Step = { id: string; kind: string; title: string; text: string; outputs: string[]; clear?: boolean; x: number; y: number };
 type Graph = { nodes: Step[]; edges: { from: string; output: string; to: string }[] };
 const START: Step = { id: "start", kind: "start", title: "Start", text: "", outputs: ["next"], x: 40, y: 40 };
 /** Each flow's stored graph; a flow without one has only its Start step. */
@@ -221,6 +226,8 @@ let activeRuns: Run[];
 /** The prompt flow_start and flow_continue return; a string makes them fail with it. */
 let runPrompt: string | null;
 let runRefusal: string | null;
+/** What flow_cleared reports, one per call; then "pending". */
+let clearStates: ({ state: "pending" | "gone" } | { state: "ready"; prompt: string | null })[];
 /** What primary_selection reports: the text selected anywhere on the desktop, if any. */
 let primarySelection: string | null;
 /** What clipboard_text reports: the text copied to the clipboard, if any. */
@@ -312,7 +319,8 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
   };
   switch (cmd) {
     case "flows_list":
-      return storedFlows.map((f) => ({ ...f }));
+      // As the backend reads it from each flow's Start step.
+      return storedFlows.map((f) => (storedGraphs[f.id]?.nodes.some((n) => n.kind === "start" && n.clear) ? { ...f, clear: true } : { ...f }));
     case "flow_create": {
       const flow = { id: Math.max(0, ...storedFlows.map((f) => f.id)) + 1, name: named(args.name), archived: false };
       storedFlows.push(flow);
@@ -338,7 +346,14 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
     case "flow_save_graph":
       storedGraphs[find(args.id).id] = structuredClone(args.graph as Graph);
       return flowProblems;
-    case "flow_start":
+    case "flow_start": {
+      if (runRefusal) throw { code: "failed", message: runRefusal };
+      // As the backend reads it from the flow's stored Start step.
+      const clear = storedGraphs[args.flowId as number]?.nodes.some((n) => n.kind === "start" && n.clear) ?? false;
+      return { runId: 5, clear, prompt: clear ? null : runPrompt };
+    }
+    case "flow_cleared":
+      return clearStates.shift() ?? { state: "pending" };
     case "flow_continue":
     case "flow_resume":
       if (runRefusal) throw { code: "failed", message: runRefusal };
@@ -402,6 +417,7 @@ beforeEach(() => {
   activeRuns = [];
   runPrompt = null;
   runRefusal = null;
+  clearStates = [];
   pastSessions = [];
   historyUnreadable = 0;
   pinnedSessions = new Set();
@@ -506,7 +522,11 @@ beforeEach(() => {
     }
   });
 
+  resizeObservers = [];
   globalThis.ResizeObserver = class {
+    constructor(cb: ResizeObserverCallback) {
+      resizeObservers.push(cb);
+    }
     observe() {}
     unobserve() {}
     disconnect() {}
@@ -3200,6 +3220,56 @@ describe("flow editor", () => {
     expect(field("maxRuns").closest("label")!.hidden).toBe(true);
   });
 
+  test("Start can begin each run with /clear, shown on the canvas and in the toolbox", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openFromBox("Deploy");
+    const mark = () => document.querySelector("#flows-box .flows li .lucide")!;
+    expect(mark().classList.contains("clears")).toBe(false);
+    await select("P");
+    expect(field("clear").closest("label")!.hidden).toBe(true);
+    await select("Start");
+    expect(field("clear").closest("label")!.hidden).toBe(false);
+    expect((field("clear") as HTMLInputElement).checked).toBe(false);
+    const box = field("clear") as HTMLInputElement;
+    box.checked = true;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "start")).toMatchObject({ clear: true });
+    expect(node("Start").querySelector(".clears")!.textContent).toBe("/clear");
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    expect(mark().classList.contains("clears")).toBe(true);
+    box.checked = false;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "start")).not.toHaveProperty("clear");
+    expect(node("Start").querySelector(".clears")).toBeNull();
+  });
+
+  test("▶ saves a change to the flow first, so a just-ticked /clear counts", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = runnable();
+    await boot();
+    await openClaudeTabs(1);
+    await openFromBox("Deploy");
+    await select("Start");
+    const box = field("clear") as HTMLInputElement;
+    box.checked = true;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    // Not saved yet when ▶ is pressed.
+    expect(callsOf("flow_save_graph")).toHaveLength(0);
+    document.querySelector<HTMLButtonElement>("#flows-box .flows li button.run")!.click();
+    await settle();
+    expect(callsOf("flow_save_graph")).toHaveLength(1);
+    expect(callsOf("flow_start")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(200);
+    const typed = callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+    expect(typed).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
+  });
+
   test("a saved run limit is shown, and kept when another step is selected before it is committed", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
@@ -3487,6 +3557,101 @@ describe("flow runs", () => {
     expect(callsOf("flow_start").map((c) => c.args)).toEqual([{ flowId: 1, tabId: spawns()[0].tabId }]);
     expect(typed()).toEqual(["\x1b[200~Fix the tests.\nEnd with FLOW: pass\x1b[201~", "\r"]);
     expect(callsOf("pty_write")[0].args.id).toBe(1);
+  });
+
+  /** Presses ▶ on a flow, then lets the paste's Enter go. */
+  async function playAndEnter(name: string) {
+    flowRow(name).querySelector<HTMLButtonElement>("button.run")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+  }
+  async function pollClear() {
+    await vi.advanceTimersByTimeAsync(CLEAR_POLL_MS);
+    await settle();
+  }
+
+  test("a flow whose Start clears starts its run, types /clear, and sends the first prompt once Claude has cleared", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    clearStates = [{ state: "pending" }, { state: "ready", prompt: "Fix the tests." }];
+    await boot();
+    await openClaudeTabs(1);
+    await playAndEnter("Deploy");
+    // The run holds the tab before anything is typed, so a refused start clears nothing.
+    expect(callsOf("flow_start")).toHaveLength(1);
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
+    await pollClear();
+    expect(callsOf("flow_cleared").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(typed()).toHaveLength(2);
+    await pollClear();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~", "\r", "\x1b[200~Fix the tests.\x1b[201~", "\r"]);
+    // Done: no more asking.
+    await pollClear();
+    expect(callsOf("flow_cleared")).toHaveLength(2);
+    expect(callsOf("flow_stop")).toHaveLength(0);
+  });
+
+  test("a clear that never comes stops the run and says so", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    await boot();
+    await openClaudeTabs(1);
+    await playAndEnter("Deploy");
+    await vi.advanceTimersByTimeAsync(CLEAR_TIMEOUT_MS);
+    await settle();
+    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(box().querySelector(".error")!.textContent).toContain("did not clear");
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
+  });
+
+  test("a run stopped while it clears is left alone", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    clearStates = [{ state: "gone" }];
+    await boot();
+    await openClaudeTabs(1);
+    await playAndEnter("Deploy");
+    await pollClear();
+    await vi.advanceTimersByTimeAsync(CLEAR_TIMEOUT_MS);
+    await settle();
+    expect(callsOf("flow_cleared")).toHaveLength(1);
+    expect(callsOf("flow_stop")).toHaveLength(0);
+    expect(box().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
+  });
+
+  test("a flow that clears does not start while Claude is working, as /clear would wait for it", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    await boot();
+    await openClaudeTabs(1);
+    terms()[0].onTitle!("◐ Fixing");
+    await playAndEnter("Deploy");
+    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(typed()).toEqual([]);
+    expect(box().querySelector(".error")!.textContent).toContain("working");
+  });
+
+  test("pressing ▶ again while a flow starts in the tab does not start it twice", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    await boot();
+    await openClaudeTabs(1);
+    const play = flowRow("Deploy").querySelector<HTMLButtonElement>("button.run")!;
+    play.click();
+    play.click();
+    flowRow("Review").querySelector<HTMLButtonElement>("button.run")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_start")).toHaveLength(1);
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
+  });
+
+  test("a flow that is not ready is refused without clearing", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    flowProblems = ["Start is not connected to a step."];
+    runRefusal = "the flow is not ready to run: Start is not connected to a step.";
+    await boot();
+    await openClaudeTabs(1);
+    await play("Deploy");
+    expect(typed()).toEqual([]);
+    expect(box().querySelector(".error")!.textContent).toContain("not ready to run");
   });
 
   test("a flow that starts at a manual step types nothing", async () => {
@@ -3777,6 +3942,42 @@ describe("flow runs and Claude's state", () => {
     await vi.advanceTimersByTimeAsync(200);
     await settle();
     expect(typed()).toEqual(["\x1b[200~Next.\x1b[201~"]);
+  });
+
+  test("a first prompt that cannot be sent, as Claude left the tab, says so", async () => {
+    runPrompt = "Fix it.";
+    await boot();
+    await clickTerminal();
+    openClaudes = { 1: SESSION };
+    await poll();
+    box().querySelector<HTMLButtonElement>("button.run")!.click();
+    await settle();
+    // Claude quits while the prompt is pasted: its Enter is held back, and the person told.
+    openClaudes = {};
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(callsOf("flow_start")).toHaveLength(1);
+    expect(callsOf("pty_write")).toHaveLength(1);
+    expect(boxError().textContent).toContain("was not sent");
+  });
+
+  test("Claude leaving before /clear is sent stops the run that would clear", async () => {
+    storedGraphs[1] = { nodes: [{ ...START, clear: true }, { id: "p", kind: "prompt", title: "P", text: "x", outputs: ["done"], x: 0, y: 0 }], edges: [] };
+    await boot();
+    await clickTerminal();
+    openClaudes = { 1: SESSION };
+    await poll();
+    box().querySelector<HTMLButtonElement>("button.run")!.click();
+    await settle();
+    const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~"]);
+    openClaudes = {};
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~"]);
+    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(callsOf("flow_cleared")).toHaveLength(0);
+    expect(boxError().textContent).toContain("before /clear was sent");
   });
 
   test("▶ checks a terminal tab's Claude right before starting", async () => {
@@ -4318,5 +4519,173 @@ describe("toolbox order", () => {
     localStorage.setItem("misag.toolboxOrder", "not json");
     await boot();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
+  });
+});
+
+describe("sidebar width", () => {
+  const sidebar = () => document.querySelector<HTMLElement>("#sidebar")!;
+  const resizer = () => document.querySelector<HTMLElement>("#sidebar-resizer")!;
+  const width = () => sidebar().style.getPropertyValue("--sidebar-width");
+  const stored = () => localStorage.getItem("misag.sidebarWidth");
+  /** A mouse event at `clientX`; a move holds the left button unless `buttons` says otherwise. */
+  const mouse = (target: EventTarget, type: string, clientX: number, init: MouseEventInit = {}) =>
+    target.dispatchEvent(
+      new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, buttons: type === "mousemove" ? 1 : 0, clientX, ...init }),
+    );
+  const key = (k: string) => {
+    const e = new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true });
+    resizer().dispatchEvent(e);
+    return e;
+  };
+  const setWindowWidth = (px: number) => Object.defineProperty(window, "innerWidth", { value: px, configurable: true, writable: true });
+  /** Drags the sidebar's edge from `from` (where it is now by default) to `x`, then releases it. */
+  function drag(x: number, from = 240) {
+    mouse(resizer(), "mousedown", from);
+    mouse(document, "mousemove", x);
+    mouse(document, "mouseup", x);
+  }
+
+  beforeEach(() => setWindowWidth(1024));
+  afterEach(() => setWindowWidth(1024));
+
+  test("dragging the sidebar's edge resizes it, and the width is remembered", async () => {
+    await boot();
+    expect(width()).toBe("240px");
+    drag(320);
+    expect(width()).toBe("320px");
+    expect(document.body.classList.contains("resizing-sidebar")).toBe(false);
+    vi.resetModules();
+    await boot();
+    expect(width()).toBe("320px");
+  });
+
+  test("the edge moves by as far as the mouse went, wherever it was grabbed", async () => {
+    await boot();
+    drag(263, 243);
+    expect(width()).toBe("260px");
+    drag(282, 262);
+    expect(width()).toBe("280px");
+  });
+
+  test("the width is saved once let go, and moving the mouse after that leaves it", async () => {
+    await boot();
+    mouse(resizer(), "mousedown", 240);
+    mouse(document, "mousemove", 320);
+    expect(width()).toBe("320px");
+    expect(stored()).toBeNull();
+    mouse(document, "mouseup", 320);
+    expect(stored()).toBe("320");
+    mouse(document, "mousemove", 500);
+    expect(width()).toBe("320px");
+  });
+
+  test("a drag let go outside the window ends at the next move without the button, or when the window loses focus", async () => {
+    await boot();
+    mouse(resizer(), "mousedown", 240);
+    mouse(document, "mousemove", 300);
+    mouse(document, "mousemove", 400, { buttons: 0 });
+    expect(width()).toBe("300px");
+    expect(stored()).toBe("300");
+    expect(document.body.classList.contains("resizing-sidebar")).toBe(false);
+
+    mouse(resizer(), "mousedown", 300);
+    mouse(document, "mousemove", 350);
+    window.dispatchEvent(new Event("blur"));
+    mouse(document, "mousemove", 450);
+    expect(width()).toBe("350px");
+    expect(stored()).toBe("350");
+    expect(document.body.classList.contains("resizing-sidebar")).toBe(false);
+  });
+
+  test("only the left button drags the edge", async () => {
+    await boot();
+    mouse(resizer(), "mousedown", 240, { button: 2 });
+    mouse(document, "mousemove", 320);
+    expect(width()).toBe("240px");
+    expect(document.body.classList.contains("resizing-sidebar")).toBe(false);
+  });
+
+  test("the terminal is fitted once the edge is let go, not at every move", async () => {
+    await boot();
+    await clickClaude();
+    const term = terms()[0];
+    const before = term.fits;
+    mouse(resizer(), "mousedown", 240);
+    mouse(document, "mousemove", 300);
+    for (const cb of resizeObservers) cb([], {} as ResizeObserver);
+    mouse(document, "mousemove", 360);
+    for (const cb of resizeObservers) cb([], {} as ResizeObserver);
+    expect(term.fits).toBe(before);
+    mouse(document, "mouseup", 360);
+    expect(term.fits).toBe(before + 1);
+  });
+
+  test("the sidebar stays between its narrowest and widest", async () => {
+    await boot();
+    drag(10);
+    expect(width()).toBe("160px");
+    drag(5000, 160);
+    expect(width()).toBe("600px");
+  });
+
+  test("the sidebar leaves the terminals room in a narrow window, and takes its width back when the window grows", async () => {
+    localStorage.setItem("misag.sidebarWidth", "500");
+    await boot();
+    expect(width()).toBe("500px");
+    setWindowWidth(700);
+    window.dispatchEvent(new Event("resize"));
+    expect(width()).toBe("380px");
+    expect(resizer().getAttribute("aria-valuemax")).toBe("380");
+    expect(stored()).toBe("500");
+    setWindowWidth(1024);
+    window.dispatchEvent(new Event("resize"));
+    expect(width()).toBe("500px");
+    setWindowWidth(700);
+    window.dispatchEvent(new Event("resize"));
+    drag(1000, 380);
+    expect(width()).toBe("380px");
+  });
+
+  test("the arrow keys on the sidebar's edge resize it, and a double-click restores the default", async () => {
+    await boot();
+    key("ArrowRight");
+    expect(width()).toBe("256px");
+    key("ArrowLeft");
+    key("ArrowLeft");
+    expect(width()).toBe("224px");
+    expect(resizer().getAttribute("aria-valuenow")).toBe("224");
+    expect(resizer().getAttribute("aria-valuetext")).toBe("224 pixels");
+    expect(key("a").defaultPrevented).toBe(false);
+    expect(width()).toBe("224px");
+    key("End");
+    expect(width()).toBe("600px");
+    key("Home");
+    expect(width()).toBe("160px");
+    resizer().dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    expect(width()).toBe("240px");
+    vi.resetModules();
+    await boot();
+    expect(width()).toBe("240px");
+  });
+
+  test("Reset sidebar on the Settings page restores the default width", async () => {
+    await boot();
+    drag(400);
+    document.querySelector<HTMLButtonElement>("#settings .reset-sidebar")!.click();
+    expect(width()).toBe("240px");
+    vi.resetModules();
+    await boot();
+    expect(width()).toBe("240px");
+  });
+
+  test.each([
+    ["wide", "240px"],
+    ["", "240px"],
+    ["9999", "600px"],
+    ["10", "160px"],
+  ])("a stored width of %j opens the sidebar at %s", async (value, expected) => {
+    localStorage.setItem("misag.sidebarWidth", value);
+    await boot();
+    expect(width()).toBe(expected);
   });
 });

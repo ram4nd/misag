@@ -24,8 +24,9 @@ pub const ATTENTION: &str = "attention";
 /// The newest graph format this misag reads; `check` refuses newer ones, which it
 /// could misread. A graph is stored as the oldest format that holds it (see
 /// `stored`), so older misags keep reading the flows they can run correctly.
-/// Version 2 added step run limits (`Node::max_runs`).
-pub const GRAPH_VERSION: u32 = 2;
+/// Version 2 added step run limits (`Node::max_runs`), version 3 clearing the
+/// conversation at Start (`Node::clear`).
+pub const GRAPH_VERSION: u32 = 3;
 
 /// Mirrored by `Graph` in src/flowEditor.ts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -70,6 +71,10 @@ pub struct Node {
     /// at the step before, who can still send it on. None: no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u32>,
+    /// For the Start step: the run begins by typing `/clear`, so Claude starts the
+    /// flow in a new conversation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear: bool,
     pub x: f64,
     pub y: f64,
 }
@@ -93,6 +98,7 @@ impl Default for Graph {
             text: String::new(),
             outputs: vec![START_OUTPUT.into()],
             max_runs: None,
+            clear: false,
             x: 40.0,
             y: 40.0,
         };
@@ -193,14 +199,28 @@ fn check_node(node: &Node) -> Result<(), String> {
         }
         (Some(_), _) => {}
     }
+    if node.clear && node.kind != Kind::Start {
+        return Err(format!("\"{}\" cannot clear the conversation: only Start can", node.name()));
+    }
     check_outputs(node)
 }
 
 /// `graph` as stored: in the oldest format that holds it, so a misag that would
 /// ignore a newer field refuses the graph rather than run it differently.
 pub fn stored(mut graph: Graph) -> Graph {
-    graph.version = if graph.nodes.iter().any(|n| n.max_runs.is_some()) { 2 } else { 1 };
+    // The format each step needs, by the newest field it uses.
+    let needs = |n: &Node| match n {
+        Node { kind: Kind::Start, clear: true, .. } => 3,
+        Node { max_runs: Some(_), .. } => 2,
+        _ => 1,
+    };
+    graph.version = graph.nodes.iter().map(needs).max().unwrap_or(1);
     graph
+}
+
+/// Whether a run of `graph` begins by clearing the conversation.
+pub fn clears(graph: &Graph) -> bool {
+    graph.nodes.iter().any(|n| n.kind == Kind::Start && n.clear)
 }
 
 /// Ok if `graph` is well formed enough to store (see the module docs), else why not.
@@ -337,6 +357,7 @@ pub(crate) mod tests {
             text: if kind == Kind::Prompt { format!("do {id}") } else { String::new() },
             outputs: outputs.iter().map(|o| o.to_string()).collect(),
             max_runs: None,
+            clear: false,
             x: 0.0,
             y: 0.0,
         }
@@ -400,8 +421,11 @@ pub(crate) mod tests {
         assert_eq!(serde_json::to_value(limited).unwrap()["nodes"][1]["maxRuns"], 3);
         let read: Node = serde_json::from_value(serde_json::json!({ "id": "p", "kind": "prompt", "maxRuns": 3, "x": 0, "y": 0 })).unwrap();
         assert_eq!(read.max_runs, Some(3));
+        assert!(json["nodes"][0].get("clear").is_none(), "not clearing is left out");
+        let read: Node = serde_json::from_value(serde_json::json!({ "id": "start", "kind": "start", "clear": true, "x": 0, "y": 0 })).unwrap();
+        assert!(read.clear);
         assert_eq!(parsed.version, 1, "graphs stored before versions are version 1");
-        let newer = serde_json::json!({ "version": 3, "nodes": [], "edges": [] });
+        let newer = serde_json::json!({ "version": 4, "nodes": [], "edges": [] });
         assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer Mischief of Agents"));
     }
 
@@ -519,6 +543,31 @@ pub(crate) mod tests {
         g.nodes[1].max_runs = Some(2);
         assert_eq!(stored(g.clone()).version, 2);
         check(&stored(g)).unwrap();
+    }
+
+    #[test]
+    fn only_start_can_clear_the_conversation() {
+        let mut g = runnable();
+        g.nodes[0].clear = true;
+        check(&g).unwrap();
+        let mut g = runnable();
+        g.nodes[1].clear = true;
+        rejected(&g, "only Start can");
+    }
+
+    #[test]
+    fn a_graph_that_clears_is_a_newer_format() {
+        // An older misag would ignore `clear` and run in the old conversation.
+        let mut g = runnable();
+        g.nodes[0].clear = true;
+        assert_eq!(stored(g.clone()).version, 3);
+        g.nodes[1].max_runs = Some(2);
+        assert_eq!(stored(g.clone()).version, 3);
+        check(&stored(g)).unwrap();
+        assert!(!clears(&runnable()));
+        let mut g = runnable();
+        g.nodes[0].clear = true;
+        assert!(clears(&g));
     }
 
     #[test]

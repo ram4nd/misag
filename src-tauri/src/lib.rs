@@ -206,6 +206,7 @@ pub fn run() {
             commands::clipboard_text,
             commands::flow_export_file,
             commands::flow_start,
+            commands::flow_cleared,
             commands::flow_continue,
             commands::flow_resume,
             commands::flow_stop,

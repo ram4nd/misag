@@ -55,6 +55,8 @@
         </section>
         <button id="open-settings" title="Settings"><span data-icon="settings"></span>Settings</button>
       </aside>
+      <!-- Dragged (or Left, Right, Home and End on it) to resize the sidebar; double-click restores its default width. -->
+      <div id="sidebar-resizer" role="separator" aria-orientation="vertical" aria-controls="sidebar" aria-label="Sidebar width" tabindex="0" title="Drag to resize the sidebar (double-click: default width)"></div>
       <main id="terminals">
         <p id="empty-state">No tabs open. Open a terminal with the button at the top right, or Claude in a folder from the Workspace box.</p>
         <!-- The settings tab's page, shown in place of the terminals (see showActive in main.ts). Every change is saved right away. -->
@@ -80,7 +82,7 @@
             <fieldset>
               <h2><span data-icon="menu"></span>Sidebar</h2>
               <button type="button" class="reset-sidebar">Reset sidebar</button>
-              <p class="hint">Puts the toolboxes back in their first order and opens them all. Drag a toolbox by its header (or press Alt+Up or Alt+Down on it) to move it.</p>
+              <p class="hint">Puts the toolboxes back in their first order, opens them all and restores the sidebar's width. Drag the sidebar's right edge to resize it. Drag a toolbox by its header (or press Alt+Up or Alt+Down on it) to move it.</p>
             </fieldset>
             <p class="hint not-saving" hidden>Mischief of Agents is running without its database, so settings last only until it quits.</p>
             <p class="error" role="alert" hidden></p>

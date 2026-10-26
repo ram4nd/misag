@@ -89,10 +89,16 @@ body.dragging-tab, body.dragging-tab * { cursor: grabbing !important; }
 /* Band under the tabs (same colour as the active tab) framing the terminal. */
 #content { flex: 1; display: flex; min-height: 0; padding-top: 4px; background: var(--surface); }
 #sidebar {
-  flex: none; width: 240px; overflow: hidden; background: var(--panel);
+  flex: none; width: var(--sidebar-width, 240px); overflow: hidden; background: var(--panel);
   border-right: 1px solid var(--press); transition: width .15s ease;
 }
 body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
+/* The sidebar's edge, a few px wide over its border, dragged to resize it (see main.ts). */
+#sidebar-resizer { flex: none; width: 6px; margin: 0 -3px; position: relative; z-index: 3; cursor: col-resize; }
+#sidebar-resizer:hover, #sidebar-resizer:focus-visible, body.resizing-sidebar #sidebar-resizer { background: var(--accent); outline: none; }
+body.sidebar-collapsed #sidebar-resizer { display: none; }
+body.resizing-sidebar #sidebar { transition: none; }
+body.resizing-sidebar, body.resizing-sidebar * { cursor: col-resize !important; user-select: none; }
 #sidebar { display: flex; flex-direction: column; }
 
 /* ---------- toolboxes ---------- */
@@ -291,6 +297,8 @@ svg.lucide { display: block; flex: none; }
   display: flex; flex-direction: column; gap: 16px;
 }
 .flow-editor .panel { display: flex; flex-direction: column; gap: 10px; }
+.flow-editor .panel label.check { flex-wrap: wrap; }
+.flow-editor .panel label.check .hint { flex-basis: 100%; }
 .flow-editor .panel[hidden], .flow-editor .panel label[hidden], .flow-editor .panel button[hidden] { display: none; }
 .flow-editor textarea {
   font: inherit; color: var(--fg); background: var(--surface); resize: vertical;
@@ -310,7 +318,8 @@ svg.lucide { display: block; flex: none; }
   background: var(--surface); color: var(--fg); border: 1px solid var(--line);
 }
 .flow-editor .drawflow .drawflow-node.selected { border-color: var(--accent); background: var(--surface); box-shadow: 0 0 0 2px var(--accent); }
-.flow-editor .drawflow .drawflow-node .limit { float: right; color: var(--fg); text-transform: none; letter-spacing: 0; }
+.flow-editor .drawflow .drawflow-node .limit,
+.flow-editor .drawflow .drawflow-node .clears { float: right; color: var(--fg); text-transform: none; letter-spacing: 0; }
 .flow-editor .drawflow .drawflow-node .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .flow-editor .drawflow .drawflow-node .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-editor .drawflow .drawflow-node.start { border-left: 4px solid #1e8e3e; }
