@@ -3745,13 +3745,41 @@ describe("flow runs", () => {
     expect(flowRow("Deploy").querySelector(".picks")).toBeNull();
   });
 
+  test("▶ on a manual step with one output finishes the step and goes on", async () => {
+    runPrompt = "Submit the form.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review the filled form", outputs: ["done"] })];
+    await poll();
+    const row = flowRow("Deploy");
+    // ▶ does it, so there is no list of outputs; ■ still stops the run.
+    expect(row.querySelector(".picks")).toBeNull();
+    expect(row.querySelector("button.stop-run")).not.toBeNull();
+    const go = row.querySelector<HTMLButtonElement>("button.go-on")!;
+    expect(go.title).toBe('Done with "Review the filled form": go on');
+    go.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "done" }]);
+    expect(callsOf("flow_load")).toHaveLength(0);
+    expect(typed()).toEqual(["\x1b[200~Submit the form.\x1b[201~", "\r"]);
+  });
+
+  test("a manual step with several outputs offers no ▶, as it cannot tell which", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["approve", "reject"] })];
+    await poll();
+    expect(flowRow("Deploy").querySelector("button.go-on")).toBeNull();
+  });
+
   test("a pick in the flow list that cannot go on says why", async () => {
     runRefusal = "the run has moved on";
     await boot();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
     await poll();
-    flowRow("Deploy").querySelector<HTMLButtonElement>(".picks button.pick")!.click();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
     await settle();
     expect(box().querySelector<HTMLElement>(".error")!.textContent).toContain("the run has moved on");
   });

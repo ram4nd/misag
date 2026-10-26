@@ -341,13 +341,13 @@ svg.lucide { display: block; flex: none; }
 
 /* ---------- flow runs (see src/flows.ts and src/flowEditor.ts) ---------- */
 #flows-box .flows > li .name { flex: 1; }
-#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run, #flows-box .flows > li > button.resume { padding: 2px; background: none; }
+#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run, #flows-box .flows > li > button.resume, #flows-box .flows > li > button.go-on { padding: 2px; background: none; }
 #flows-box .flows > li > button.run { visibility: hidden; }
 #flows-box .flows > li:hover > button.run, #flows-box .flows > li > button.run:focus-visible { visibility: visible; }
 /* A flow running in the active tab. */
 #flows-box .flows > li.running { font-weight: 600; }
 #flows-box .flows > li.running > svg:first-child { color: var(--accent); }
-#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child, #flows-box .flows > li > button.resume { color: #e8710a; }
+#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child, #flows-box .flows > li > button.resume, #flows-box .flows > li > button.go-on { color: #e8710a; }
 /* A run whose tab is gone: it can only be stopped. */
 #flows-box .flows > li.orphan { font-weight: normal; font-style: italic; }
 #flows-box .flows > li.orphan > svg:first-child { color: var(--muted); }
