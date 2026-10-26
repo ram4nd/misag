@@ -3355,6 +3355,33 @@ describe("flow editor", () => {
     expect(saved()!.nodes[1].id).not.toBe(first);
   });
 
+  test("a manual step has no outputs field, as it goes on one way", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    tool("add-manual").click();
+    await settle();
+    await select("Manual step");
+    expect(field("outputs").closest("label")!.hidden).toBe(true);
+  });
+
+  test("a manual step from an older flow with several outputs shows them, to cut down to one", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = { nodes: [START, step("m", "manual", "Review", ["approve", "reject"])], edges: [] };
+    await boot();
+    await openFromBox("Deploy");
+    await select("Review");
+    expect(field("outputs").closest("label")!.hidden).toBe(false);
+    await edit("outputs", "approve, again");
+    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A manual step has one output");
+    await edit("outputs", "approve");
+    await afterSave();
+    expect(saved()!.nodes.find((n) => n.id === "m")!.outputs).toEqual(["approve"]);
+    await select("Start");
+    await select("Review");
+    expect(field("outputs").closest("label")!.hidden).toBe(true);
+  });
+
   test("Start and End have no fields for outputs, End none for a prompt, and Start cannot be deleted", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();

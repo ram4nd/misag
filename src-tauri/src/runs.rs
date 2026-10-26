@@ -707,11 +707,11 @@ mod tests {
         Graph { version: 1, nodes: all, edges }
     }
 
-    /// Start → a manual step that is ok (→ a prompt) or redone.
+    /// Start → a manual step → a prompt.
     fn manual_first() -> Graph {
         graph(
-            vec![node("m", Kind::Manual, &["ok", "redo"]), node("p", Kind::Prompt, &["done"])],
-            vec![edge("start", "next", "m"), edge("m", "ok", "p"), edge("m", "redo", "m")],
+            vec![node("m", Kind::Manual, &["ok"]), node("p", Kind::Prompt, &["done"])],
+            vec![edge("start", "next", "m"), edge("m", "ok", "p")],
         )
     }
 
@@ -774,13 +774,16 @@ mod tests {
 
     #[test]
     fn start_s_base_info_waits_for_the_first_prompt_after_manual_steps() {
-        let mut g = manual_first();
+        let mut g = graph(
+            vec![node("m", Kind::Manual, &["ok"]), node("m2", Kind::Manual, &["ok"]), node("p", Kind::Prompt, &["done"])],
+            vec![edge("start", "next", "m"), edge("m", "ok", "m2"), edge("m2", "ok", "p")],
+        );
         g.nodes[0].text = "The app is in src/.".into();
         let (_db, mut conn, flow) = setup("runs-base-info-manual", &g);
         let started = start(&mut conn, flow, &tab("t1")).unwrap();
         assert_eq!(started.prompt, None);
-        assert_eq!(pick(&mut conn, started.run_id, "redo").unwrap(), None);
-        assert_eq!(pick(&mut conn, started.run_id, "ok").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
+        assert_eq!(pick(&mut conn, started.run_id, "ok").unwrap(), None);
+        assert_eq!(pick(&mut conn, started.run_id, "ok").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[3])));
     }
 
     /// `graph` with `info` as Start's base info.
@@ -925,12 +928,11 @@ mod tests {
         let (_db, mut conn, flow) = setup("runs-manual", &g);
         assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap().prompt, None);
         let run = only_run(&conn);
-        assert_eq!((run.status, run.outputs.clone()), (Status::Manual, vec!["ok".to_string(), "redo".to_string()]));
+        assert_eq!((run.status, run.outputs.clone()), (Status::Manual, vec!["ok".to_string()]));
         // Claude ending a turn (the person chatting) does not move a manual step.
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: ok")).unwrap(), None);
         assert_eq!(only_run(&conn).status, Status::Manual);
         assert!(pick(&mut conn, run.id, "maybe").unwrap_err().contains("maybe"));
-        assert_eq!(pick(&mut conn, run.id, "redo").unwrap(), None);
         assert_eq!(only_run(&conn).status, Status::Manual);
         assert_eq!(pick(&mut conn, run.id, "ok").unwrap(), prompt_of(&g, "p"));
         assert_eq!(only_run(&conn).status, Status::Running);

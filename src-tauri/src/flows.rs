@@ -52,7 +52,8 @@ pub enum Kind {
     Start,
     /// Sends `text` to Claude.
     Prompt,
-    /// Waits for a person, who picks one of the outputs.
+    /// Waits for a person, who goes on by its one output (several in flows from
+    /// older versions, which `problems` refuses to start).
     Manual,
     End,
 }
@@ -354,6 +355,10 @@ pub fn problems(graph: &Graph) -> Vec<String> {
         if node.kind == Kind::Prompt && node.text.trim().is_empty() {
             problems.push(format!("\"{name}\" has no prompt."));
         }
+        // Older versions let the person pick among several; ■ stops the run instead.
+        if node.kind == Kind::Manual && node.outputs.len() > 1 {
+            problems.push(format!("\"{name}\" has more than one output; a manual step goes on one way, with ▶."));
+        }
         // Other outputs with no next step end the flow there.
         if node.kind == Kind::Start && !graph.edges.iter().any(|e| e.from == node.id) {
             problems.push("Start is not connected to a step.".into());
@@ -633,6 +638,18 @@ pub(crate) mod tests {
         let mut g = Graph::default();
         g.nodes.extend((0..200).map(|i| node(&format!("n{i}"), Kind::End, &[])));
         rejected(&g, "at most 200");
+    }
+
+    #[test]
+    fn a_manual_step_goes_on_one_way() {
+        let mut g = runnable();
+        g.nodes.push(node("m", Kind::Manual, &["ok", "redo"]));
+        g.edges.push(edge("p", "pass", "m"));
+        g.edges.retain(|e| e.to != "e");
+        g.nodes.retain(|n| n.id != "e");
+        // Flows from older versions still load, to be cut down to one output.
+        check(&g).unwrap();
+        assert_eq!(problems(&g), vec!["\"M\" has more than one output; a manual step goes on one way, with ▶."]);
     }
 
     #[test]

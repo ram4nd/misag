@@ -60,14 +60,13 @@ A flow file:
       {"id": "review", "kind": "prompt", "title": "Review", "maxRuns": 3,
        "text": "Review the change for bugs.", "outputs": ["ok", "changes"]},
       {"id": "try", "kind": "manual", "title": "Try it",
-       "text": "Try the change in the app.", "outputs": ["works", "broken"]}
+       "text": "Try the change in the app.", "outputs": ["done"]}
     ],
     "edges": [
       {"from": "start", "output": "next", "to": "fix"},
       {"from": "fix", "output": "done", "to": "review"},
       {"from": "review", "output": "changes", "to": "fix"},
-      {"from": "review", "output": "ok", "to": "try"},
-      {"from": "try", "output": "broken", "to": "fix"}
+      {"from": "review", "output": "ok", "to": "try"}
     ]
   }
 }
@@ -80,8 +79,8 @@ Steps ("nodes"):
             "prompt": sends "text" to Claude in the run's tab. misag adds an
               instruction to end the reply with "FLOW: <output>", which picks
               the output, so the text need not mention the outputs.
-            "manual": waits for the person, who picks an output in the app;
-              "text" says what to do.
+            "manual": waits for the person, who goes on with ▶ in the app or
+              stops the run with ■; "text" says what to do. It has one output.
             "end": from flows made by older versions; it ends the run and has
               no outputs. Not needed: an output that leads nowhere ends it.
   title     The step's name on the canvas (up to 200 characters).
@@ -90,8 +89,9 @@ Steps ("nodes"):
             4000 characters), sent ahead of the run's first prompt and again
             with the first prompt after each /clear.
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
-            and _, starting with a letter or digit, up to 24 characters).
-            "attention" is reserved: Claude ends with it to ask for the person.
+            and _, starting with a letter or digit, up to 24 characters), or
+            one for a manual step. "attention" is reserved: Claude ends with
+            it to ask for the person.
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run
             waits for the person.

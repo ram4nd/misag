@@ -212,7 +212,8 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     maxRuns.value = s.maxRuns === undefined ? "" : String(s.maxRuns);
     const words = s.kind === "prompt" || s.kind === "manual";
     text.closest("label")!.hidden = !words && s.kind !== "start";
-    outputs.closest("label")!.hidden = !words;
+    // A manual step goes on one way, with ▶; only one from an older flow, with several, shows them to cut down.
+    outputs.closest("label")!.hidden = !(s.kind === "prompt" || (s.kind === "manual" && s.outputs.length > 1));
     // Leaving a manual step is always your pick, which no limit holds back.
     maxRuns.closest("label")!.hidden = s.kind !== "prompt";
     clear.checked = s.clear === true;
@@ -318,7 +319,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
           ? "A step needs at least one output."
           : words.length > MAX_OUTPUTS
             ? `A step has at most ${MAX_OUTPUTS} outputs.`
-            : null;
+            : s.kind === "manual" && words.length > 1
+              ? "A manual step has one output: ▶ goes on from it, and ■ stops the run."
+              : null;
     invalid.hidden = why === null;
     invalid.textContent = why ?? "";
     if (why !== null) return;
