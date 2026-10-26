@@ -3121,10 +3121,9 @@ describe("flow editor", () => {
     await openFromBox("Deploy");
     tool("add-prompt").click();
     tool("add-manual").click();
+    tool("add-end").click();
     await settle();
-    // There is no End step to add: an output with no next step ends the flow.
-    expect(editor().querySelector("button.add-end")).toBeNull();
-    expect(titles()).toEqual(["Start", "Prompt", "Manual step"]);
+    expect(titles()).toEqual(["Start", "Prompt", "Manual step", "End"]);
     expect(callsOf("flow_save_graph")).toHaveLength(0);
     await afterSave();
     expect(callsOf("flow_save_graph")).toHaveLength(1);
@@ -3133,8 +3132,9 @@ describe("flow editor", () => {
       ["start", ["next"]],
       ["prompt", ["done"]],
       ["manual", ["done"]],
+      ["end", []],
     ]);
-    expect(new Set(graph.nodes.map((n) => n.id)).size).toBe(3);
+    expect(new Set(graph.nodes.map((n) => n.id)).size).toBe(4);
     expect(editor().querySelector(".status")!.textContent).toBe("Saved");
   });
 

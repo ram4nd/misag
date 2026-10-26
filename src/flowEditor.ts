@@ -47,10 +47,11 @@ const MAX_TEXT = 20000;
 const MAX_INFO = 4000;
 const MAX_OUTPUTS = 8;
 const MAX_RUNS = 100;
-/** The steps the toolbar adds. There is no End to add: an output with no next step ends the flow. */
-const NEW_STEPS: Record<"prompt" | "manual", { title: string; outputs: string[] }> = {
+/** The steps the toolbar adds. An End marks where the flow ends; an output with no next step ends it too. */
+const NEW_STEPS: Record<"prompt" | "manual" | "end", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
   manual: { title: "Manual step", outputs: ["done"] },
+  end: { title: "End", outputs: [] },
 };
 
 export interface FlowEditorOptions {
@@ -83,6 +84,7 @@ function editorMarkup(): string {
         <div class="toolbar">
           <button type="button" class="add-prompt">+ Prompt</button>
           <button type="button" class="add-manual">+ Manual step</button>
+          <button type="button" class="add-end">+ End</button>
           <span class="status" role="status"></span>
         </div>
         <div class="run-bar" hidden>
@@ -287,6 +289,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
 
   $<HTMLButtonElement>(".add-prompt").onclick = () => addStep("prompt");
   $<HTMLButtonElement>(".add-manual").onclick = () => addStep("manual");
+  $<HTMLButtonElement>(".add-end").onclick = () => addStep("end");
   $<HTMLButtonElement>(".delete-step").onclick = () => {
     const s = find(selected);
     if (s && s.kind !== "start") removeStep(s.id);

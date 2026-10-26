@@ -81,8 +81,8 @@ Steps ("nodes"):
               the output, so the text need not mention the outputs.
             "manual": waits for the person, who goes on with ▶ in the app or
               stops the run with ■; "text" says what to do. It has one output.
-            "end": from flows made by older versions; it ends the run and has
-              no outputs. Not needed: an output that leads nowhere ends it.
+            "end": ends the run and has no outputs. Optional: an output that
+              leads nowhere ends it too.
   title     The step's name on the canvas (up to 200 characters).
   text      The prompt, or what the person does (up to 20000 characters).
             Optional on Start: base info, such as where things are (up to
