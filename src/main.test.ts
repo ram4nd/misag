@@ -3367,7 +3367,10 @@ describe("flow editor", () => {
 
   test("a manual step from an older flow with several outputs shows them, to cut down to one", async () => {
     storedFlows = flows("Deploy");
-    storedGraphs[1] = { nodes: [START, step("m", "manual", "Review", ["approve", "reject"])], edges: [] };
+    storedGraphs[1] = {
+      nodes: [START, step("m", "manual", "Review", ["approve", "reject"]), step("p", "prompt", "Fix", ["done"], "fix it")],
+      edges: [{ from: "m", output: "reject", to: "p" }],
+    };
     await boot();
     await openFromBox("Deploy");
     await select("Review");
@@ -3377,7 +3380,11 @@ describe("flow editor", () => {
     await edit("outputs", "approve");
     await afterSave();
     expect(saved()!.nodes.find((n) => n.id === "m")!.outputs).toEqual(["approve"]);
+    // Its connection from "reject" went with it, and the panel says so.
+    expect(saved()!.edges).toEqual([]);
+    expect(panel().querySelector<HTMLElement>(".removed")!.textContent).toBe('Removed the connection from "reject".');
     await select("Start");
+    expect(panel().querySelector<HTMLElement>(".removed")!.hidden).toBe(true);
     await select("Review");
     expect(field("outputs").closest("label")!.hidden).toBe(true);
   });

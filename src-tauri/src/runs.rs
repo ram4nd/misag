@@ -4,10 +4,10 @@
 //! sends its text to Claude; when Claude ends its turn, the Stop hook
 //! (`misag --claude-hook`, a separate process) reads the `FLOW: <output>` line
 //! Claude ended with and moves on, handing Claude the next prompt as hook context.
-//! A manual step, or a reply the runner cannot follow, waits for the person, who
-//! picks an output in the Flows box or the editor's run bar (and can do so for a
-//! running step too, if Claude was interrupted) or, at a prompt step, has Claude go
-//! on with it. A pick or Continue names the step it was made for, so one that
+//! A manual step waits for the person, who goes on by its one output (▶ in the
+//! Flows box) or stops the run. A reply the runner cannot follow waits too: the
+//! person picks an output in the editor's run bar (and can do so for a running
+//! step too, if Claude was interrupted) or has Claude go on with the step. A pick or Continue names the step it was made for, so one that
 //! arrives after the run moved on is refused. An output with no next step ends the
 //! run.
 //!
@@ -43,7 +43,7 @@ pub const CLEAR_TIMEOUT_SECS: i64 = 35;
 pub enum Status {
     /// Claude is working on a prompt step.
     Running,
-    /// At a manual step, waiting for the person to pick an output.
+    /// At a manual step, waiting for the person to go on (by its one output) or stop the run.
     Manual,
     /// The run needs a person (its note says why): Claude's reply could not be
     /// followed, it asked for one, or the run hit `MAX_RUN_STEPS`. The person picks
@@ -920,6 +920,15 @@ mod tests {
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Used SQLite.\nFLOW: fail")).unwrap(), prompt_of(&g, "p"));
         let run = only_run(&conn);
         assert_eq!((run.status, run.note), (Status::Running, None));
+    }
+
+    #[test]
+    fn a_manual_step_from_an_older_flow_with_several_outputs_does_not_start() {
+        let mut g = manual_first();
+        g.nodes[1].outputs.push("redo".into());
+        let (_db, mut conn, flow) = setup("runs-manual-several", &g);
+        assert!(start(&mut conn, flow, &tab("t1")).unwrap_err().contains("more than one output"));
+        assert!(active(&conn).unwrap().is_empty());
     }
 
     #[test]

@@ -269,7 +269,7 @@ export function createFlows(opts: FlowsOptions): Flows {
           go.addEventListener("click", (e) => e.stopPropagation());
           li.insertBefore(go, action);
         } else if (mine?.status === "manual") {
-          // Several ways on: its outputs, on a line of their own.
+          // A run of an older flow whose manual step has several ways on (new ones have one): its outputs, on a line of their own.
           const picks = document.createElement("div");
           picks.className = "picks";
           picks.append(

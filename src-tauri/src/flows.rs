@@ -52,8 +52,8 @@ pub enum Kind {
     Start,
     /// Sends `text` to Claude.
     Prompt,
-    /// Waits for a person, who goes on by its one output (several in flows from
-    /// older versions, which `problems` refuses to start).
+    /// Waits for a person, who goes on by its one output. Flows from older versions
+    /// may have several, which `problems` reports, so such a flow does not start.
     Manual,
     End,
 }
@@ -357,9 +357,11 @@ pub fn problems(graph: &Graph) -> Vec<String> {
         }
         // Older versions let the person pick among several; ■ stops the run instead.
         if node.kind == Kind::Manual && node.outputs.len() > 1 {
-            problems.push(format!("\"{name}\" has more than one output; a manual step goes on one way, with ▶."));
+            problems.push(format!(
+                "\"{name}\" has more than one output; a manual step goes on one way, with ▶, so give it a single output."
+            ));
         }
-        // Other outputs with no next step end the flow there.
+        // Start must lead somewhere; other outputs with no next step end the flow there.
         if node.kind == Kind::Start && !graph.edges.iter().any(|e| e.from == node.id) {
             problems.push("Start is not connected to a step.".into());
         }
@@ -649,7 +651,10 @@ pub(crate) mod tests {
         g.nodes.retain(|n| n.id != "e");
         // Flows from older versions still load, to be cut down to one output.
         check(&g).unwrap();
-        assert_eq!(problems(&g), vec!["\"M\" has more than one output; a manual step goes on one way, with ▶."]);
+        assert_eq!(
+            problems(&g),
+            vec!["\"M\" has more than one output; a manual step goes on one way, with ▶, so give it a single output."]
+        );
     }
 
     #[test]

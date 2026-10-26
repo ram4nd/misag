@@ -110,6 +110,7 @@ function editorMarkup(): string {
               </label>
               <p class="invalid" role="alert" hidden></p>
               <p class="invalid runs-invalid" role="alert" hidden></p>
+              <p class="removed" role="status" hidden></p>
               <button type="button" class="delete-step">Delete step</button>
             </div>
             <div class="problems"></div>
@@ -138,6 +139,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   maxRuns.max = String(MAX_RUNS);
   const invalidRuns = $<HTMLElement>(".runs-invalid");
   const invalid = $<HTMLElement>(".invalid:not(.runs-invalid)");
+  const removed = $<HTMLElement>(".removed");
   const status = $<HTMLElement>(".status");
   const errorEl = $<HTMLElement>(".error");
   form.onsubmit = (e) => e.preventDefault();
@@ -207,6 +209,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     panel.hidden = !s;
     invalid.hidden = true;
     invalidRuns.hidden = true;
+    removed.hidden = true;
     if (!s) return;
     title.value = s.title;
     text.value = s.text;
@@ -329,8 +332,11 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     invalid.textContent = why ?? "";
     if (why !== null) return;
     s.outputs = words;
-    // Connections from outputs that are gone go with them.
+    // Connections from outputs that are gone go with them, saying so.
+    const gone = graph.edges.filter((e) => e.from === s.id && !s.outputs.includes(e.output)).map((e) => `"${e.output}"`);
     graph.edges = graph.edges.filter((e) => e.from !== s.id || s.outputs.includes(e.output));
+    removed.hidden = gone.length === 0;
+    removed.textContent = gone.length === 0 ? "" : `Removed the connection${gone.length > 1 ? "s" : ""} from ${gone.join(", ")}.`;
     outputs.value = s.outputs.join(", ");
     changed(true);
   }

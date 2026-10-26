@@ -80,7 +80,9 @@ Steps ("nodes"):
               instruction to end the reply with "FLOW: <output>", which picks
               the output, so the text need not mention the outputs.
             "manual": waits for the person, who goes on with ▶ in the app or
-              stops the run with ■; "text" says what to do. It has one output.
+              stops the run with ■; "text" says what to do. It has exactly
+              one output; a flow with more still imports, but does not run
+              until it has one.
             "end": ends the run and has no outputs. Optional: an output that
               leads nowhere ends it too.
   title     The step's name on the canvas (up to 200 characters).
@@ -89,9 +91,9 @@ Steps ("nodes"):
             4000 characters), sent ahead of the run's first prompt and again
             with the first prompt after each /clear.
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
-            and _, starting with a letter or digit, up to 24 characters), or
-            one for a manual step. "attention" is reserved: Claude ends with
-            it to ask for the person.
+            and _, starting with a letter or digit, up to 24 characters); a
+            manual step has exactly one. "attention" is reserved: Claude ends
+            with it to ask for the person.
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run
             waits for the person.
