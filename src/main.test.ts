@@ -10,7 +10,7 @@ import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
 // wterm needs WASM and real layout, so the tests drive a stand-in that
 // records writes and exposes the callbacks main.ts assigns.
 const fakes = vi.hoisted(() => {
-  type Used = "cols" | "rows" | "element" | "onData" | "onBinary" | "onTitle" | "onResize" | "write" | "fit" | "focus" | "destroy" | "setRenderingPaused" | "bridge";
+  type Used = "cols" | "rows" | "element" | "onData" | "onBinary" | "onTitle" | "onResize" | "write" | "fit" | "focus" | "destroy" | "setRenderingPaused" | "bridge" | "getSelectionText";
   class FakeTerminal implements Pick<WTerm, Used> {
     static all: FakeTerminal[] = [];
     /** Makes the next terminal's init() fail, as a broken view would. */
@@ -25,6 +25,11 @@ const fakes = vi.hoisted(() => {
     tracking = 0;
     bridge = { bracketedPaste: () => this.bracketed, mouseTracking: () => this.tracking } as unknown as WTerm["bridge"];
     written: string[] = [];
+    /** The text wterm holds selected in it, apart from the page's own selection. */
+    selected: string | null = null;
+    getSelectionText() {
+      return this.selected;
+    }
     destroyed = false;
     paused: boolean;
     /** Focus calls that reached the terminal's input, which exists only once it has loaded. */
@@ -216,6 +221,8 @@ let runPrompt: string | null;
 let runRefusal: string | null;
 /** What primary_selection reports: the text selected anywhere on the desktop, if any. */
 let primarySelection: string | null;
+/** What clipboard_text reports: the text copied to the clipboard, if any. */
+let clipboard: string | null;
 /** Makes flow_import_file and flow_export_file fail with it. */
 let importRefusal: string | null;
 /** Whether the person picks a file in the import or export dialog (which the backend opens). */
@@ -406,6 +413,7 @@ beforeEach(() => {
   importRefusal = null;
   flowPicked = true;
   primarySelection = null;
+  clipboard = null;
   picker.asked = [];
   fsGates = {};
   fsHidden = {};
@@ -477,6 +485,7 @@ beforeEach(() => {
     }
     if (cmd.startsWith("flow")) return flowCommand(cmd, (args ?? {}) as Record<string, unknown>);
     if (cmd === "primary_selection") return primarySelection;
+    if (cmd === "clipboard_text") return clipboard;
     if (cmd === "claude_open_sessions") {
       const ids = (args as { tabs: { id: number }[] }).tabs.map((t) => t.id);
       return claudeCheckGate.then(() => Object.fromEntries(
@@ -1047,6 +1056,109 @@ describe("input", () => {
       terms()[0].element.dispatchEvent(down);
       expect(down.defaultPrevented).toBe(false);
       expect(callsOf("primary_selection")).toHaveLength(0);
+    });
+  });
+
+  describe("right-click paste", () => {
+    const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+    /** Right-clicks the first terminal; returns whether WebKit's menu was kept off. */
+    async function rightClick(shiftKey = false) {
+      const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2, shiftKey });
+      terms()[0].element.dispatchEvent(menu);
+      for (let i = 0; i < 6; i++) await flush();
+      return menu.defaultPrevented;
+    }
+
+    test("pastes the clipboard in place of WebKit's menu, which has no Paste there", async () => {
+      clipboard = "git status";
+      await boot();
+      await clickClaude();
+      expect(await rightClick()).toBe(true);
+      expect(callsOf("clipboard_text")).toHaveLength(1);
+      expect(typed()).toEqual(["git status"]);
+    });
+
+    test("pastes in brackets when the program asked for them, without escapes that end them", async () => {
+      clipboard = "a\x1b[201~b";
+      await boot();
+      await clickClaude();
+      terms()[0].bracketed = true;
+      await rightClick();
+      expect(typed()).toEqual(["\x1b[200~a[201~b\x1b[201~"]);
+    });
+
+    test("an empty or unreadable clipboard types nothing", async () => {
+      await boot();
+      await clickClaude();
+      await rightClick();
+      failing.add("clipboard_text");
+      await rightClick();
+      expect(typed()).toEqual([]);
+      expect(noticeText()).toContain("Could not paste the clipboard");
+    });
+
+    test("over selected text it copies the selection instead, and pastes nothing", async () => {
+      clipboard = "old";
+      await boot();
+      await clickClaude();
+      const copy = vi.fn(() => true);
+      document.execCommand = copy;
+      terms()[0].selected = "some output";
+      expect(await rightClick()).toBe(true);
+      expect(copy).toHaveBeenCalledWith("copy");
+      expect(callsOf("clipboard_text")).toHaveLength(0);
+      expect(typed()).toEqual([]);
+    });
+
+    test("a program without bracketed paste gets no control characters", async () => {
+      clipboard = "a\x1bb\x03c\x9bd\x7fe\tf";
+      await boot();
+      await clickClaude();
+      await rightClick();
+      expect(typed()).toEqual(["abcde\tf"]);
+    });
+
+    test("bracketed paste also drops the 8-bit escape that could end it", async () => {
+      clipboard = "a\x9b201~b";
+      await boot();
+      await clickClaude();
+      terms()[0].bracketed = true;
+      await rightClick();
+      expect(typed()).toEqual(["\x1b[200~a201~b\x1b[201~"]);
+    });
+
+    test("more than one line to a program without bracketed paste is pasted only if you agree", async () => {
+      clipboard = "rm -rf build\nmake\n";
+      await boot();
+      await clickClaude();
+      picker.answer = false;
+      await rightClick();
+      expect(picker.asked).toHaveLength(1);
+      expect(typed()).toEqual([]);
+      picker.answer = true;
+      await rightClick();
+      expect(typed()).toEqual(["rm -rf build\rmake\r"]);
+    });
+
+    test("more than one line in brackets is pasted without asking, as the program will not run it", async () => {
+      clipboard = "a\nb";
+      await boot();
+      await clickClaude();
+      terms()[0].bracketed = true;
+      await rightClick();
+      expect(picker.asked).toHaveLength(0);
+      expect(typed()).toEqual(["\x1b[200~a\rb\x1b[201~"]);
+    });
+
+    test("a program that tracks the mouse gets the click, and Shift pastes anyway", async () => {
+      clipboard = "ls";
+      await boot();
+      await clickClaude();
+      terms()[0].tracking = 1000;
+      expect(await rightClick()).toBe(true);
+      expect(callsOf("clipboard_text")).toHaveLength(0);
+      await rightClick(true);
+      expect(typed()).toEqual(["ls"]);
     });
   });
 
@@ -2247,6 +2359,70 @@ describe("terminal views", () => {
     terms()[0].loading!.resolve();
     for (let i = 0; i < 3; i++) await flush();
     expect(terms()[0].focused).toBeGreaterThan(0);
+  });
+
+  test("switching tabs focuses the shown terminal at once, without the tab taking focus first", async () => {
+    await boot();
+    await openClaudeTabs(2);
+    await flush();
+    const before = terms()[0].focused;
+    const down = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
+    tabs()[0].dispatchEvent(down);
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    tabs()[0].click();
+    expect(down.defaultPrevented).toBe(true);
+    expect(terms()[0].focused).toBeGreaterThan(before);
+  });
+
+  test("letting go of a click anywhere on the terminal focuses it, even when its rows were redrawn meanwhile", async () => {
+    await boot();
+    await clickClaude();
+    await flush();
+    const before = terms()[0].focused;
+    const row = document.createElement("div");
+    terms()[0].element.append(row);
+    row.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    await flush();
+    expect(terms()[0].focused).toBe(before + 1);
+  });
+
+  test("letting go of the right button, or over text wterm holds selected, does not focus", async () => {
+    await boot();
+    await clickClaude();
+    await flush();
+    const before = terms()[0].focused;
+    const el = terms()[0].element;
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 2 }));
+    terms()[0].selected = "all of it";
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    await flush();
+    expect(terms()[0].focused).toBe(before);
+  });
+
+  test("pressing a tab's close button or rename field is left to them", async () => {
+    await boot();
+    await clickClaude();
+    for (const target of [tabs()[0].querySelector(".x")!, tabs()[0].querySelector(".name")!.appendChild(document.createElement("input"))]) {
+      const down = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
+      target.dispatchEvent(down);
+      document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+      expect(down.defaultPrevented).toBe(false);
+    }
+  });
+
+  test("letting go of a drag that selected text keeps the selection", async () => {
+    await boot();
+    await clickClaude();
+    await flush();
+    const before = terms()[0].focused;
+    const row = document.createElement("div");
+    row.textContent = "selected text";
+    terms()[0].element.append(row);
+    getSelection()!.selectAllChildren(row);
+    row.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+    await flush();
+    expect(terms()[0].focused).toBe(before);
+    getSelection()!.removeAllRanges();
   });
 
   test("only the shown tab's terminal paints", async () => {

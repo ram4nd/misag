@@ -203,6 +203,7 @@ pub fn run() {
             commands::flow_save_graph,
             commands::flow_import_file,
             commands::primary_selection,
+            commands::clipboard_text,
             commands::flow_export_file,
             commands::flow_start,
             commands::flow_continue,

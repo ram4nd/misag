@@ -9,7 +9,14 @@ declare module "drawflow" {
   export default class Drawflow {
     constructor(container: HTMLElement);
     reroute: boolean;
+    /** How far the canvas is panned and zoomed, kept in step with `precanvas` by hand in canvas.ts. */
+    canvas_x: number;
+    canvas_y: number;
+    zoom: number;
+    /** The element Drawflow draws in and moves to pan and zoom. */
+    precanvas: HTMLElement;
     start(): void;
+    dispatch(event: string, details: unknown): void;
     clear(): void;
     addNode(
       name: string,

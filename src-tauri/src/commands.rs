@@ -555,15 +555,54 @@ pub fn flow_load(db: State<'_, Db>, id: i64) -> Result<FlowDetail, CommandError>
 /// thread, where GTK's clipboard lives.
 #[tauri::command(async)]
 pub fn primary_selection(app: tauri::AppHandle) -> Result<Option<String>, CommandError> {
+    Ok(gtk_text(&app, Selection::Primary)?)
+}
+
+/// The clipboard's text, for a right-click paste in a terminal; None if there is none.
+/// WebKit's menu over a terminal has no Paste, and reading it through GTK spares the
+/// page the webview's clipboard permission.
+#[tauri::command(async)]
+pub fn clipboard_text(app: tauri::AppHandle) -> Result<Option<String>, CommandError> {
+    Ok(gtk_text(&app, Selection::Clipboard)?)
+}
+
+/// Where `gtk_text` reads text from.
+#[derive(Clone, Copy)]
+enum Selection {
+    /// What is selected anywhere on the desktop.
+    Primary,
+    /// What was copied.
+    Clipboard,
+}
+
+impl Selection {
+    fn name(self) -> &'static str {
+        match self {
+            Selection::Primary => "the primary selection",
+            Selection::Clipboard => "the clipboard",
+        }
+    }
+}
+
+/// The text of `selection`, read through GTK on the main thread.
+fn gtk_text(app: &tauri::AppHandle, selection: Selection) -> Result<Option<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     app.run_on_main_thread(move || {
-        gtk::Clipboard::get(&gtk::gdk::SELECTION_PRIMARY).request_text(move |_, text| {
+        // An Atom cannot cross threads, so it is picked here.
+        let atom = match selection {
+            Selection::Primary => gtk::gdk::SELECTION_PRIMARY,
+            Selection::Clipboard => gtk::gdk::SELECTION_CLIPBOARD,
+        };
+        gtk::Clipboard::get(&atom).request_text(move |_, text| {
             let _ = tx.send(text.map(str::to_owned));
         });
     })
     .map_err(|e| format!("cannot reach the main thread: {e}"))?;
-    // The selection's owner may be another app that never answers.
-    Ok(rx.recv_timeout(std::time::Duration::from_secs(2)).map_err(|_| "the primary selection did not arrive".to_string())?)
+    rx.recv_timeout(std::time::Duration::from_secs(2)).map_err(|e| match e {
+        // The selection's owner may be another app that never answers.
+        std::sync::mpsc::RecvTimeoutError::Timeout => format!("{} did not arrive within 2 seconds", selection.name()),
+        std::sync::mpsc::RecvTimeoutError::Disconnected => format!("GTK dropped the request for {}", selection.name()),
+    })
 }
 
 const FLOW_FILES: (&str, &[&str]) = ("Flow", &["json"]);

@@ -3,7 +3,7 @@ import { WTerm } from "@wterm/dom";
 import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 import "@wterm/dom/css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { folderLabel, shellQuote, untypeable } from "./paths";
@@ -340,7 +340,33 @@ async function spawn(opts: SpawnOptions) {
     // A program tracking the mouse (tmux, vim) gets the click instead, as in xterm;
     // Shift, which wterm does not report, pastes anyway.
     if ((term.bridge?.mouseTracking?.() ?? 0) !== 0 && !e.shiftKey) return;
-    void pastePrimary(term);
+    void pasteFrom(term, "primary_selection");
+  });
+  // wterm focuses only on a click, which WebKit does not fire when Claude redrew the
+  // pressed row between press and release. So letting go of the left button anywhere on
+  // the shown pane focuses it, unless that selected text.
+  term.element.addEventListener("mouseup", (e) => {
+    if (e.button !== 0) return;
+    // After wterm's own click handling, which may have selected a word.
+    setTimeout(() => {
+      if (active === s && shownPage === null && (getSelection()?.isCollapsed ?? true) && !term.getSelectionText?.()) term.focus();
+    });
+  });
+  // WebKit's menu over the terminal has no Paste, so a right click copies the selected
+  // text, or with nothing selected pastes the clipboard, as in PuTTY. The menu stays off
+  // either way, also when a program tracking the mouse gets the click.
+  term.element.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (term.getSelectionText?.()) {
+      // wterm puts its selection on the clipboard as the copy happens.
+      document.execCommand("copy");
+      getSelection()?.removeAllRanges();
+      term.focus();
+      return;
+    }
+    term.focus();
+    if ((term.bridge?.mouseTracking?.() ?? 0) !== 0 && !e.shiftKey) return;
+    void pasteFrom(term, "clipboard_text");
   });
   term.onResize = (cols, rows) => {
     if (s.id === null || s.exited) return;
@@ -513,6 +539,8 @@ function activate(s: Session) {
   shownPage = null;
   showActive();
   showHistory();
+  // At once, so keys typed before the next frame reach it; again once it is fitted.
+  s.term.focus();
   requestAnimationFrame(() => {
     s.term.fit();
     s.term.focus();
@@ -638,7 +666,10 @@ function renderSessions() {
       tab.onclick = () => activate(s);
       tab.ondblclick = () => rename(s, tab);
       tab.onmousedown = (e) => {
-        if (e.button === 0 && !(e.target instanceof Element && e.target.closest(".x, input"))) dragTab(s, e);
+        if (e.button !== 0 || (e.target instanceof Element && e.target.closest(".x, input"))) return;
+        // Keeps the tab from taking focus on press, so the terminal keeps it until activate moves it.
+        e.preventDefault();
+        dragTab(s, e);
       };
       // Middle-click closes the tab.
       tab.onauxclick = (e) => {
@@ -1378,22 +1409,35 @@ const flows = createFlows({
   onResume: async (run) => flows.showBoxError(await resumeRun(run)),
 });
 
+/** What a terminal can paste: the backend command that reads it, and its name. */
+const PASTE_SOURCES = { primary_selection: "primary selection", clipboard_text: "clipboard" } as const;
+
 /**
- * Types the primary selection (what is selected anywhere on the desktop) into the
- * terminal, as wterm pastes: in brackets if its program asked for them, without the
- * escapes that could end them early.
+ * Types the primary selection (what is selected anywhere on the desktop) or the
+ * clipboard into the terminal: in brackets if its program asked for them, with line
+ * breaks as Enter sends them and no other control characters, so the text cannot end
+ * the brackets early or send keys of its own. Without brackets each line runs as it
+ * arrives, so more than one line is pasted only if the person agrees.
  */
-async function pastePrimary(term: WTerm) {
+async function pasteFrom(term: WTerm, source: keyof typeof PASTE_SOURCES) {
   let text: string | null;
   try {
-    text = await invoke<string | null>("primary_selection");
+    text = await invoke<string | null>(source);
   } catch (err) {
-    console.error("misag: could not read the primary selection", err);
+    console.error(`misag: could not read the ${PASTE_SOURCES[source]}`, err);
+    setNotice("paste", `Could not paste the ${PASTE_SOURCES[source]}: ${errorText(err)}.`);
     return;
   }
+  setNotice("paste", null);
   if (!text) return;
+  const clean = text.replace(/\r\n?|\n/g, "\r").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, "");
   const bracketed = term.bridge?.bracketedPaste() ?? false;
-  term.onData?.(bracketed ? `\x1b[200~${text.replace(/\x1b/g, "")}\x1b[201~` : text);
+  if (!bracketed && clean.includes("\r")) {
+    const sure = await ask("The text has more than one line, and the program in this tab runs each line as it is pasted. Paste it?", { title: "Paste", kind: "warning" });
+    term.focus();
+    if (!sure) return;
+  }
+  term.onData?.(bracketed ? `\x1b[200~${clean}\x1b[201~` : clean);
 }
 
 /** How long after pasting a prompt Claude gets the Enter that sends it, so the paste is not taken as typing. */

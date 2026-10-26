@@ -26,10 +26,14 @@ export interface Canvas {
 const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Manual", end: "End" };
 
 /**
- * A Drawflow canvas in `el` showing a flow's steps. Drawflow's own node ids stay in
- * here: everything outside uses the flow's step ids.
+ * A Drawflow canvas showing a flow's steps, drawn in an element it adds to `canvasEl`.
+ * Drawflow's own node ids stay in here: everything outside uses the flow's step ids.
  */
-export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
+export function createCanvas(canvasEl: HTMLElement, events: CanvasEvents): Canvas {
+  // Drawflow pans only when a drag starts on an element whose first class is its own,
+  // so it gets a bare element of its own rather than one styled by misag.
+  const el = document.createElement("div");
+  canvasEl.append(el);
   const df = new Drawflow(el);
   df.reroute = false;
   let graph: Graph = { version: 1, nodes: [], edges: [] };
@@ -61,6 +65,24 @@ export function createCanvas(el: HTMLElement, events: CanvasEvents): Canvas {
   /** Logs an event that does not match what was drawn: the canvas and the flow have drifted apart. */
   const dropped = (what: string, detail: unknown) => console.error(`misag: ignored a canvas ${what}`, detail);
   df.start();
+  // The wheel scrolls the canvas; Drawflow zooms with Ctrl+wheel. Drawflow 0.0.60 has no
+  // call to pan, so this moves it the way its own drag does, through its canvas_x,
+  // canvas_y and precanvas properties, and tells its listeners as the drag does.
+  if (Number.isFinite(df.canvas_x) && Number.isFinite(df.canvas_y) && Number.isFinite(df.zoom) && df.precanvas && typeof df.dispatch === "function") {
+    el.addEventListener("wheel", (e) => {
+      if (e.ctrlKey) return;
+      e.preventDefault();
+      // Pixels per delta: some wheels count lines, or pages (the canvas's width across, its height down).
+      const page = e.deltaMode === WheelEvent.DOM_DELTA_PAGE;
+      const line = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
+      df.canvas_x -= e.deltaX * (page ? el.clientWidth : line);
+      df.canvas_y -= e.deltaY * (page ? el.clientHeight : line);
+      df.precanvas.style.transform = `translate(${df.canvas_x}px, ${df.canvas_y}px) scale(${df.zoom})`;
+      df.dispatch("translate", { x: df.canvas_x, y: df.canvas_y });
+    });
+  } else {
+    console.error("misag: Drawflow no longer has the fields the wheel scrolls with; the wheel does not scroll the canvas");
+  }
   df.on("connectionCreated", (e) => {
     if (rendering) return;
     const p = port(e);
