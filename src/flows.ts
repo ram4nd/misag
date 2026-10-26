@@ -50,6 +50,8 @@ export interface FlowsOptions {
   onStop(run: Run): void;
   /** Has Claude go on with a step that needs attention (the Continue button). */
   onResume(run: Run): void;
+  /** Goes on from a manual step as `output` (its buttons under the flow). */
+  onContinue(run: Run, output: string): void;
 }
 
 export interface Flows {
@@ -256,6 +258,28 @@ export function createFlows(opts: FlowsOptions): Flows {
           li.append(resume);
         }
         li.append(action);
+        if (mine?.status === "manual") {
+          // A manual step waits for your pick: its outputs, on a line of their own.
+          const picks = document.createElement("div");
+          picks.className = "picks";
+          picks.append(
+            ...mine.outputs.map((output) => {
+              const b = document.createElement("button");
+              b.type = "button";
+              b.className = "pick";
+              b.textContent = output;
+              b.title = `Go on as "${output}"`;
+              b.onclick = (e) => {
+                e.stopPropagation();
+                // A second click would send the next step too; the poll after the pick redraws the row.
+                for (const other of picks.querySelectorAll("button")) other.disabled = true;
+                opts.onContinue(mine, output);
+              };
+              return b;
+            }),
+          );
+          li.append(picks);
+        }
         return li;
       }),
     );

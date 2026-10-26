@@ -3707,7 +3707,7 @@ describe("flow runs", () => {
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Check the form", outputs: ["ok"] })];
     await poll();
-    // A manual step is picked in its editor; there is nothing for Claude to go on with.
+    // A manual step is picked by you; there is nothing for Claude to go on with.
     expect(flowRow("Deploy").querySelector("button.resume")).toBeNull();
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
     await poll();
@@ -3721,6 +3721,39 @@ describe("flow runs", () => {
     expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5 }]);
     expect(callsOf("flow_load")).toHaveLength(0);
     expect(typed()).toEqual(["\x1b[200~Go on with the flow step.\x1b[201~", "\r"]);
+  });
+
+  test("a run waiting at a manual step goes on from the flow list with the output picked there", async () => {
+    runPrompt = "Ship it.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review the diff", outputs: ["approve", "reject"] })];
+    await poll();
+    const picks = [...flowRow("Deploy").querySelectorAll<HTMLButtonElement>(".picks button.pick")];
+    expect(picks.map((b) => b.textContent)).toEqual(["approve", "reject"]);
+    expect(picks[0].title).toBe('Go on as "approve"');
+    picks[0].click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "approve" }]);
+    // Picking does not open the editor.
+    expect(callsOf("flow_load")).toHaveLength(0);
+    expect(typed()).toEqual(["\x1b[200~Ship it.\x1b[201~", "\r"]);
+    // A running step is not offered there: Claude picks its output.
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    expect(flowRow("Deploy").querySelector(".picks")).toBeNull();
+  });
+
+  test("a pick in the flow list that cannot go on says why", async () => {
+    runRefusal = "the run has moved on";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>(".picks button.pick")!.click();
+    await settle();
+    expect(box().querySelector<HTMLElement>(".error")!.textContent).toContain("the run has moved on");
   });
 
   test("Continue in the run bar has Claude go on with a step that needs attention", async () => {

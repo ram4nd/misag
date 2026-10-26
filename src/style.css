@@ -352,6 +352,10 @@ svg.lucide { display: block; flex: none; }
 #flows-box .flows > li.orphan { font-weight: normal; font-style: italic; }
 #flows-box .flows > li.orphan > svg:first-child { color: var(--muted); }
 #flows-box .flows > li > button.run:disabled { opacity: 0.4; cursor: default; }
+/* A manual step's outputs, picked from the list. */
+#flows-box .flows > li.manual { flex-wrap: wrap; }
+#flows-box .flows > li > .picks { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px; padding-left: 20px; }
+#flows-box .flows > li > .picks button { padding: 1px 8px; font-weight: normal; color: #e8710a; }
 /* Where the active tab's run of this flow is. */
 .flow-editor .run-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--press); border-left: 3px solid var(--accent); }
 .flow-editor .run-bar.manual, .flow-editor .run-bar.attention { border-left-color: #e8710a; }

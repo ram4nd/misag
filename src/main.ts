@@ -1505,6 +1505,7 @@ const flows = createFlows({
   onRun: startFlow,
   onStop: stopRun,
   onResume: async (run) => flows.showBoxError(await resumeRun(run)),
+  onContinue: async (run, output) => flows.showBoxError(await continueRun(run, output)),
 });
 
 /** What a terminal can paste: the backend command that reads it, and its name. */
