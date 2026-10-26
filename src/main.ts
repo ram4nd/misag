@@ -313,6 +313,9 @@ async function spawn(opts: SpawnOptions) {
   }
   // wterm resolves without an error for a view destroyed while it loaded.
   if (s.closing) return;
+  // Without autoResize, wterm holds the pane at the height of the rows it started with,
+  // so fit() would only ever measure that; the stylesheet sizes the pane instead.
+  term.element.style.height = "";
   // The pane must be visible and sized before the PTY is opened with its dimensions.
   term.fit();
   // Focus from `activate` did not reach a terminal that was still loading.

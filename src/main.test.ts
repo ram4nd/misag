@@ -68,6 +68,8 @@ const fakes = vi.hoisted(() => {
       }
       // Like wterm: a terminal destroyed while loading resolves without an error.
       if (!this.destroyed) this.loaded = true;
+      // Like wterm without autoResize: the pane is held at the height of its first rows.
+      if (!this.destroyed && this.options.autoResize === false) this.element.style.height = "420px";
       return this;
     }
     write(data: string | Uint8Array) {
@@ -2423,6 +2425,13 @@ describe("terminal views", () => {
     await flush();
     expect(terms()[0].focused).toBe(before);
     getSelection()!.removeAllRanges();
+  });
+
+  test("a terminal fills its pane, rather than keeping the height of the rows it started with", async () => {
+    await boot();
+    await clickClaude();
+    for (let i = 0; i < 3; i++) await flush();
+    expect(terms()[0].element.style.height).toBe("");
   });
 
   test("only the shown tab's terminal paints", async () => {
