@@ -162,7 +162,7 @@ body.dragging-toolbox, body.dragging-toolbox * { cursor: grabbing !important; us
   position: absolute; inset: 0; padding: 6px; border-radius: 0; box-shadow: none;
   --term-bg: #000000; --term-fg: #ffffff; --term-cursor: #ffffff;
   --term-selection-bg: #555555;
-  --term-font-family: 'JetBrains Mono', 'Fira Code', monospace; --term-font-size: 14px;
+  --term-font-family: 'JetBrains Mono', 'Fira Code', monospace; --term-font-size: var(--terminal-font-size, 14px);
   /* xfce4-terminal's palette. */
   --term-color-0: #000000; --term-color-1: #aa0000; --term-color-2: #00aa00; --term-color-3: #aa5500;
   --term-color-4: #0000aa; --term-color-5: #aa00aa; --term-color-6: #00aaaa; --term-color-7: #aaaaaa;
@@ -209,6 +209,7 @@ input:focus { border-color: var(--accent); }
   border: 1px solid var(--press); border-radius: 6px; padding: 4px 8px; outline: none;
 }
 .page select:focus { border-color: var(--accent); }
+.page input[type="number"] { width: 6em; align-self: flex-start; }
 dialog {
   width: 480px; background: var(--surface); color: var(--fg);
   border: 1px solid var(--press); border-radius: 10px; padding: 16px;
@@ -263,6 +264,7 @@ svg.lucide { display: block; flex: none; }
 #flows-settings details fieldset { margin: 0; padding: 0; border: 0; }
 #flows-settings .new-flow input { flex: 1; }
 #flows-settings .new-flow button { white-space: nowrap; }
+#flows-settings .new-flow button.import { display: inline-flex; align-items: center; gap: 4px; }
 #flows-settings details { margin-top: 20px; color: var(--muted); }
 #flows-settings details ul { margin-top: 8px; color: var(--fg); }
 #flows-settings details li .name { padding: 6px 0; }
@@ -327,13 +329,13 @@ svg.lucide { display: block; flex: none; }
 
 /* ---------- flow runs (see src/flows.ts and src/flowEditor.ts) ---------- */
 #flows-box .flows > li .name { flex: 1; }
-#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run { padding: 2px; background: none; }
+#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run, #flows-box .flows > li > button.resume { padding: 2px; background: none; }
 #flows-box .flows > li > button.run { visibility: hidden; }
 #flows-box .flows > li:hover > button.run, #flows-box .flows > li > button.run:focus-visible { visibility: visible; }
 /* A flow running in the active tab. */
 #flows-box .flows > li.running { font-weight: 600; }
 #flows-box .flows > li.running > svg:first-child { color: var(--accent); }
-#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child { color: #e8710a; }
+#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child, #flows-box .flows > li > button.resume { color: #e8710a; }
 /* A run whose tab is gone: it can only be stopped. */
 #flows-box .flows > li.orphan { font-weight: normal; font-style: italic; }
 #flows-box .flows > li.orphan > svg:first-child { color: var(--muted); }

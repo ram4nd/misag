@@ -134,6 +134,8 @@ interface StoreReport {
   hookProblem: HookProblem | null;
   /** Why the `claude` wrapper for terminal tabs could not be installed. */
   wrapperProblem: string | null;
+  /** Why the `misag` shim for tabs could not be installed. */
+  cliProblem: string | null;
 }
 
 /** Mirrors `layout::Tab` in src-tauri/src/layout.rs. */
@@ -153,7 +155,13 @@ interface Settings {
   workspace: string | null;
   /** When true, Claude tabs get `autoMemoryEnabled: false`; when false, nothing is passed and the user's Claude config decides. */
   disableAutoMemory: boolean;
+  /** The terminals' font size in pixels. */
+  fontSize: number;
 }
+
+/** The terminals' font size, and the range allowed: mirrors `settings::DEFAULT_FONT_SIZE` and `FONT_SIZES`. */
+const DEFAULT_FONT_SIZE = 14;
+const FONT_SIZES = { min: 8, max: 32 };
 
 
 /** How long after a Claude tab starts its session hook should have reported in. */
@@ -239,7 +247,7 @@ const openPages: PageId[] = [];
 /** The page shown instead of a terminal; null when a terminal (or nothing) is shown. */
 let shownPage: PageId | null = null;
 /** The stored settings, as last loaded or saved; the defaults until the first load. */
-let settings: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
+let settings: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: DEFAULT_FONT_SIZE };
 let counter = 0;
 const encoder = new TextEncoder();
 
@@ -318,6 +326,22 @@ async function spawn(opts: SpawnOptions) {
     write(s, encoder.encode(data));
   };
   term.onBinary = (data) => write(s, data);
+  // WebKitGTK 2.54 crashes the app (in its callback for the primary selection's
+  // targets) pasting a middle click itself, so the terminal does it instead.
+  for (const type of ["mousedown", "auxclick"] as const) {
+    term.element.addEventListener(type, (e) => {
+      if (e.button === 1) e.preventDefault();
+    });
+  }
+  term.element.addEventListener("mouseup", (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    term.focus();
+    // A program tracking the mouse (tmux, vim) gets the click instead, as in xterm;
+    // Shift, which wterm does not report, pastes anyway.
+    if ((term.bridge?.mouseTracking?.() ?? 0) !== 0 && !e.shiftKey) return;
+    void pastePrimary(term);
+  });
   term.onResize = (cols, rows) => {
     if (s.id === null || s.exited) return;
     invoke("pty_resize", { id: s.id, cols, rows }).catch((err) =>
@@ -765,6 +789,7 @@ function settingsField<T extends HTMLInputElement | HTMLSelectElement = HTMLInpu
 function fillSettingsForms() {
   settingsField("skipPermissions").checked = settings.skipPermissions;
   settingsField<HTMLSelectElement>("disableAutoMemory").value = String(settings.disableAutoMemory ?? false);
+  settingsField("fontSize").value = String(settings.fontSize ?? DEFAULT_FONT_SIZE);
   (pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement).value = settings.workspace ?? "";
 }
 
@@ -773,7 +798,14 @@ function readSettingsForm(): Settings {
     ...settings,
     skipPermissions: settingsField("skipPermissions").checked,
     disableAutoMemory: settingsField<HTMLSelectElement>("disableAutoMemory").value === "true",
+    fontSize: Number(settingsField("fontSize").value),
   };
+}
+
+/** Sets the terminals' font size from the settings; a hidden terminal measures it again when shown (see `activate`). */
+function applyFontSize() {
+  document.documentElement.style.setProperty("--terminal-font-size", `${settings.fontSize ?? DEFAULT_FONT_SIZE}px`);
+  if (shownPage === null) active?.term.fit();
 }
 
 /** Enables or disables every control on the page (each part of it is a fieldset). */
@@ -807,16 +839,24 @@ async function loadPage(p: Page) {
 
 async function loadSettings() {
   settings = await invoke<Settings>("settings_load");
+  applyFontSize();
 }
 
 /** Saves the settings page; if that fails, the form goes back to the stored settings. */
 async function saveSettingsForm() {
-  try {
-    settings = await invoke<Settings>("settings_save", { settings: readSettingsForm() });
-    showPageError(pages.settings, null);
-  } catch (err) {
-    console.error("misag: could not save settings", err);
-    showPageError(pages.settings, `Settings not saved: ${errorText(err)}`);
+  const next = readSettingsForm();
+  const { min, max } = FONT_SIZES;
+  if (!Number.isInteger(next.fontSize) || next.fontSize < min || next.fontSize > max) {
+    showPageError(pages.settings, `Settings not saved: the font size must be ${min} to ${max}.`);
+  } else {
+    try {
+      settings = await invoke<Settings>("settings_save", { settings: next });
+      showPageError(pages.settings, null);
+      applyFontSize();
+    } catch (err) {
+      console.error("misag: could not save settings", err);
+      showPageError(pages.settings, `Settings not saved: ${errorText(err)}`);
+    }
   }
   fillSettingsForms();
 }
@@ -1067,6 +1107,7 @@ async function showStoreStatus() {
     "wrapper",
     report.wrapperProblem && `Claude sessions started in terminal tabs will not be reopened: ${report.wrapperProblem}.`,
   );
+  setNotice("cli", report.cliProblem && `misag flow is not available in tabs: ${report.cliProblem}.`);
 }
 
 /**
@@ -1255,7 +1296,26 @@ const flows = createFlows({
   onChange: followFlows,
   onRun: startFlow,
   onStop: stopRun,
+  onResume: async (run) => flows.showBoxError(await resumeRun(run)),
 });
+
+/**
+ * Types the primary selection (what is selected anywhere on the desktop) into the
+ * terminal, as wterm pastes: in brackets if its program asked for them, without the
+ * escapes that could end them early.
+ */
+async function pastePrimary(term: WTerm) {
+  let text: string | null;
+  try {
+    text = await invoke<string | null>("primary_selection");
+  } catch (err) {
+    console.error("misag: could not read the primary selection", err);
+    return;
+  }
+  if (!text) return;
+  const bracketed = term.bridge?.bracketedPaste() ?? false;
+  term.onData?.(bracketed ? `\x1b[200~${text.replace(/\x1b/g, "")}\x1b[201~` : text);
+}
 
 /** How long after pasting a prompt Claude gets the Enter that sends it, so the paste is not taken as typing. */
 const PASTE_SUBMIT_MS = 150;
@@ -1280,12 +1340,18 @@ function showTabRuns() {
 /**
  * Types `text` into the tab as one paste and sends it, as if the person had. The
  * backend drops control characters from prompts, so the text cannot end the paste.
- * If Claude is busy (mid-turn, or in a menu), the paste lands there instead.
+ * If Claude is busy (mid-turn, or in a menu), the paste lands there instead. Claude
+ * is checked again before the Enter: in a terminal tab it may have been suspended
+ * or quit meanwhile, and the shell must not run a flow's text.
  */
 function typePrompt(s: Session, text: string) {
   write(s, encoder.encode(`\x1b[200~${text}\x1b[201~`));
-  setTimeout(() => {
-    if (!s.exited && !s.closing) write(s, encoder.encode("\r"));
+  setTimeout(async () => {
+    if (!(await claudeLive(s))) {
+      console.warn(`misag: Claude left ${tabLabel(s)} before its flow prompt was sent; it was not sent`);
+      return;
+    }
+    write(s, encoder.encode("\r"));
   }, PASTE_SUBMIT_MS);
 }
 
@@ -1316,15 +1382,18 @@ async function startFlow(flow: Flow) {
   await pollRuns();
 }
 
-/** Goes on as `output`; resolves to why it could not, for the run bar it was picked in, or null. */
-async function continueRun(run: Run, output: string): Promise<string | null> {
+/**
+ * Moves the run on with `go`, typing the prompt it returns into the run's tab;
+ * resolves to why it could not, for the run bar it was picked in, or null.
+ */
+async function goOn(run: Run, go: () => Promise<string | null>): Promise<string | null> {
   const s = sessions.find((s) => s.tabId === run.tabId);
   let error: string | null = null;
   if (!s || !(await claudeLive(s))) {
     error = `Claude is not running in ${s ? tabLabel(s) : "the run's tab"}; start it there first, or stop the run.`;
   } else {
     try {
-      const prompt = await invoke<string | null>("flow_continue", { runId: run.id, output });
+      const prompt = await go();
       if (prompt !== null) typePrompt(s, prompt);
     } catch (err) {
       console.error("misag: could not continue the run", err);
@@ -1333,6 +1402,16 @@ async function continueRun(run: Run, output: string): Promise<string | null> {
   }
   await pollRuns();
   return error;
+}
+
+/** Goes on as `output`. */
+function continueRun(run: Run, output: string): Promise<string | null> {
+  return goOn(run, () => invoke<string | null>("flow_continue", { runId: run.id, output }));
+}
+
+/** Has Claude go on with the run's step that needs attention. */
+function resumeRun(run: Run): Promise<string | null> {
+  return goOn(run, () => invoke<string>("flow_resume", { runId: run.id }));
 }
 
 async function stopRun(run: Run) {
@@ -1372,7 +1451,7 @@ async function pollRuns() {
 function openFlowEditor(flow: Flow) {
   const id: EditorPageId = `flow:${flow.id}`;
   if (!editorPages.has(id)) {
-    const editor = createFlowEditor(flow.id, { errorText, onContinue: continueRun });
+    const editor = createFlowEditor(flow.id, { errorText, onContinue: continueRun, onResume: resumeRun });
     termsEl.append(editor.el);
     const page: Page = {
       title: flow.name,
@@ -1573,6 +1652,8 @@ setInterval(checkStore, STORE_POLL_MS);
 // flow runs move on in the Stop hook.
 setInterval(pollTabs, TAB_POLL_MS);
 setInterval(pollRuns, TAB_POLL_MS);
+// `misag flow import` adds flows without telling the app.
+setInterval(() => void flows.refresh(), TAB_POLL_MS);
 setInterval(reloadHistoryIfShown, HISTORY_POLL_MS);
 restore()
   .catch((err) => {

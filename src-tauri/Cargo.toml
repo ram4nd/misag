@@ -24,6 +24,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 tauri-plugin-dialog = "2"
+# The GTK that Tauri runs on, to read the primary selection (see commands::primary_selection).
+gtk = "0.18"
 
 # https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

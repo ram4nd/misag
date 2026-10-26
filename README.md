@@ -44,6 +44,7 @@ The `.deb` and AppImage bundles land in `src-tauri/target/release/bundle/`. Inst
 - Click the terminal icon at the top right for a new terminal tab, or Shift+click it to pick a name, a folder and whether it runs Claude.
 - Hover a folder in the Workspace box and click its Claude icon to start Claude there.
 - Open the Flows box's gear to make a flow, click the flow to edit its steps, then hover it and click ▶ with a Claude tab selected.
+- Flows export and import as JSON files on the Flows tab, or with `misag flow` in a terminal. Ask Claude in a misag tab to "run `misag flow help`, then add a misag flow that …" and it writes one.
 
 The [reference](docs/reference.md) covers every action, how each feature behaves and troubleshooting.
 

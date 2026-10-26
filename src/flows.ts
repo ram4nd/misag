@@ -17,6 +17,8 @@ export interface Run {
   note: string | null;
   outputs: string[];
   steps: number;
+  /** Whether Claude can be asked to go on with the step (a prompt step that needs attention). */
+  resumable: boolean;
 }
 
 export const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
@@ -44,11 +46,15 @@ export interface FlowsOptions {
   onRun(flow: Flow): void;
   /** Stops the run (the ■ button that takes ▶'s place). */
   onStop(run: Run): void;
+  /** Has Claude go on with a step that needs attention (the Continue button). */
+  onResume(run: Run): void;
 }
 
 export interface Flows {
   /** Reads the flows again and shows them in the toolbox and on the page. */
   reload(): Promise<void>;
+  /** Shows flows changed outside the app (`misag flow import`); only redraws on a change. */
+  refresh(): Promise<void>;
   /**
    * Marks the flows of the active tab's runs, waiting or not, and of runs whose tab
    * is gone (which can only be stopped); ▶ is off on the rest while the tab runs one.
@@ -140,6 +146,30 @@ export function createFlows(opts: FlowsOptions): Flows {
     });
   }
 
+  /**
+   * Adds a flow from a file the person picks, and opens it, so its problems show.
+   * The backend opens the file dialogs, so the page never names a file.
+   */
+  async function importFile() {
+    let imported: Flow | null = null;
+    const done = await change("import the flow", async () => {
+      imported = await invoke<Flow | null>("flow_import_file");
+    });
+    const flow = imported as Flow | null;
+    if (done && flow) opts.onOpen(flow);
+  }
+
+  /** Writes the flow to a file the person picks. */
+  async function exportFile(flow: Flow) {
+    try {
+      await invoke<boolean>("flow_export_file", { id: flow.id });
+      opts.showError(null);
+    } catch (err) {
+      console.error("misag: could not export the flow", err);
+      opts.showError(`Could not export "${flow.name}": ${opts.errorText(err)}`);
+    }
+  }
+
   async function remove(flow: Flow) {
     const sure = await ask(`Delete the flow "${flow.name}"? This cannot be undone.`, { title: "Delete flow", kind: "warning" });
     if (sure) change(`delete "${flow.name}"`, () => invoke("flow_delete", { id: flow.id }));
@@ -167,7 +197,8 @@ export function createFlows(opts: FlowsOptions): Flows {
       change(`archive "${flow.name}"`, () => invoke("flow_set_archived", { id: flow.id, archived: true })),
     );
     const edit = button("edit", "pencil", "Edit the steps", () => opts.onOpen(flow));
-    li.append(name, edit, up, down, archive, button("delete", "trash-2", "Delete", () => remove(flow)));
+    const exported = button("export", "download", "Export to a file", () => exportFile(flow));
+    li.append(name, edit, exported, up, down, archive, button("delete", "trash-2", "Delete", () => remove(flow)));
     return li;
   }
 
@@ -176,7 +207,8 @@ export function createFlows(opts: FlowsOptions): Flows {
     const unarchive = button("unarchive", "archive-restore", "Unarchive", () =>
       change(`unarchive "${flow.name}"`, () => invoke("flow_set_archived", { id: flow.id, archived: false })),
     );
-    li.append(nameSpan(flow), unarchive, button("delete", "trash-2", "Delete", () => remove(flow)));
+    const exported = button("export", "download", "Export to a file", () => exportFile(flow));
+    li.append(nameSpan(flow), exported, unarchive, button("delete", "trash-2", "Delete", () => remove(flow)));
     return li;
   }
 
@@ -196,7 +228,7 @@ export function createFlows(opts: FlowsOptions): Flows {
         const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
         const run = mine ?? orphan;
         li.title = mine
-          ? `${flow.name}: ${STATUS_LABELS[mine.status].toLowerCase()} at ${mine.step}`
+          ? `${flow.name}: ${STATUS_LABELS[mine.status].toLowerCase()} at ${mine.step}${mine.note ? `. ${mine.note}` : ""}`
           : orphan
             ? `${flow.name}: running in a closed tab; ■ stops it`
             : `Edit ${flow.name}`;
@@ -211,7 +243,16 @@ export function createFlows(opts: FlowsOptions): Flows {
           action.title = `This tab runs ${here[0].flowName}; a tab runs one flow at a time`;
         }
         if (run) li.classList.add("running", orphan ? "orphan" : run.status);
-        li.append(icon("workflow", 14), nameSpan(flow), action);
+        const attention = mine?.status === "attention";
+        const mark = icon(attention ? "circle-alert" : "workflow", 14);
+        if (attention) mark.classList.add("needs-attention");
+        li.append(mark, nameSpan(flow));
+        if (mine?.resumable) {
+          const resume = button("resume", "step-forward", "Continue: have Claude go on with this step", () => opts.onResume(mine));
+          resume.addEventListener("click", (e) => e.stopPropagation());
+          li.append(resume);
+        }
+        li.append(action);
         return li;
       }),
     );
@@ -228,8 +269,30 @@ export function createFlows(opts: FlowsOptions): Flows {
     if (created) newName.value = "";
   };
 
+  opts.page.querySelector<HTMLButtonElement>("button.import")!.onclick = () => void importFile();
+
   return {
     reload,
+    refresh() {
+      // Queued, so it never lands between a change and the reload after it.
+      const run = queue.then(async () => {
+        let next: Flow[];
+        try {
+          next = await invoke<Flow[]>("flows_list");
+        } catch (err) {
+          // The next reload (after a change, or when the page opens) shows the error.
+          console.error("misag: could not read the flows", err);
+          return;
+        }
+        if (JSON.stringify(next) === JSON.stringify(flows)) return;
+        flows = next;
+        opts.onChange(flows);
+        render();
+      });
+      // A redraw that throws must not stop every change queued after it.
+      queue = run.catch((err) => console.error("misag: could not show the flows", err));
+      return queue;
+    },
     showBoxError,
     showRuns(nextHere: Run[], nextOrphans: Run[]) {
       if (JSON.stringify([nextHere, nextOrphans]) === JSON.stringify([here, orphans])) return;

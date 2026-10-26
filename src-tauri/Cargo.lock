@@ -2131,6 +2131,7 @@ dependencies = [
 name = "misag"
 version = "0.1.0"
 dependencies = [
+ "gtk",
  "libc",
  "portable-pty",
  "rusqlite",

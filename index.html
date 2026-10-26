@@ -73,6 +73,11 @@
               <p class="hint">Auto leaves it to your Claude settings; Disable turns off Claude's auto memory. Applies to Claude tabs started, restarted or restored from now on, and to every <code>claude</code> started in a terminal tab.</p>
             </fieldset>
             <fieldset>
+              <h2><span data-icon="square-terminal"></span>Terminal</h2>
+              <label>Font size <input name="fontSize" type="number" min="8" max="32" step="1" /></label>
+              <p class="hint">The size of the text in every tab, 8 to 32 pixels. Applies right away.</p>
+            </fieldset>
+            <fieldset>
               <h2><span data-icon="menu"></span>Sidebar</h2>
               <button type="button" class="reset-sidebar">Reset sidebar</button>
               <p class="hint">Puts the toolboxes back in their first order and opens them all. Drag a toolbox by its header (or press Alt+Up or Alt+Down on it) to move it.</p>
@@ -113,6 +118,7 @@
             <fieldset>
               <input name="name" placeholder="New flow name" aria-label="New flow name" />
               <button class="primary">Add flow</button>
+              <button type="button" class="import" title="Add a flow from a file exported here or written with misag flow (see misag flow help)"><span data-icon="upload" data-size="14"></span>Import…</button>
             </fieldset>
           </form>
           <details class="archived">

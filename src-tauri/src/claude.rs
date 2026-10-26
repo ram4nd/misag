@@ -13,7 +13,8 @@
 //! `install_wrapper`), which hands `claude` to `misag --claude-launch`: that
 //! starts the real `claude` with the same hook and the current settings, so a
 //! Claude session started in a terminal tab is recorded for that tab and set up
-//! like a Claude tab's.
+//! like a Claude tab's. Tabs also find a `misag` shim on their `PATH` (see
+//! `install_cli`), so `misag flow` there works on this app's flows.
 
 use crate::db::{self, unix_secs, Db, SessionReport};
 use crate::layout::TabId;
@@ -35,11 +36,17 @@ pub const DB_ENV: &str = "MISAG_DB";
 pub const WRAPPER_ENV: &str = "MISAG_WRAPPER";
 /// The same, set by raterm (misag's old name) in its tabs.
 pub const RATERM_WRAPPER_ENV: &str = "RATERM_WRAPPER";
+/// Set on Claude and terminal tabs: the directory of the `misag` shim misag put on
+/// their PATH, so a misag started from such a tab can take it off again.
+pub const CLI_ENV: &str = "MISAG_CLI";
 /// Claude Code sets this for the commands and hooks it runs (seen in 2.1): its
 /// own process, recorded with the session.
 pub const PID_ENV: &str = "CLAUDE_PID";
 /// The subdirectory of the database's directory that holds the `claude` wrapper.
 pub const WRAPPER_DIR: &str = "bin";
+/// The one that holds the `misag` shim. Not the wrapper's, which the wrapper takes
+/// off PATH before it starts Claude.
+pub const CLI_DIR: &str = "cli";
 /// Claude Code's cap on Stop-hook continuations in a row (8 by default). Tabs get
 /// it raised to just above misag's own limit (`runs::MAX_RUN_STEPS`), so a flow
 /// run is not cut short; it applies to the user's own Stop hooks in those tabs too.
@@ -196,6 +203,42 @@ pub fn wrapper_dir(db: &Path) -> Option<PathBuf> {
     Some(db.parent()?.join(WRAPPER_DIR))
 }
 
+/// The directory of the `misag` shim for the database at `db`.
+pub fn cli_dir(db: &Path) -> Option<PathBuf> {
+    Some(db.parent()?.join(CLI_DIR))
+}
+
+/// The `misag` shim: runs `exe`, the misag that runs the tab, so `misag flow` in a
+/// tab (by the person or by Claude) works on that app's database whichever misag,
+/// if any, is installed on PATH.
+fn cli_script(exe: &Path) -> String {
+    let exe = shell_quote(&exe.to_string_lossy());
+    format!(
+        r#"#!/bin/sh
+# Written by misag at every start; changes are lost. misag's tabs have this
+# directory on PATH, so `misag` there is the misag that runs them.
+exec {exe} "$@"
+"#
+    )
+}
+
+/// Writes `text` as the executable `name` in `dir`, renamed into place, so a tab
+/// running it meanwhile never runs half a script. `what` names it in errors.
+fn install_script(dir: &Path, what: &str, name: &str, text: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let failed = |e: std::io::Error| format!("cannot write {what} in {}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(failed)?;
+    let partial = dir.join(format!(".{name}.partial"));
+    let written = std::fs::write(&partial, text)
+        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
+        .and_then(|()| std::fs::rename(&partial, dir.join(name)));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&partial);
+        return Err(failed(e));
+    }
+    Ok(())
+}
+
 /// The `claude` wrapper: takes its own directory off `PATH` and has `exe` start the
 /// real `claude` (see `LAUNCH_FLAG`), or runs `claude` unchanged with a warning if
 /// `exe` has gone (another misag build rewrote the shared wrapper, say). Inside a
@@ -231,23 +274,20 @@ exec {exe} {LAUNCH_FLAG} "$@"
 }
 
 /// Writes the `claude` wrapper (see `wrapper_script`) into `wrapper_dir(db)`,
-/// replacing any earlier one, so it always starts `claude` through this misag. Returns the
-/// directory.
+/// replacing any earlier one, so it always runs this misag. Returns its directory.
 pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
-    use std::os::unix::fs::PermissionsExt;
     let dir = wrapper_dir(db).ok_or_else(|| format!("{} has no directory", db.display()))?;
-    let failed = |e: std::io::Error| format!("cannot write the claude wrapper in {}: {e}", dir.display());
     let text = dir.to_str().ok_or_else(|| format!("{} is not valid UTF-8", dir.display()))?;
-    std::fs::create_dir_all(&dir).map_err(failed)?;
-    // Renamed into place, so a tab starting `claude` meanwhile never runs half a script.
-    let partial = dir.join(".claude.partial");
-    let written = std::fs::write(&partial, wrapper_script(text, exe))
-        .and_then(|()| std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755)))
-        .and_then(|()| std::fs::rename(&partial, dir.join("claude")));
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&partial);
-        return Err(failed(e));
-    }
+    install_script(&dir, "the claude wrapper", "claude", &wrapper_script(text, exe))?;
+    Ok(dir)
+}
+
+/// Writes the `misag` shim (see `cli_script`) into `cli_dir(db)`, replacing any
+/// earlier one, so it always runs this misag. Returns its directory. Installed apart
+/// from the wrapper, so neither failing keeps the other from tabs.
+pub fn install_cli(db: &Path, exe: &Path) -> Result<PathBuf, String> {
+    let dir = cli_dir(db).ok_or_else(|| format!("{} has no directory", db.display()))?;
+    install_script(&dir, "the misag shim", "misag", &cli_script(exe))?;
     Ok(dir)
 }
 
@@ -627,6 +667,28 @@ mod tests {
     }
 
     #[test]
+    fn the_misag_shim_runs_this_misag_and_stays_on_claude_s_path() {
+        let base = crate::test_support::temp_dir("wrapper-cli");
+        let exe = base.join("my apps/misag");
+        stand_in(&exe, "misag");
+        let db = base.join("data/misag.db");
+        let wrapper = install_wrapper(&db, &exe).unwrap();
+        let cli = install_cli(&db, &exe).unwrap();
+        assert_eq!(cli, cli_dir(&db).unwrap());
+        let out = std::process::Command::new(cli.join("misag")).args(["flow", "it's"]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8(out.stdout).unwrap().lines().take(3).collect::<Vec<_>>(), ["misag", "flow", "it's"]);
+        // The claude wrapper takes only itself off PATH, so Claude finds this misag.
+        let real = base.join("real");
+        stand_in(&real.join("claude"), "claude");
+        let path = format!("{}:{}:{}:/usr/bin:/bin", wrapper.display(), cli.display(), real.display());
+        let out = std::process::Command::new("claude").env("PATH", &path).env_remove("CLAUDECODE").output().unwrap();
+        let lines: Vec<String> = String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect();
+        assert_eq!(lines.last().unwrap(), &format!("PATH={}:{}:/usr/bin:/bin", cli.display(), real.display()));
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn without_a_real_claude_the_wrapper_fails_instead_of_calling_itself() {
         let base = crate::test_support::temp_dir("wrapper-missing");
         let wrapper = install_wrapper(&base.join("data/misag.db"), Path::new(EXE)).unwrap();
@@ -670,6 +732,21 @@ mod tests {
         let err = install_wrapper(&base.join("misag.db"), Path::new(EXE)).unwrap_err();
         assert!(err.contains("cannot write the claude wrapper"), "{err}");
         assert!(!dir.join(".claude.partial").exists());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_shim_that_cannot_be_written_says_so_and_leaves_the_wrapper_alone() {
+        if crate::test_support::running_as_root() {
+            return;
+        }
+        let base = crate::test_support::temp_dir("cli-blocked");
+        let db = base.join("misag.db");
+        // A file where the shim's directory goes.
+        fs::write(cli_dir(&db).unwrap(), "").unwrap();
+        let err = install_cli(&db, Path::new(EXE)).unwrap_err();
+        assert!(err.starts_with("cannot write the misag shim in"), "{err}");
+        assert!(install_wrapper(&db, Path::new(EXE)).is_ok());
         fs::remove_dir_all(&base).unwrap();
     }
 

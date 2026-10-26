@@ -10,7 +10,7 @@ import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
 // wterm needs WASM and real layout, so the tests drive a stand-in that
 // records writes and exposes the callbacks main.ts assigns.
 const fakes = vi.hoisted(() => {
-  type Used = "cols" | "rows" | "element" | "onData" | "onBinary" | "onTitle" | "onResize" | "write" | "fit" | "focus" | "destroy" | "setRenderingPaused";
+  type Used = "cols" | "rows" | "element" | "onData" | "onBinary" | "onTitle" | "onResize" | "write" | "fit" | "focus" | "destroy" | "setRenderingPaused" | "bridge";
   class FakeTerminal implements Pick<WTerm, Used> {
     static all: FakeTerminal[] = [];
     /** Makes the next terminal's init() fail, as a broken view would. */
@@ -19,6 +19,11 @@ const fakes = vi.hoisted(() => {
     static hold = false;
     cols = 80;
     rows = 24;
+    /** Whether the program in it asked for bracketed paste. */
+    bracketed = false;
+    /** The mouse tracking mode the program in it asked for (0: none). */
+    tracking = 0;
+    bridge = { bracketedPaste: () => this.bracketed, mouseTracking: () => this.tracking } as unknown as WTerm["bridge"];
     written: string[] = [];
     destroyed = false;
     paused: boolean;
@@ -65,7 +70,11 @@ const fakes = vi.hoisted(() => {
       if (data === "\x1bc") this.written = [];
       else this.written.push(typeof data === "string" ? data : new TextDecoder().decode(data));
     }
-    fit() {}
+    /** fit() calls, which measure the font again. */
+    fits = 0;
+    fit() {
+      this.fits++;
+    }
     focus() {
       if (this.loaded) this.focused++;
     }
@@ -169,6 +178,7 @@ let storeReport: {
   store: { state: "saving" } | { state: "recovered"; notice: string } | { state: "notSaving"; reason: string };
   hookProblem: { at: number; message: string; log: string } | null;
   wrapperProblem?: string | null;
+  cliProblem?: string | null;
 };
 let reported: Set<string>;
 let missingDirs: Set<string>;
@@ -182,7 +192,7 @@ let fsHidden: Record<string, number>;
 let fsTree: Record<string, { name: string; dir: boolean }[]>;
 /** settings_load waits for this, so a test can hold the load back. */
 let settingsLoadGate: Promise<void>;
-const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
+const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: 14 };
 type Flow = { id: number; name: string; archived: boolean };
 /** The stored flows in order, archived ones included; the flow commands change it like the backend. */
 let storedFlows: Flow[];
@@ -197,13 +207,19 @@ let storedGraphs: Record<number, Graph>;
 let flowProblems: string[];
 type Run = {
   id: number; flowId: number; flowName: string; tabId: string; stepId: string; step: string;
-  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number;
+  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number; resumable: boolean;
 };
 /** What flow_runs reports. */
 let activeRuns: Run[];
 /** The prompt flow_start and flow_continue return; a string makes them fail with it. */
 let runPrompt: string | null;
 let runRefusal: string | null;
+/** What primary_selection reports: the text selected anywhere on the desktop, if any. */
+let primarySelection: string | null;
+/** Makes flow_import_file and flow_export_file fail with it. */
+let importRefusal: string | null;
+/** Whether the person picks a file in the import or export dialog (which the backend opens). */
+let flowPicked: boolean;
 type Past = { id: string; title: string; cwd: string; modified: number; pinned?: boolean };
 /** What claude_history lists: the sessions of every folder, newest first. */
 let pastSessions: Past[];
@@ -315,10 +331,22 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
       return flowProblems;
     case "flow_start":
     case "flow_continue":
+    case "flow_resume":
       if (runRefusal) throw { code: "failed", message: runRefusal };
       return runPrompt;
     case "flow_runs":
       return activeRuns;
+    case "flow_import_file": {
+      if (importRefusal) throw { code: "failed", message: importRefusal };
+      if (!flowPicked) return null;
+      const flow = { id: Math.max(0, ...storedFlows.map((f) => f.id)) + 1, name: "Imported", archived: false };
+      storedFlows.push(flow);
+      return flow;
+    }
+    case "flow_export_file":
+      find(args.id);
+      if (importRefusal) throw { code: "failed", message: importRefusal };
+      return flowPicked;
     case "flow_stop":
       activeRuns = activeRuns.filter((r) => r.id !== args.runId);
       return null;
@@ -375,6 +403,9 @@ beforeEach(() => {
   picker.fails = false;
   picker.calls = [];
   picker.answer = false;
+  importRefusal = null;
+  flowPicked = true;
+  primarySelection = null;
   picker.asked = [];
   fsGates = {};
   fsHidden = {};
@@ -445,6 +476,7 @@ beforeEach(() => {
       return storedSettings;
     }
     if (cmd.startsWith("flow")) return flowCommand(cmd, (args ?? {}) as Record<string, unknown>);
+    if (cmd === "primary_selection") return primarySelection;
     if (cmd === "claude_open_sessions") {
       const ids = (args as { tabs: { id: number }[] }).tabs.map((t) => t.id);
       return claudeCheckGate.then(() => Object.fromEntries(
@@ -955,6 +987,69 @@ describe("input", () => {
     expect(callsOf("pty_resize")[0].args).toMatchObject({ id: 1, cols: 100, rows: 30 });
   });
 
+  describe("middle-click paste", () => {
+    const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+    /** Middle-clicks the first terminal; returns whether the press and the release were left to WebKit. */
+    async function middleClick(shiftKey = false) {
+      const el = terms()[0].element;
+      const down = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 1, shiftKey });
+      const up = new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 1, shiftKey });
+      el.dispatchEvent(down);
+      el.dispatchEvent(up);
+      for (let i = 0; i < 6; i++) await flush();
+      return [down.defaultPrevented, up.defaultPrevented];
+    }
+
+    test("pastes the primary selection itself, as WebKitGTK 2.54 crashes doing it", async () => {
+      primarySelection = "ls -la";
+      await boot();
+      await clickClaude();
+      expect(await middleClick()).toEqual([true, true]);
+      expect(callsOf("primary_selection")).toHaveLength(1);
+      expect(typed()).toEqual(["ls -la"]);
+    });
+
+    test("pastes in brackets when the program asked for them, without escapes that end them", async () => {
+      primarySelection = "a\x1b[201~b";
+      await boot();
+      await clickClaude();
+      terms()[0].bracketed = true;
+      await middleClick();
+      expect(typed()).toEqual(["\x1b[200~a[201~b\x1b[201~"]);
+    });
+
+    test("an empty or unreadable primary selection types nothing", async () => {
+      primarySelection = null;
+      await boot();
+      await clickClaude();
+      await middleClick();
+      failing.add("primary_selection");
+      await middleClick();
+      expect(typed()).toEqual([]);
+    });
+
+    test("a program that tracks the mouse gets the click, and Shift pastes anyway", async () => {
+      primarySelection = "ls";
+      await boot();
+      await clickClaude();
+      terms()[0].tracking = 1000;
+      // WebKit's own paste stays off either way.
+      expect(await middleClick()).toEqual([true, true]);
+      expect(callsOf("primary_selection")).toHaveLength(0);
+      await middleClick(true);
+      expect(typed()).toEqual(["ls"]);
+    });
+
+    test("other buttons are left alone", async () => {
+      await boot();
+      await clickClaude();
+      const down = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
+      terms()[0].element.dispatchEvent(down);
+      expect(down.defaultPrevented).toBe(false);
+      expect(callsOf("primary_selection")).toHaveLength(0);
+    });
+  });
+
   /** Clicks a link in the first terminal, as `detail` 1 (a mouse click) or 0 (the keyboard), and returns the event. */
   async function clickLink(init: MouseEventInit) {
     const link = document.createElement("a");
@@ -1418,6 +1513,51 @@ describe("settings", () => {
     expect(storedSettings).toEqual({ ...DEFAULTS, skipPermissions: true, disableAutoMemory: true });
     await change("skipPermissions", false);
     expect(storedSettings).toEqual({ ...DEFAULTS, disableAutoMemory: true });
+  });
+
+  test("the terminal font size is applied at start, shown on the page, and saved and applied when changed", async () => {
+    const field = () => setting("fontSize");
+    const applied = () => document.documentElement.style.getPropertyValue("--terminal-font-size");
+    async function size(value: string) {
+      field().value = value;
+      field().dispatchEvent(new Event("change", { bubbles: true }));
+      for (let i = 0; i < 3; i++) await flush();
+    }
+    storedSettings = { ...DEFAULTS, fontSize: 16 };
+    await boot();
+    expect(applied()).toBe("16px");
+    await clickTerminal();
+    await openSettings();
+    expect(field().value).toBe("16");
+    const term = fakes.FakeTerminal.all[0];
+    await size("20");
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ ...DEFAULTS, fontSize: 20 });
+    expect(applied()).toBe("20px");
+    // The terminal measures its cells again once it is shown.
+    const before = term.fits;
+    tabs()[0].click();
+    await vi.advanceTimersByTimeAsync(20);
+    expect(term.fits).toBeGreaterThan(before);
+  });
+
+  test("a font size out of range is not saved, and says why", async () => {
+    await boot();
+    await openSettings();
+    const field = setting("fontSize");
+    field.value = "40";
+    field.dispatchEvent(new Event("change", { bubbles: true }));
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("settings_save")).toHaveLength(0);
+    expect(pageError().textContent).toContain("8 to 32");
+    expect(field.value).toBe("14");
+    expect(document.documentElement.style.getPropertyValue("--terminal-font-size")).toBe("14px");
+  });
+
+  test("a missing font size shows as 14", async () => {
+    storedSettings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
+    await boot();
+    await openSettings();
+    expect(setting("fontSize").value).toBe("14");
   });
 
   test("a missing auto memory value shows as Auto", async () => {
@@ -2338,6 +2478,12 @@ describe("edge cases", () => {
     );
   });
 
+  test("a misag shim that could not be installed is reported", async () => {
+    storeReport.cliProblem = "cannot write the misag shim in /d/cli: Read-only file system";
+    await boot();
+    expect(noticeText()).toContain("misag flow is not available in tabs: cannot write the misag shim in /d/cli");
+  });
+
   test("restores the layout fixture the Rust tests also parse", async () => {
     savedLayout = JSON.parse(sharedLayout);
     await boot();
@@ -2389,6 +2535,78 @@ describe("flows", () => {
     await settle();
   }
   const flows = (...names: string[]) => names.map((name, i) => ({ id: i + 1, name, archived: false }));
+
+  test("Import adds a flow from the file picked and opens it", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    page().querySelector<HTMLButtonElement>("button.import")!.click();
+    await settle();
+    // The backend asks for the file, so the page never names one.
+    expect(callsOf("flow_import_file").map((c) => c.args)).toEqual([{}]);
+    expect(listedNames("flow-list")).toEqual(["Deploy", "Imported"]);
+    expect(boxRows()).toEqual(["Deploy", "Imported"]);
+    expect(tabNames()).toEqual(["Flows", "Imported"]);
+  });
+
+  test("a cancelled import does nothing, and a refused one says why", async () => {
+    flowPicked = false;
+    await boot();
+    await openFlows();
+    page().querySelector<HTMLButtonElement>("button.import")!.click();
+    await settle();
+    expect(tabNames()).toEqual(["Flows"]);
+    expect(pageError().hidden).toBe(true);
+    flowPicked = true;
+    importRefusal = "not a flow file: it has no \"misagFlow\": 1";
+    page().querySelector<HTMLButtonElement>("button.import")!.click();
+    await settle();
+    expect(pageError().textContent).toContain("not a flow file");
+    expect(listedNames("flow-list")).toEqual([]);
+  });
+
+  test("Export saves a flow where the person picks, or says why it could not", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    await click("Deploy", "export");
+    expect(callsOf("flow_export_file").map((c) => c.args)).toEqual([{ id: 1 }]);
+    expect(pageError().hidden).toBe(true);
+    importRefusal = "cannot write /x/deploy.json: Permission denied";
+    await click("Deploy", "export");
+    expect(pageError().textContent).toBe('Could not export "Deploy": cannot write /x/deploy.json: Permission denied');
+  });
+
+  test("an archived flow can be exported too", async () => {
+    storedFlows = flows("Old");
+    storedFlows[0].archived = true;
+    await boot();
+    await openFlows();
+    await click("Old", "export");
+    expect(callsOf("flow_export_file").map((c) => c.args)).toEqual([{ id: 1 }]);
+  });
+
+  test("a flow list that cannot be read on a poll leaves the flows working", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFlows();
+    failing.add("flows_list");
+    await vi.advanceTimersByTimeAsync(2_000);
+    await settle();
+    failing.delete("flows_list");
+    await create("Review");
+    expect(listedNames("flow-list")).toEqual(["Deploy", "Review"]);
+  });
+
+  test("a flow added outside the app, as by misag flow import, shows up", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openClaudeTabs(1);
+    storedFlows.push({ id: 2, name: "From Claude", archived: false });
+    await vi.advanceTimersByTimeAsync(2_000);
+    await settle();
+    expect(boxRows()).toEqual(["Deploy", "From Claude"]);
+  });
 
   test("the toolbox lists the flows that are not archived, in order", async () => {
     storedFlows = flows("Deploy", "Old", "Review");
@@ -3050,7 +3268,7 @@ describe("flow runs", () => {
   const step = (id: string, kind: Step["kind"], title: string, outputs: string[]): Step => ({ id, kind, title, text: "x", outputs, x: 0, y: 0 });
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, ...over,
+    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, resumable: false, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -3131,6 +3349,42 @@ describe("flow runs", () => {
     await poll();
     expect(running()).toEqual([]);
     expect(tabs().map((t) => t.classList.contains("needs-you"))).toEqual([false, false]);
+  });
+
+  test("a run that needs attention is marked in the flow list, and Continue has Claude go on with its step", async () => {
+    runPrompt = "Go on with the flow step.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Check the form", outputs: ["ok"] })];
+    await poll();
+    // A manual step is picked in its editor; there is nothing for Claude to go on with.
+    expect(flowRow("Deploy").querySelector("button.resume")).toBeNull();
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
+    await poll();
+    const row = flowRow("Deploy");
+    expect(row.classList.contains("attention")).toBe(true);
+    expect(row.querySelector(".needs-attention")).not.toBeNull();
+    expect(row.title).toContain("Claude asked for a person.");
+    row.querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(callsOf("flow_load")).toHaveLength(0);
+    expect(typed()).toEqual(["\x1b[200~Go on with the flow step.\x1b[201~", "\r"]);
+  });
+
+  test("Continue in the run bar has Claude go on with a step that needs attention", async () => {
+    runPrompt = "Go on.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
+    await poll();
+    await open("Deploy");
+    runBar().querySelector<HTMLButtonElement>("button.resume")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(typed()).toEqual(["\x1b[200~Go on.\x1b[201~", "\r"]);
   });
 
   test("■ stops the run", async () => {
@@ -3279,7 +3533,7 @@ describe("flow runs and Claude's state", () => {
   const runError = () => document.querySelector<HTMLElement>(".page.flow-editor.active .run-bar .run-error")!;
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "manual", note: null, outputs: ["ok"], steps: 1, ...over,
+    status: "manual", note: null, outputs: ["ok"], steps: 1, resumable: false, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -3318,6 +3572,26 @@ describe("flow runs and Claude's state", () => {
     await settle();
     expect(callsOf("flow_continue")).toHaveLength(1);
     expect(runError().hidden).toBe(true);
+  });
+
+  test("a prompt's Enter is held back if Claude left a terminal tab while it was pasted", async () => {
+    runPrompt = "Next.";
+    await boot();
+    await clickTerminal();
+    const tabId = spawns()[0].tabId;
+    openClaudes = { 1: SESSION };
+    activeRuns = [run({ tabId })];
+    await poll();
+    await open();
+    output().click();
+    await settle();
+    const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+    expect(typed()).toEqual(["\x1b[200~Next.\x1b[201~"]);
+    // Suspended or quit: the shell, not Claude, would run the pasted line.
+    openClaudes = {};
+    await vi.advanceTimersByTimeAsync(200);
+    await settle();
+    expect(typed()).toEqual(["\x1b[200~Next.\x1b[201~"]);
   });
 
   test("▶ checks a terminal tab's Claude right before starting", async () => {

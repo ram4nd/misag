@@ -6,8 +6,16 @@ use serde_json::{Map, Value};
 
 /// The Claude flag that runs tools without asking.
 pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+/// The terminals' font size in pixels: the default, and the range allowed (also a
+/// CHECK in the schema, see db.rs).
+pub const DEFAULT_FONT_SIZE: u32 = 14;
+const FONT_SIZES: std::ops::RangeInclusive<u32> = 8..=32;
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+fn default_font_size() -> u32 {
+    DEFAULT_FONT_SIZE
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     /// Start Claude tabs, and a `claude` started in a terminal tab, with
@@ -19,6 +27,15 @@ pub struct Settings {
     /// `autoMemoryEnabled: false`; when false, nothing is passed and the user's own
     /// Claude configuration decides.
     pub disable_auto_memory: bool,
+    /// The font size of every terminal, in pixels.
+    #[serde(default = "default_font_size")]
+    pub font_size: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings { skip_permissions: false, workspace: None, disable_auto_memory: false, font_size: DEFAULT_FONT_SIZE }
+    }
 }
 
 impl Settings {
@@ -34,6 +51,9 @@ impl Settings {
     /// means home. An unchanged one is not checked again: it may have gone since it
     /// was chosen, which must not block saving the other settings.
     pub fn validated(mut self, stored: &Settings) -> Result<Self, String> {
+        if !FONT_SIZES.contains(&self.font_size) {
+            return Err(format!("the font size must be {} to {}", FONT_SIZES.start(), FONT_SIZES.end()));
+        }
         self.workspace = self.workspace.map(|d| d.trim().to_owned()).filter(|d| !d.is_empty());
         if let Some(dir) = &self.workspace
             && self.workspace != stored.workspace
@@ -87,10 +107,22 @@ mod tests {
 
     #[test]
     fn the_frontend_sees_camel_case_fields() {
-        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: true };
-        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src", "disableAutoMemory": true });
+        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: true, font_size: 16 };
+        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src", "disableAutoMemory": true, "fontSize": 16 });
         assert_eq!(serde_json::to_value(&s).unwrap(), json);
         assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), s);
+    }
+
+    #[test]
+    fn the_font_size_defaults_to_14_and_stays_in_range() {
+        assert_eq!(Settings::default().font_size, 14);
+        let missing = serde_json::json!({ "skipPermissions": false, "workspace": null, "disableAutoMemory": false });
+        assert_eq!(serde_json::from_value::<Settings>(missing).unwrap().font_size, 14);
+        let with = |size| Settings { font_size: size, ..Settings::default() }.validated(&Settings::default());
+        assert_eq!(with(8).unwrap().font_size, 8);
+        assert_eq!(with(32).unwrap().font_size, 32);
+        assert_eq!(with(7).unwrap_err(), "the font size must be 8 to 32");
+        assert_eq!(with(33).unwrap_err(), "the font size must be 8 to 32");
     }
 
     #[test]

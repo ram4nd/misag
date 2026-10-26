@@ -1,7 +1,9 @@
 pub mod claude;
+pub mod cli;
 mod commands;
 pub mod db;
 pub mod files;
+pub mod flow_file;
 pub mod flows;
 pub mod history;
 pub mod runs;
@@ -104,24 +106,39 @@ fn open_store(dir: Result<PathBuf, String>, old_dir: Option<PathBuf>) -> db::Db 
 
 /// Where raterm, misag's old name, kept its data, given misag's app data directory:
 /// the same place under raterm's identifier.
+/// Where this build keeps its data in the app data directory `dir`: debug builds in
+/// a subdirectory, so even a dev build run without the dev config's identifier never
+/// touches an installed misag's.
+pub(crate) fn in_build(dir: PathBuf) -> PathBuf {
+    if cfg!(debug_assertions) { dir.join("dev") } else { dir }
+}
+
 fn raterm_data_dir(dir: &std::path::Path) -> Option<PathBuf> {
     let name = dir.file_name()?.to_str()?;
     let suffix = name.strip_prefix("io.github.ram4nd.misag")?;
     Some(dir.with_file_name(format!("com.tag1.raterm{suffix}")))
 }
 
-/// The `claude` wrapper for terminal tabs. Without it, `claude` in a terminal tab
-/// runs untracked, nothing worse; the UI says why (see `store_status`).
+/// The `claude` wrapper for terminal tabs and the `misag` shim for every tab.
+/// Without the wrapper, `claude` in a terminal tab runs untracked; without the shim,
+/// `misag` in a tab is whichever is on PATH, if any. Nothing worse: the UI says why
+/// (see `store_status`).
 fn install_wrapper(store: &db::Db, exe: &commands::AppExe) -> commands::Wrapper {
-    let installed = match (store.hook_path(), exe.path()) {
-        (None, _) => Err("Mischief of Agents is running without its database".to_string()),
-        (_, Err(e)) => Err(e.to_string()),
-        (Some(db), Ok(exe)) => claude::install_wrapper(db, exe),
+    let install = |what: &str, install: fn(&std::path::Path, &std::path::Path) -> Result<PathBuf, String>| {
+        let installed = match (store.hook_path(), exe.path()) {
+            (None, _) => Err("Mischief of Agents is running without its database".to_string()),
+            (_, Err(e)) => Err(e.to_string()),
+            (Some(db), Ok(exe)) => install(db, exe),
+        };
+        if let Err(e) = &installed {
+            eprintln!("misag: no {what}: {e}");
+        }
+        installed
     };
-    if let Err(e) = &installed {
-        eprintln!("misag: no claude wrapper for terminal tabs: {e}");
+    commands::Wrapper {
+        claude: install("claude wrapper for terminal tabs", claude::install_wrapper),
+        cli: install("misag shim for tabs", claude::install_cli),
     }
-    commands::Wrapper(installed)
 }
 
 pub fn run() {
@@ -151,11 +168,8 @@ pub fn run() {
         .manage(exe)
         .manage(history::Cache::default())
         .setup(|app| {
-            // Debug builds keep their data in a subdirectory, so even a dev build run
-            // without the dev config's identifier never touches an installed misag's.
             let dir = app.path().app_data_dir().map_err(|e| e.to_string());
             let old_dir = dir.as_deref().ok().and_then(raterm_data_dir);
-            let in_build = |d: PathBuf| if cfg!(debug_assertions) { d.join("dev") } else { d };
             let store = open_store(dir.map(in_build), old_dir.map(in_build));
             app.manage(install_wrapper(&store, &app.state::<commands::AppExe>()));
             app.manage(store);
@@ -187,8 +201,12 @@ pub fn run() {
             commands::flow_delete,
             commands::flow_load,
             commands::flow_save_graph,
+            commands::flow_import_file,
+            commands::primary_selection,
+            commands::flow_export_file,
             commands::flow_start,
             commands::flow_continue,
+            commands::flow_resume,
             commands::flow_stop,
             commands::flow_runs,
             commands::flow_stop_tab,

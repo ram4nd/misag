@@ -52,6 +52,8 @@ export interface FlowEditorOptions {
   errorText(err: unknown): string;
   /** The person picked `output` for the shown run's step; resolves to why it could not go on, or null. */
   onContinue(run: Run, output: string): Promise<string | null>;
+  /** Has Claude go on with the run's step that needs attention; resolves like `onContinue`. */
+  onResume(run: Run): Promise<string | null>;
 }
 
 export interface FlowEditor {
@@ -397,24 +399,34 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     note.hidden = !run.note;
     note.textContent = run.note ?? "";
     const shown = run;
+    /** Runs a button's action once: a second click would send the next step too. */
+    async function once(go: () => Promise<string | null>) {
+      for (const other of buttons) other.disabled = true;
+      showRunError(null);
+      try {
+        showRunError(await go());
+      } finally {
+        for (const other of buttons) other.disabled = false;
+      }
+    }
     const buttons = shown.outputs.map((output) => {
       const b = document.createElement("button");
       b.type = "button";
       b.className = "output";
       b.textContent = output;
       b.title = shown.status === "running" ? `Claude is still on this step; go on as "${output}" anyway` : `Go on as "${output}"`;
-      b.onclick = async () => {
-        // Once: a second click would send the next step too.
-        for (const other of buttons) other.disabled = true;
-        showRunError(null);
-        try {
-          showRunError(await opts.onContinue(shown, output));
-        } finally {
-          for (const other of buttons) other.disabled = false;
-        }
-      };
+      b.onclick = () => once(() => opts.onContinue(shown, output));
       return b;
     });
+    if (shown.resumable) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "resume";
+      b.textContent = "Continue";
+      b.title = "Have Claude go on with this step";
+      b.onclick = () => once(() => opts.onResume(shown));
+      buttons.unshift(b);
+    }
     $(".run-bar .actions").replaceChildren(...buttons);
   }
 

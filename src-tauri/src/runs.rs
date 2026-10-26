@@ -6,7 +6,8 @@
 //! Claude ended with and moves on, handing Claude the next prompt as hook context.
 //! A manual step, or a reply the runner cannot follow, waits for the person, who
 //! picks an output in the sidebar (and can do so for a running step too, if Claude
-//! was interrupted). An output with no next step ends the run.
+//! was interrupted) or, at a prompt step, has Claude go on with it. An output with
+//! no next step ends the run.
 //!
 //! Any turn that ends while a step runs counts as its reply, including one the
 //! person started by chatting with Claude.
@@ -56,6 +57,36 @@ pub struct Run {
     /// The current step's outputs, for the person to pick from.
     pub outputs: Vec<String>,
     pub steps: i64,
+    /// Whether Claude can be asked to go on with the step (see `resume`).
+    pub resumable: bool,
+}
+
+/// How Continue has Claude go on with a step that needs attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resume {
+    /// Claude still has the step in mind (it asked for a person, or its reply could
+    /// not be followed): remind it to go on and how to end.
+    Remind,
+    /// Claude no longer has the step in mind (the conversation was cleared): send
+    /// the step's prompt again.
+    Prompt,
+}
+
+impl Resume {
+    fn as_str(self) -> &'static str {
+        match self {
+            Resume::Remind => "remind",
+            Resume::Prompt => "prompt",
+        }
+    }
+
+    fn parse(s: Option<String>) -> Option<Self> {
+        match s.as_deref() {
+            Some("remind") => Some(Resume::Remind),
+            Some("prompt") => Some(Resume::Prompt),
+            _ => None,
+        }
+    }
 }
 
 /// Statuses in which a run holds its tab, as SQL. The `one_active_run_per_tab`
@@ -104,6 +135,7 @@ struct Stored {
     node_id: String,
     status: Status,
     steps: i64,
+    resume: Option<Resume>,
 }
 
 impl Stored {
@@ -117,25 +149,36 @@ impl Stored {
 fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, String> {
     let row = tx
         .query_row(
-            &format!("SELECT id, graph, node_id, status, steps FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
+            &format!("SELECT id, graph, node_id, status, steps, resume FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
             [key],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get(4)?)),
+            |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get(4)?, r.get(5)?))
+            },
         )
         .optional()
         .map_err(sql)?;
-    row.map(|(id, graph, node_id, status, steps)| {
-        Ok(Stored { id, graph: parse_graph(&graph)?, node_id, status: Status::parse(&status)?, steps })
+    row.map(|(id, graph, node_id, status, steps, resume)| {
+        Ok(Stored { id, graph: parse_graph(&graph)?, node_id, status: Status::parse(&status)?, steps, resume: Resume::parse(resume) })
     })
     .transpose()
 }
 
 fn set(tx: &Transaction, run: i64, node_id: &str, status: Status, steps: i64, note: Option<&str>) -> Result<(), String> {
     tx.execute(
-        "UPDATE flow_runs SET node_id = ?2, status = ?3, steps = ?4, note = ?5, updated_at = ?6 WHERE id = ?1",
+        "UPDATE flow_runs SET node_id = ?2, status = ?3, steps = ?4, note = ?5, resume = NULL, updated_at = ?6 WHERE id = ?1",
         params![run, node_id, status.as_str(), steps, note, now()],
     )
     .map(drop)
     .map_err(sql)
+}
+
+/// Makes the run wait at `node_id` for the person, saying why, and how Continue
+/// goes on from there (None: it cannot help, and the person picks an output).
+fn wait(tx: &Transaction, run: i64, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Result<Option<String>, String> {
+    set(tx, run, node_id, Status::Attention, steps, Some(why))?;
+    tx.execute("UPDATE flow_runs SET resume = ?2 WHERE id = ?1", params![run, resume.map(Resume::as_str)])
+        .map_err(sql)?;
+    Ok(None)
 }
 
 /// Records that the run left `node_id` by `output`.
@@ -173,7 +216,8 @@ fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
 /// the next step has already run its `max_runs`.
 fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by: By) -> Result<Option<String>, String> {
     let next = flows::next_step(&run.graph, &from.id, output);
-    let wait = |why: String| set(tx, run.id, &from.id, Status::Attention, steps, Some(&why)).map(|()| None);
+    // Going on with `from` would only redo it and stop here again.
+    let wait = |why: String| wait(tx, run.id, &from.id, steps, &why, None);
     if next.is_some_and(|n| n.kind == Kind::Prompt) && steps >= MAX_RUN_STEPS {
         return wait(format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on."));
     }
@@ -232,7 +276,7 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Opti
         }
         other => other.map_err(sql)?,
     };
-    let run = Stored { id: tx.last_insert_rowid(), graph, node_id: start.id.clone(), status: Status::Running, steps: 0 };
+    let run = Stored { id: tx.last_insert_rowid(), graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None };
     let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, By::Flow)?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
@@ -262,9 +306,11 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
         return Ok(None);
     }
     let node = run.node()?.clone();
-    let wait = |why: String| set(&tx, run.id, &node.id, Status::Attention, run.steps, Some(&why)).map(|()| None);
+    let wait = |why: String| wait(&tx, run.id, &node.id, run.steps, &why, Some(Resume::Remind));
     let Some(reply) = reply else {
-        let prompt = wait("Claude Code did not report Claude's reply to Mischief of Agents; update Claude Code to run flows.".into())?;
+        // Its next reply would not be reported either.
+        let why = "Claude Code did not report Claude's reply to Mischief of Agents; update Claude Code to run flows.";
+        let prompt = self::wait(&tx, run.id, &node.id, run.steps, why, None)?;
         tx.commit().map_err(sql)?;
         return Ok(prompt);
     };
@@ -297,11 +343,35 @@ pub fn proceed(conn: &mut Connection, run_id: i64, output: &str) -> Result<Optio
     Ok(prompt)
 }
 
+/// The person has seen to a prompt step that needs attention (answered Claude, or
+/// fixed what it asked for): the run goes back to running the step, and the
+/// returned text has Claude go on with it (see `Resume`). Refused where that cannot
+/// help, as at a step limit, where the person picks an output instead.
+pub fn resume(conn: &mut Connection, run_id: i64) -> Result<String, String> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+    let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
+    let node = run.node()?;
+    if run.status != Status::Attention || node.kind != Kind::Prompt {
+        return Err(format!("\"{}\" does not need attention; pick an output instead", node.name()));
+    }
+    let Some(how) = run.resume else {
+        return Err(format!("Claude going on with \"{}\" would not help; pick an output instead", node.name()));
+    };
+    set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
+    let prompt = match how {
+        Resume::Remind => flows::resume_text(node),
+        Resume::Prompt => flows::prompt_text(node),
+    };
+    tx.commit().map_err(sql)?;
+    Ok(prompt)
+}
+
 /// Makes the tab's running run wait for the person, saying why: Claude will not
-/// reply to its step (the conversation was cleared, or the hook failed).
+/// reply to its step (the conversation was cleared, or the hook failed), so
+/// Continue sends the step's prompt again.
 pub fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     conn.execute(
-        "UPDATE flow_runs SET status = 'attention', note = ?2, updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
+        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
         params![tab_id.as_str(), why, now()],
     )
     .map(drop)
@@ -330,7 +400,8 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
     for tab in tabs {
         if open_tabs.iter().any(|open| open.as_str() == tab) {
             tx.execute(
-                "UPDATE flow_runs SET status = 'attention', note = ?2, updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
+                // Claude comes back in its conversation, so it can be reminded.
+                "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'remind', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
                 params![tab, "Mischief of Agents was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.", now()],
             )
             .map_err(sql)?;
@@ -359,28 +430,35 @@ pub fn stop(conn: &Connection, run_id: i64) -> Result<(), String> {
 pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps
+            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume
              FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE r.status IN {ACTIVE} ORDER BY r.id"
         ))
         .map_err(sql)?;
-    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64);
+    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64, Option<String>);
     let rows = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)))
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?))
+        })
         .map_err(sql)?
         .collect::<Result<Vec<Row>, _>>()
         .map_err(sql)?;
     rows.into_iter()
-        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps)| {
+        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume)| {
             // A run that cannot be read is still listed, saying why, so it can be stopped.
             let node = parse_graph(&graph).and_then(|graph| {
                 let node = graph.nodes.into_iter().find(|n| n.id == step_id);
                 node.ok_or_else(|| format!("the run is at a missing step {step_id:?}"))
             });
-            let (step, outputs, note) = match node {
-                Ok(node) => (node.name().to_owned(), node.outputs, note),
-                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it."))),
+            let status = Status::parse(&status)?;
+            let (step, outputs, note, resumable) = match node {
+                Ok(node) => {
+                    // The same test as `resume`'s.
+                    let resumable = status == Status::Attention && node.kind == Kind::Prompt && Resume::parse(resume).is_some();
+                    (node.name().to_owned(), node.outputs, note, resumable)
+                }
+                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false),
             };
-            Ok(Run { id, flow_id, flow_name, tab_id, step, outputs, step_id, status: Status::parse(&status)?, note, steps })
+            Ok(Run { id, flow_id, flow_name, tab_id, step, outputs, step_id, status, note, steps, resumable })
         })
         .collect()
 }
@@ -641,6 +719,98 @@ mod tests {
         on_stop(&mut conn, &tab("t1"), Some("Hmm.")).unwrap();
         let run = only_run(&conn);
         assert_eq!(proceed(&mut conn, run.id, "fail").unwrap(), prompt_of(&g, "p"));
+    }
+
+    #[test]
+    fn a_step_that_needs_attention_can_be_resumed_by_asking_claude_to_go_on() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-resume", &g);
+        let t = tab("t1");
+        start(&mut conn, flow, &t).unwrap();
+        on_stop(&mut conn, &t, Some("Which database?\nFLOW: attention")).unwrap();
+        let run = only_run(&conn);
+        assert!(run.resumable);
+        let prompt = resume(&mut conn, run.id).unwrap();
+        assert!(prompt.contains("\"P\"") && prompt.contains("`FLOW: pass` or `FLOW: fail`"), "{prompt}");
+        let resumed = only_run(&conn);
+        assert!(!resumed.resumable);
+        assert_eq!((resumed.status, resumed.note, resumed.step_id.as_str(), resumed.steps), (Status::Running, None, "p", run.steps));
+        // Claude's reply moves it on as usual.
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: pass")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty());
+        // Only a prompt step that needs attention is resumed.
+        let (_db, mut conn, flow) = setup("runs-resume-manual", &manual_first());
+        start(&mut conn, flow, &t).unwrap();
+        let run = only_run(&conn);
+        assert!(!run.resumable);
+        assert!(resume(&mut conn, run.id).unwrap_err().contains("does not need attention"));
+        assert_eq!(only_run(&conn).status, Status::Manual);
+    }
+
+    #[test]
+    fn continue_is_offered_only_where_claude_going_on_can_help() {
+        let g = runnable();
+        let t = tab("t1");
+        // A reply without a FLOW line, or one naming no output: Claude is reminded.
+        for reply in ["Done.", "FLOW: maybe"] {
+            let (_db, mut conn, flow) = setup("runs-resume-reply", &g);
+            start(&mut conn, flow, &t).unwrap();
+            on_stop(&mut conn, &t, Some(reply)).unwrap();
+            let run = only_run(&conn);
+            assert!(run.resumable, "{reply:?}");
+            assert!(resume(&mut conn, run.id).unwrap().starts_with("Go on with the flow step"));
+        }
+        // The conversation was cleared: Claude gets the step's prompt again.
+        let (_db, mut conn, flow) = setup("runs-resume-cleared", &g);
+        start(&mut conn, flow, &t).unwrap();
+        pause_tab(&mut conn, &t, "The conversation was cleared.").unwrap();
+        let run = only_run(&conn);
+        assert!(run.resumable);
+        assert_eq!(Some(resume(&mut conn, run.id).unwrap()), prompt_of(&g, "p"));
+        // Claude Code that does not report replies would only wait again.
+        let (_db, mut conn, flow) = setup("runs-resume-unreported", &g);
+        start(&mut conn, flow, &t).unwrap();
+        on_stop(&mut conn, &t, None).unwrap();
+        assert!(!only_run(&conn).resumable);
+        // A step limit: going on would only redo the step and wait again.
+        let (_db, mut conn, flow) = setup("runs-resume-limit", &g);
+        start(&mut conn, flow, &t).unwrap();
+        for _ in 0..MAX_RUN_STEPS {
+            on_stop(&mut conn, &t, Some("FLOW: fail")).unwrap();
+        }
+        let run = only_run(&conn);
+        assert_eq!(run.status, Status::Attention);
+        assert!(!run.resumable);
+        assert!(resume(&mut conn, run.id).is_err());
+        assert_eq!(only_run(&conn), run);
+    }
+
+    #[test]
+    fn a_second_continue_is_refused_and_changes_nothing() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-resume-twice", &g);
+        let t = tab("t1");
+        start(&mut conn, flow, &t).unwrap();
+        on_stop(&mut conn, &t, Some("FLOW: attention")).unwrap();
+        let id = only_run(&conn).id;
+        resume(&mut conn, id).unwrap();
+        let running = only_run(&conn);
+        assert!(resume(&mut conn, id).unwrap_err().contains("does not need attention"));
+        assert_eq!(only_run(&conn), running);
+        stop(&conn, id).unwrap();
+        assert!(resume(&mut conn, id).unwrap_err().contains("no active run"));
+    }
+
+    #[test]
+    fn after_a_restart_claude_is_reminded_of_its_step() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-resume-restart", &g);
+        let t = tab("t1");
+        start(&mut conn, flow, &t).unwrap();
+        after_restart(&mut conn, std::slice::from_ref(&t)).unwrap();
+        let run = only_run(&conn);
+        assert!(run.resumable);
+        assert!(resume(&mut conn, run.id).unwrap().starts_with("Go on with the flow step"));
     }
 
     #[test]

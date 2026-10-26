@@ -113,6 +113,19 @@ impl Node {
     }
 }
 
+/// Characters that take no room on screen yet reach Claude: zero-width and bidi
+/// controls, tags, variation selectors and the like. A shared flow could hide
+/// instructions in them. The joiner and emoji presentation selectors that make emoji,
+/// which people do see, are allowed.
+pub fn hidden(c: char) -> bool {
+    matches!(c,
+        '\u{AD}' | '\u{34F}' | '\u{61C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}' | '\u{200C}' | '\u{200E}' | '\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0D}'
+        | '\u{FEFF}' | '\u{FFA0}' | '\u{FFF0}'..='\u{FFF8}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
 fn plain_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= MAX_ID && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
@@ -158,6 +171,13 @@ fn check_node(node: &Node) -> Result<(), String> {
     }
     if node.title.chars().count() > MAX_TITLE || node.text.chars().count() > MAX_TEXT {
         return Err(format!("\"{}\" has a title or text that is too long", node.name()));
+    }
+    if let Some(c) = node.title.chars().chain(node.text.chars()).find(|&c| hidden(c)) {
+        return Err(format!(
+            "\"{}\" has a hidden character (U+{:04X}) that Claude would read but the editor does not show",
+            node.name(),
+            c as u32
+        ));
     }
     if !node.x.is_finite() || !node.y.is_finite() {
         return Err(format!("\"{}\" has no valid position", node.name()));
@@ -241,16 +261,29 @@ pub fn parse_marker(reply: &str) -> Option<String> {
 /// What is sent to Claude for a prompt step: the step's text and how to end the
 /// reply so the runner knows which output.
 /// Control characters (other than newlines and tabs) are dropped: the prompt may be
-/// typed into a terminal, where they would act as keys or end the paste early.
+/// typed into a terminal, where they would act as keys or end the paste early. So
+/// are hidden ones, which `check` refuses, in case a flow stored before holds some.
 pub fn prompt_text(node: &Node) -> String {
-    let mut text = node.text.trim_end().to_owned();
+    typeable(format!("{}\n\n{}", node.text.trim_end(), reply_rule(node)))
+}
+
+/// What is sent to Claude to go on with a prompt step that needs attention, once
+/// the person has seen to it.
+pub fn resume_text(node: &Node) -> String {
+    typeable(format!("Go on with the flow step \"{}\". {}", node.name(), reply_rule(node)))
+}
+
+fn reply_rule(node: &Node) -> String {
     let outputs: Vec<String> = node.outputs.iter().map(|o| format!("`FLOW: {o}`")).collect();
-    text.push_str(&format!(
-        "\n\nWhen you have finished, end your reply with a last line that is exactly {}, whichever fits. \
+    format!(
+        "When you have finished, end your reply with a last line that is exactly {}, whichever fits. \
          If you need a person to decide or do something first, end it with `FLOW: {ATTENTION}` instead and say why.",
         outputs.join(" or ")
-    ));
-    text.retain(|c| !c.is_control() || c == '\n' || c == '\t');
+    )
+}
+
+fn typeable(mut text: String) -> String {
+    text.retain(|c| (!c.is_control() || c == '\n' || c == '\t') && !hidden(c));
     text
 }
 
@@ -554,6 +587,38 @@ pub(crate) mod tests {
         let mut odd = g.nodes[1].clone();
         odd.text = "a\u{1b}[201~b\tc\u{7}d\ne".into();
         assert!(prompt_text(&odd).starts_with("a[201~b\tcd\ne"));
+        // Characters Claude reads but no one sees, in a flow stored before they were refused.
+        odd.text = "a\u{200B}b\u{E0041}\u{202E}c \u{2764}\u{FE0F}".into();
+        assert!(prompt_text(&odd).starts_with("abc \u{2764}\u{FE0F}\n"));
+    }
+
+    #[test]
+    fn the_reminder_to_go_on_names_the_step_and_its_outputs_typeably() {
+        let mut g = runnable();
+        g.nodes[1].title = "Fix\u{1b}[201~\u{202E} it".into();
+        let text = resume_text(&g.nodes[1]);
+        assert!(text.starts_with("Go on with the flow step \"Fix[201~ it\". "), "{text}");
+        assert!(text.contains("`FLOW: pass` or `FLOW: fail`") && text.contains("`FLOW: attention`"), "{text}");
+    }
+
+    #[test]
+    fn hidden_characters_are_refused_but_emoji_are_kept() {
+        let mut g = runnable();
+        for hidden in ['\u{200B}', '\u{202E}', '\u{2066}', '\u{FEFF}', '\u{E0041}', '\u{E0100}', '\u{AD}'] {
+            g.nodes[1].text = format!("do p{hidden} and more");
+            let err = check(&g).unwrap_err();
+            assert_eq!(
+                err,
+                format!("\"P\" has a hidden character (U+{:04X}) that Claude would read but the editor does not show", hidden as u32)
+            );
+        }
+        g.nodes[1].text = "do p".into();
+        g.nodes[1].title = "P\u{200B}".into();
+        assert!(check(&g).unwrap_err().contains("U+200B"));
+        // Joiners and emoji presentation make emoji, which people do see.
+        g.nodes[1].title = "\u{1F469}\u{200D}\u{1F4BB} \u{2764}\u{FE0F}".into();
+        g.nodes[1].text = "\u{2705} done".into();
+        assert_eq!(check(&g), Ok(()));
     }
 
     #[test]

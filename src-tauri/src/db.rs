@@ -119,6 +119,14 @@ const MIGRATIONS: &[&str] = &[r#"
         session_id TEXT PRIMARY KEY,
         pinned_at  INTEGER NOT NULL
     );
+"#, r#"
+    -- The terminals' font size in pixels (see settings::FONT_SIZES).
+    ALTER TABLE settings ADD COLUMN font_size INTEGER NOT NULL DEFAULT 14
+        CHECK (font_size BETWEEN 8 AND 32);
+"#, r#"
+    -- How Continue goes on with a run that needs attention (see runs::Resume);
+    -- NULL when it cannot help, and the person picks an output.
+    ALTER TABLE flow_runs ADD COLUMN resume TEXT CHECK (resume IN ('remind', 'prompt'));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -189,10 +197,11 @@ pub fn connect(path: &Path) -> Result<Connection, OpenError> {
 }
 
 /// Opens an existing database without creating or migrating it, and only if its
-/// schema is exactly the one this binary knows. Used by the hook, which may be a
-/// different misag version than the running app. Across an upgrade that adds a
-/// migration, a new hook therefore refuses the old schema (and logs it) until the
-/// app has migrated: session changes in that window are not recorded.
+/// schema is exactly the one this binary knows. Used by the hook and by `misag
+/// flow`, either of which may be a different misag version than the running app.
+/// Across an upgrade that adds a migration, a new hook therefore refuses the old
+/// schema (and logs it) until the app has migrated: session changes in that window
+/// are not recorded.
 pub fn connect_existing(path: &Path) -> Result<Connection, String> {
     let known = MIGRATIONS.len() as i64;
     connect_if_current(path)?.ok_or_else(|| {
@@ -284,6 +293,15 @@ fn database_files(path: &Path) -> [PathBuf; 3] {
 impl Db {
     pub fn open(path: PathBuf) -> Result<Self, OpenError> {
         Self::open_with_notice(path, None)
+    }
+
+    /// Opens an existing database the way the hook does (see `connect_existing`):
+    /// never created or migrated, and only at this binary's schema. For other
+    /// processes than the app, such as `misag flow`, which may be another misag
+    /// version than the running app.
+    pub fn open_existing(path: PathBuf) -> Result<Self, String> {
+        let conn = connect_existing(&path)?;
+        Ok(Self::with(Backing::File { path, recovered_notice: None }, conn))
     }
 
     fn open_with_notice(path: PathBuf, recovered_notice: Option<String>) -> Result<Self, OpenError> {
@@ -494,8 +512,8 @@ impl Db {
         let changed = self
             .conn()
             .execute(
-                "UPDATE settings SET skip_permissions = ?1, workspace = ?2, disable_auto_memory = ?3 WHERE id = 1",
-                params![settings.skip_permissions, settings.workspace, settings.disable_auto_memory],
+                "UPDATE settings SET skip_permissions = ?1, workspace = ?2, disable_auto_memory = ?3, font_size = ?4 WHERE id = 1",
+                params![settings.skip_permissions, settings.workspace, settings.disable_auto_memory, settings.font_size],
             )
             .map_err(sql)?;
         if changed != 1 {
@@ -634,11 +652,15 @@ pub struct FlowSummary {
     pub archived: bool,
 }
 
-/// A flow's name as stored: trimmed, and not empty.
+/// A flow's name as stored: trimmed, not empty, and plain text, as it is printed in
+/// terminals (`misag flow list`) and read by Claude.
 fn flow_name(name: &str) -> Result<&str, String> {
     match name.trim() {
         "" => Err("a flow needs a name".into()),
-        name => Ok(name),
+        name => match name.chars().find(|&c| c.is_control() || flows::hidden(c)) {
+            Some(c) => Err(format!("a flow name cannot hold control or hidden characters (U+{:04X})", c as u32)),
+            None => Ok(name),
+        },
     }
 }
 
@@ -670,8 +692,19 @@ impl Db {
 
     /// Adds a flow after the others, with only its Start step.
     pub fn create_flow(&self, name: &str) -> Result<FlowSummary, String> {
+        self.add_flow(name, &Graph::default())
+    }
+
+    /// Adds a flow after the others with these steps, if they pass `flows::check`
+    /// (see `flow_file` for where they come from).
+    pub fn import_flow(&self, name: &str, graph: &Graph) -> Result<FlowSummary, String> {
+        flows::check(graph)?;
+        self.add_flow(name, &flows::stored(graph.clone()))
+    }
+
+    fn add_flow(&self, name: &str, graph: &Graph) -> Result<FlowSummary, String> {
         let name = flow_name(name)?;
-        let graph = graph_json(&Graph::default())?;
+        let graph = graph_json(graph)?;
         let conn = self.conn();
         let now = now_secs();
         conn.execute(
@@ -792,6 +825,10 @@ impl Db {
 
     pub fn proceed_run(&self, run_id: i64, output: &str) -> Result<Option<String>, String> {
         runs::proceed(&mut self.conn(), run_id, output)
+    }
+
+    pub fn resume_run(&self, run_id: i64) -> Result<String, String> {
+        runs::resume(&mut self.conn(), run_id)
     }
 
     pub fn stop_run(&self, run_id: i64) -> Result<(), String> {
@@ -917,8 +954,8 @@ pub struct SessionReport<'a> {
 
 /// The settings stored in `conn`; see `Db::load_settings`.
 pub fn load_settings(conn: &Connection) -> Result<Settings, String> {
-    conn.query_row("SELECT skip_permissions, workspace, disable_auto_memory FROM settings WHERE id = 1", [], |r| {
-        Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)? })
+    conn.query_row("SELECT skip_permissions, workspace, disable_auto_memory, font_size FROM settings WHERE id = 1", [], |r| {
+        Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)?, font_size: r.get(3)? })
     })
     .map_err(sql)
 }
@@ -1116,7 +1153,7 @@ pub(crate) mod tests {
         conn.execute("UPDATE settings SET skip_permissions = 1, workspace = '~/src'", []).unwrap();
         drop(conn);
         let db = Db::open(path).unwrap();
-        let upgraded = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: false };
+        let upgraded = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: false, ..Settings::default() };
         assert_eq!(db.load_settings().unwrap(), upgraded);
         let saved = db.save_settings(Settings { disable_auto_memory: true, ..upgraded }).unwrap();
         assert!(saved.disable_auto_memory);
@@ -1149,7 +1186,7 @@ pub(crate) mod tests {
         let path = temp_db("settings");
         let db = Db::open(path.clone()).unwrap();
         assert_eq!(db.load_settings().unwrap(), Settings::default());
-        let all = Settings { skip_permissions: true, workspace: Some("~".into()), disable_auto_memory: true };
+        let all = Settings { skip_permissions: true, workspace: Some("~".into()), disable_auto_memory: true, font_size: 18 };
         let saved = db.save_settings(all.clone()).unwrap();
         assert_eq!(saved, all, "returned as stored");
         drop(db);
@@ -1193,6 +1230,8 @@ pub(crate) mod tests {
         let conn = connect_existing(&path).unwrap();
         assert!(conn.execute("UPDATE settings SET skip_permissions = 2", []).is_err());
         assert!(conn.execute("UPDATE settings SET disable_auto_memory = 2", []).is_err());
+        assert!(conn.execute("UPDATE settings SET font_size = 7", []).is_err());
+        assert!(conn.execute("UPDATE settings SET font_size = 33", []).is_err());
         assert!(conn.execute("INSERT INTO settings (id) VALUES (2)", []).is_err(), "one row only");
         assert_eq!(db.load_settings().unwrap(), Settings::default());
     }
@@ -1557,6 +1596,36 @@ pub(crate) mod tests {
         assert!(err.contains("schema 99"), "{err}");
     }
 
+    #[test]
+    fn an_imported_flow_is_added_after_the_others_with_its_steps() {
+        let db = Db::open(temp_db("import-flow")).unwrap();
+        db.create_flow("First").unwrap();
+        let graph = crate::flows::tests::runnable();
+        let flow = db.import_flow("  Second ", &graph).unwrap();
+        assert_eq!((flow.name.as_str(), flow.archived), ("Second", false));
+        assert_eq!(flow_names(&db), names(&["First", "Second"]));
+        assert_eq!(db.load_flow(flow.id).unwrap().1, graph);
+    }
+
+    #[test]
+    fn a_flow_that_cannot_be_stored_is_not_imported() {
+        let db = Db::open(temp_db("import-bad-flow")).unwrap();
+        let mut graph = crate::flows::tests::runnable();
+        graph.nodes[1].kind = crate::flows::Kind::Start;
+        graph.nodes[1].outputs = vec!["next".into()];
+        assert_eq!(db.import_flow("Two starts", &graph).unwrap_err(), "a flow has exactly one Start step");
+        assert_eq!(db.import_flow(" ", &crate::flows::tests::runnable()).unwrap_err(), "a flow needs a name");
+        // A name is printed in terminals (misag flow list) and shown to Claude.
+        for (name, code) in [("red\u{1b}[31m", "001B"), ("a\u{200B}b", "200B"), ("x\u{202E}y", "202E")] {
+            assert_eq!(
+                db.import_flow(name, &crate::flows::tests::runnable()).unwrap_err(),
+                format!("a flow name cannot hold control or hidden characters (U+{code})")
+            );
+            assert!(db.create_flow(name).is_err());
+        }
+        assert!(db.list_flows().unwrap().is_empty());
+    }
+
     fn flow_names(db: &Db) -> Vec<(String, bool)> {
         db.list_flows().unwrap().into_iter().map(|f| (f.name, f.archived)).collect()
     }
@@ -1730,6 +1799,20 @@ pub(crate) mod tests {
         let left: i64 = runs.query_row("SELECT COUNT(*) FROM flow_runs", [], |r| r.get(0)).unwrap();
         let events: i64 = runs.query_row("SELECT COUNT(*) FROM flow_run_events", [], |r| r.get(0)).unwrap();
         assert_eq!((left, events), (1, 1), "only the busy flow's run and its first step remain");
+    }
+
+    #[test]
+    fn upgrading_keeps_the_settings_and_adds_the_font_size() {
+        let path = temp_db("upgrade-font-size");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.len() - 1;
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        conn.execute("UPDATE settings SET skip_permissions = 1", []).unwrap();
+        drop(conn);
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.load_settings().unwrap(), Settings { skip_permissions: true, ..Settings::default() });
+        assert_eq!(db.save_settings(Settings { font_size: 20, ..Settings::default() }).unwrap().font_size, 20);
     }
 
     #[test]

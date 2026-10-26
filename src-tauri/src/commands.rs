@@ -126,13 +126,37 @@ pub struct HookTarget<'a> {
     pub db: &'a Path,
 }
 
-/// The `claude` wrapper terminal tabs find first on their PATH: its directory, or
-/// why it could not be written at startup (see `claude::install_wrapper`).
-pub struct Wrapper(pub Result<PathBuf, String>);
+/// What tabs find first on their PATH, installed at startup: the `claude` wrapper
+/// of terminal tabs (see `claude::install_wrapper`) and the `misag` shim (see
+/// `claude::install_cli`). Each is its directory, or why it could not be written.
+pub struct Wrapper {
+    pub claude: Result<PathBuf, String>,
+    pub cli: Result<PathBuf, String>,
+}
 
-impl Wrapper {
-    pub fn dir(&self) -> Option<&Path> {
-        self.0.as_deref().ok()
+/// What a tab's PATH is made from (see `tab_path`).
+#[derive(Default)]
+pub struct TabDirs<'a> {
+    /// The `claude` wrapper's directory, for terminal tabs.
+    pub wrapper: Option<&'a Path>,
+    /// The `misag` shim's directory.
+    pub cli: Option<&'a Path>,
+    /// misag's own PATH.
+    pub path: Option<std::ffi::OsString>,
+    /// The wrapper and shim directories of a misag, or a raterm, misag was started from.
+    pub inherited: Vec<std::ffi::OsString>,
+}
+
+impl<'a> TabDirs<'a> {
+    /// `wrapper`'s directories, with misag's own environment.
+    pub fn of(wrapper: &'a Wrapper) -> Self {
+        let inherited = [claude::WRAPPER_ENV, claude::RATERM_WRAPPER_ENV, claude::CLI_ENV];
+        TabDirs {
+            wrapper: wrapper.claude.as_deref().ok(),
+            cli: wrapper.cli.as_deref().ok(),
+            path: std::env::var_os("PATH"),
+            inherited: inherited.into_iter().filter_map(std::env::var_os).collect(),
+        }
     }
 }
 
@@ -252,20 +276,20 @@ pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
     }
 }
 
-/// The PATH for a tab: misag's own `path` without `inherited` (the wrapper
-/// directories of a misag, or a raterm, this one was started from, whose hook
-/// would report to that app's database) and with `wrapper` first. None when that is `path`
-/// unchanged, or when `path` is not UTF-8, which is then left alone rather than
-/// mangled (the wrapper is not used).
-pub fn tab_path(path: Option<&OsStr>, inherited: &[&OsStr], wrapper: Option<&Path>) -> Option<String> {
+/// The PATH for a tab: misag's own `path` without `inherited` (the wrapper and
+/// shim directories of a misag, or a raterm, this one was started from, whose hook
+/// would report to that app's database) and with `first` first, in order. None when
+/// that is `path` unchanged, or when `path` is not UTF-8, which is then left alone
+/// rather than mangled (the wrapper and shim are not used).
+pub fn tab_path(path: Option<&OsStr>, inherited: &[&OsStr], first: &[&Path]) -> Option<String> {
     let path = path.unwrap_or_default().to_str()?;
-    let wrapper = wrapper.and_then(Path::to_str);
+    let first: Vec<&str> = first.iter().filter_map(|d| d.to_str()).collect();
     let skip = |dir: &str| {
         let dir = Path::new(dir);
-        inherited.iter().any(|d| Path::new(d) == dir) || wrapper.is_some_and(|w| Path::new(w) == dir)
+        inherited.iter().any(|d| Path::new(d) == dir) || first.iter().any(|f| Path::new(f) == dir)
     };
     let kept = path.split(':').filter(|dir| !path.is_empty() && !skip(dir));
-    let joined: Vec<&str> = wrapper.into_iter().chain(kept).collect();
+    let joined: Vec<&str> = first.iter().copied().chain(kept).collect();
     let joined = joined.join(":");
     (joined != path).then_some(joined)
 }
@@ -288,20 +312,27 @@ pub struct SpawnPlan {
     pub resume: Option<Resume>,
 }
 
-/// Plans `tab`'s start. `wrapper` is the installed `claude` wrapper's directory,
-/// put first on a terminal tab's PATH when its Claude can report somewhere.
-pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, wrapper: Option<&Path>) -> Result<SpawnPlan, CommandError> {
+/// Plans `tab`'s start, with its PATH made from `dirs`: when the tab's Claude can
+/// report somewhere, a terminal tab finds the `claude` wrapper first, and every tab
+/// then finds the `misag` shim.
+pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, dirs: &TabDirs) -> Result<SpawnPlan, CommandError> {
     let plan = launch_plan(tab, exe, db)?;
     let tracked = matches!(plan, LaunchPlan::Claude { hook: Some(_), .. });
     let skips_permissions = matches!(&plan, LaunchPlan::Claude { settings, .. } if settings.skip_permissions);
-    let wrapper = wrapper.filter(|_| matches!(plan, LaunchPlan::Terminal { hook: Some(_), .. }));
+    let reports = matches!(plan, LaunchPlan::Terminal { hook: Some(_), .. } | LaunchPlan::Claude { hook: Some(_), .. });
+    let cli = dirs.cli.filter(|_| reports);
+    let wrapper = dirs.wrapper.filter(|_| matches!(plan, LaunchPlan::Terminal { hook: Some(_), .. }));
+    let first: Vec<&Path> = wrapper.into_iter().chain(cli).collect();
     let (launch, mut env) = launch_for(&plan);
-    let inherited: Vec<_> = [claude::WRAPPER_ENV, claude::RATERM_WRAPPER_ENV].into_iter().filter_map(std::env::var_os).collect();
-    let inherited: Vec<&OsStr> = inherited.iter().map(|d| d.as_os_str()).collect();
-    if let Some(path) = tab_path(std::env::var_os("PATH").as_deref(), &inherited, wrapper) {
-        // Only claimed once it is really on PATH, so a misag started here knows what to drop.
-        if let Some(dir) = wrapper.and_then(Path::to_str).filter(|dir| path.starts_with(dir)) {
-            env.push((claude::WRAPPER_ENV.to_string(), dir.to_owned()));
+    let inherited: Vec<&OsStr> = dirs.inherited.iter().map(|d| d.as_os_str()).collect();
+    if let Some(path) = tab_path(dirs.path.as_deref(), &inherited, &first) {
+        // Only claimed once they are really on PATH, so a misag started here knows what to drop.
+        let on_path = |dir: Option<&Path>| dir.and_then(Path::to_str).filter(|d| path.split(':').any(|p| p == *d)).map(str::to_owned);
+        if let Some(dir) = on_path(wrapper) {
+            env.push((claude::WRAPPER_ENV.to_string(), dir));
+        }
+        if let Some(dir) = on_path(cli) {
+            env.push((claude::CLI_ENV.to_string(), dir));
         }
         env.push(("PATH".to_string(), path));
     }
@@ -341,7 +372,7 @@ pub fn pty_spawn(
     on_data: Channel<Response>,
     on_exit: Channel<i32>,
 ) -> Result<Spawned, CommandError> {
-    let plan = plan_spawn(&request, &exe, &db, wrapper.dir())?;
+    let plan = plan_spawn(&request, &exe, &db, &TabDirs::of(&wrapper))?;
     let started_at = crate::db::unix_secs(SystemTime::now());
     let id = state.spawn(
         plan.request,
@@ -518,6 +549,81 @@ pub fn flow_load(db: State<'_, Db>, id: i64) -> Result<FlowDetail, CommandError>
     Ok(FlowDetail { flow, graph, problems })
 }
 
+/// The primary selection's text (what is selected anywhere on the desktop), for a
+/// middle-click paste in a terminal; None if there is none. WebKitGTK 2.54 crashes
+/// the app pasting it itself, so the page asks for it here: through GTK, on the main
+/// thread, where GTK's clipboard lives.
+#[tauri::command(async)]
+pub fn primary_selection(app: tauri::AppHandle) -> Result<Option<String>, CommandError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        gtk::Clipboard::get(&gtk::gdk::SELECTION_PRIMARY).request_text(move |_, text| {
+            let _ = tx.send(text.map(str::to_owned));
+        });
+    })
+    .map_err(|e| format!("cannot reach the main thread: {e}"))?;
+    // The selection's owner may be another app that never answers.
+    Ok(rx.recv_timeout(std::time::Duration::from_secs(2)).map_err(|_| "the primary selection did not arrive".to_string())?)
+}
+
+const FLOW_FILES: (&str, &[&str]) = ("Flow", &["json"]);
+
+/// A file name for a flow called `name`: without the characters some file systems
+/// refuse or read as folders, nor trailing dots and spaces.
+pub fn export_file_name(name: &str) -> String {
+    let safe: String = name.chars().map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { '-' } else { c }).collect();
+    let safe = safe.trim_end_matches(['.', ' ']).trim_start_matches('.');
+    format!("{}.json", if safe.is_empty() { "flow" } else { safe })
+}
+
+/// Adds the flow in the file at `path` (see `flow_file`) after the others.
+pub fn import_from(db: &Db, path: &Path) -> Result<FlowSummary, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let (name, graph) = crate::flow_file::parse(&text)?;
+    db.import_flow(&name, &graph)
+}
+
+/// Writes flow `id` to `path` as a file `import_from` and `misag flow import` read.
+pub fn export_to(db: &Db, id: i64, path: &Path) -> Result<(), String> {
+    let (flow, graph) = db.load_flow(id)?;
+    let file = crate::flow_file::write(&flow.name, &graph) + "\n";
+    std::fs::write(path, file).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+fn picked(path: Option<tauri_plugin_dialog::FilePath>) -> Result<Option<PathBuf>, String> {
+    path.map(|p| p.into_path().map_err(|e| format!("the file picked cannot be used: {e}"))).transpose()
+}
+
+/// Asks the person for a flow file and adds it; None if they cancel. The dialog is
+/// opened here, so the webview never names a file to read.
+#[tauri::command(async)]
+pub fn flow_import_file(window: tauri::Window, db: State<'_, Db>) -> Result<Option<FlowSummary>, CommandError> {
+    use tauri_plugin_dialog::DialogExt;
+    let (filter, extensions) = FLOW_FILES;
+    let path = window.dialog().file().set_parent(&window).set_title("Import a flow").add_filter(filter, extensions).blocking_pick_file();
+    let Some(path) = picked(path)? else { return Ok(None) };
+    Ok(Some(import_from(&db, &path)?))
+}
+
+/// Asks the person where to save flow `id`, and saves it there; false if they cancel.
+#[tauri::command(async)]
+pub fn flow_export_file(window: tauri::Window, db: State<'_, Db>, id: i64) -> Result<bool, CommandError> {
+    use tauri_plugin_dialog::DialogExt;
+    let (flow, _) = db.load_flow(id)?;
+    let (filter, extensions) = FLOW_FILES;
+    let path = window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title(format!("Export {}", flow.name))
+        .set_file_name(export_file_name(&flow.name))
+        .add_filter(filter, extensions)
+        .blocking_save_file();
+    let Some(path) = picked(path)? else { return Ok(false) };
+    export_to(&db, id, &path)?;
+    Ok(true)
+}
+
 /// Stores a flow's steps and returns what keeps them from running.
 #[tauri::command(async)]
 pub fn flow_save_graph(db: State<'_, Db>, id: i64, graph: Graph) -> Result<Vec<String>, CommandError> {
@@ -533,6 +639,12 @@ pub fn flow_start(db: State<'_, Db>, flow_id: i64, tab_id: TabId) -> Result<Opti
 #[tauri::command(async)]
 pub fn flow_continue(db: State<'_, Db>, run_id: i64, output: String) -> Result<Option<String>, CommandError> {
     Ok(db.proceed_run(run_id, &output)?)
+}
+
+/// Has Claude go on with the run's step that needs attention; returns the text to send.
+#[tauri::command(async)]
+pub fn flow_resume(db: State<'_, Db>, run_id: i64) -> Result<String, CommandError> {
+    Ok(db.resume_run(run_id)?)
 }
 
 #[tauri::command(async)]
@@ -609,13 +721,20 @@ pub struct StoreReport {
     hook_problem: Option<HookProblem>,
     /// Why the `claude` wrapper could not be installed at startup, if it could not.
     wrapper_problem: Option<String>,
+    /// Why the `misag` shim could not be installed at startup, if it could not.
+    cli_problem: Option<String>,
 }
 
 #[tauri::command(async)]
 pub fn store_status(db: State<'_, Db>, wrapper: State<'_, Wrapper>) -> StoreReport {
     // Without a database there is nothing to report to anyway, which `store` says.
-    let wrapper_problem = wrapper.0.as_ref().err().filter(|_| db.hook_path().is_some()).cloned();
-    StoreReport { store: db.status(), hook_problem: claude::hook_problem(&db), wrapper_problem }
+    let problem = |installed: &Result<PathBuf, String>| installed.as_ref().err().filter(|_| db.hook_path().is_some()).cloned();
+    StoreReport {
+        store: db.status(),
+        hook_problem: claude::hook_problem(&db),
+        wrapper_problem: problem(&wrapper.claude),
+        cli_problem: problem(&wrapper.cli),
+    }
 }
 
 /// Whether a Claude tab's session hook has reported since the tab started
@@ -689,32 +808,67 @@ mod tests {
         let path = temp_db("terminal-hook");
         let db = Db::open(path.clone()).unwrap();
         let (request, exe) = (terminal_tab(), exe());
-        let wrapper = claude::wrapper_dir(&path).unwrap();
-        let plan = plan_spawn(&request, &exe, &db, Some(&wrapper)).unwrap();
+        let (wrapper, cli) = (claude::wrapper_dir(&path).unwrap(), claude::cli_dir(&path).unwrap());
+        let dirs = TabDirs { wrapper: Some(&wrapper), cli: Some(&cli), path: Some("/usr/bin".into()), ..Default::default() };
+        let plan = plan_spawn(&request, &exe, &db, &dirs).unwrap();
         assert_eq!(plan.request.launch, Launch::LoginShell);
         let env: HashMap<_, _> = plan.request.env.into_iter().collect();
         assert_eq!(env["MISAG_TAB"], "tab-1");
         assert_eq!(env["MISAG_DB"], path.to_str().unwrap());
         assert_eq!(env["MISAG_WRAPPER"], wrapper.to_str().unwrap());
-        assert!(env["PATH"].starts_with(&format!("{}:", wrapper.display())), "{}", env["PATH"]);
+        // Then `misag` itself, for Claude and the person (see claude::install_cli).
+        assert_eq!(env["MISAG_CLI"], cli.to_str().unwrap());
+        assert!(env["PATH"].starts_with(&format!("{}:{}:", wrapper.display(), cli.display())), "{}", env["PATH"]);
 
         // Without an installed wrapper the hook environment is still set, but PATH is not changed for it.
-        let plan = plan_spawn(&request, &exe, &db, None).unwrap();
+        let plan = plan_spawn(&request, &exe, &db, &TabDirs::default()).unwrap();
         let env: HashMap<_, _> = plan.request.env.into_iter().collect();
         assert!(env.contains_key("MISAG_TAB") && !env.contains_key("MISAG_WRAPPER"));
+        // Without the wrapper, `misag` is still found.
+        let plan = plan_spawn(&request, &exe, &db, &TabDirs { wrapper: None, ..dirs }).unwrap();
+        let env: HashMap<_, _> = plan.request.env.into_iter().collect();
+        assert_eq!(env["PATH"], format!("{}:/usr/bin", cli.display()));
+        assert!(!env.contains_key("MISAG_WRAPPER"));
+        let dirs = TabDirs { wrapper: Some(&wrapper), cli: Some(&cli), path: Some("/usr/bin".into()), ..Default::default() };
         let memory = Db::open_or_recover(Err("no data dir".into()));
-        let plan = plan_spawn(&request, &exe, &memory, Some(&wrapper)).unwrap();
+        let plan = plan_spawn(&request, &exe, &memory, &dirs).unwrap();
         assert!(!plan.request.env.iter().any(|(k, _)| k.starts_with("MISAG")), "nothing to report to");
+    }
+
+    #[test]
+    fn claude_tabs_find_this_misag_first_on_their_path() {
+        let path = temp_db("claude-cli");
+        let db = Db::open(path.clone()).unwrap();
+        let (wrapper, cli) = (claude::wrapper_dir(&path).unwrap(), claude::cli_dir(&path).unwrap());
+        // Started from another misag's tab, whose shim is on PATH: it goes.
+        let dirs = TabDirs {
+            wrapper: Some(&wrapper),
+            cli: Some(&cli),
+            path: Some("/o/cli:/usr/bin".into()),
+            inherited: vec!["/o/cli".into()],
+        };
+        let plan = plan_spawn(&claude_tab(), &exe(), &db, &dirs).unwrap();
+        let env: HashMap<_, _> = plan.request.env.into_iter().collect();
+        assert_eq!(env["MISAG_CLI"], cli.to_str().unwrap());
+        assert!(!env.contains_key("MISAG_WRAPPER"), "Claude tabs start claude themselves");
+        assert_eq!(env["PATH"], format!("{}:/usr/bin", cli.display()));
+    }
+
+    #[test]
+    fn tab_paths_put_the_given_directories_first_in_order() {
+        let first = [Path::new("/d/bin"), Path::new("/d/cli")];
+        assert_eq!(tab_path(Some(std::ffi::OsStr::new("/d/cli:/usr/bin")), &[], &first).as_deref(), Some("/d/bin:/d/cli:/usr/bin"));
+        assert_eq!(tab_path(Some(std::ffi::OsStr::new("/d/bin:/d/cli:/usr/bin")), &[], &first), None, "already first");
     }
 
     #[test]
     fn tab_paths_put_the_wrapper_first_and_drop_an_outer_misag_wrapper() {
         let os = |s: &str| std::ffi::OsString::from(s);
         let w = Some(Path::new("/d/bin"));
-        let path = |p: &str, inherited: Option<&str>, wrapper| {
+        let path = |p: &str, inherited: Option<&str>, wrapper: Option<&Path>| {
             let inherited: Vec<_> = inherited.map(os).into_iter().collect();
             let inherited: Vec<&std::ffi::OsStr> = inherited.iter().map(|d| d.as_os_str()).collect();
-            tab_path(Some(os(p).as_os_str()), &inherited, wrapper)
+            tab_path(Some(os(p).as_os_str()), &inherited, wrapper.as_slice())
         };
         assert_eq!(path("/usr/bin:/bin", None, w).as_deref(), Some("/d/bin:/usr/bin:/bin"));
         assert_eq!(path("/usr/bin", None, None), None, "unchanged");
@@ -724,15 +878,36 @@ mod tests {
         // Started from a raterm tab inside a misag tab: both wrappers go.
         let both = [os("/o/bin"), os("/r/bin")];
         let both: Vec<&std::ffi::OsStr> = both.iter().map(|d| d.as_os_str()).collect();
-        assert_eq!(tab_path(Some(os("/r/bin:/o/bin:/usr/bin").as_os_str()), &both, w).as_deref(), Some("/d/bin:/usr/bin"));
+        assert_eq!(tab_path(Some(os("/r/bin:/o/bin:/usr/bin").as_os_str()), &both, w.as_slice()).as_deref(), Some("/d/bin:/usr/bin"));
         // Not listed twice, and empty entries (the current directory) are kept.
         assert_eq!(path("/d/bin:/usr/bin::", None, w), None, "already first");
         assert_eq!(path("/usr/bin:/d/bin", None, w).as_deref(), Some("/d/bin:/usr/bin"));
         assert_eq!(path("", None, w).as_deref(), Some("/d/bin"));
-        assert_eq!(tab_path(None, &[], w).as_deref(), Some("/d/bin"));
+        assert_eq!(tab_path(None, &[], w.as_slice()).as_deref(), Some("/d/bin"));
         // A PATH that is not UTF-8 is left alone rather than mangled.
         use std::os::unix::ffi::OsStrExt;
-        assert_eq!(tab_path(Some(std::ffi::OsStr::from_bytes(b"/\xff:/bin")), &[], w), None);
+        assert_eq!(tab_path(Some(std::ffi::OsStr::from_bytes(b"/\xff:/bin")), &[], w.as_slice()), None);
+    }
+
+    #[test]
+    fn a_flow_file_name_is_one_any_file_system_takes() {
+        assert_eq!(export_file_name("Deploy: v2"), "Deploy- v2.json");
+        assert_eq!(export_file_name("a/b\\c\u{1b}d"), "a-b-c-d.json");
+        assert_eq!(export_file_name("Fix it. "), "Fix it.json");
+        assert_eq!(export_file_name(".."), "flow.json");
+    }
+
+    #[test]
+    fn a_flow_exported_to_a_file_imports_as_the_same_flow() {
+        let db = Db::open(temp_db("export-file")).unwrap();
+        let flow = db.import_flow("Deploy", &crate::flows::tests::runnable()).unwrap();
+        let file = temp_db("export-file").with_file_name("deploy.json");
+        export_to(&db, flow.id, &file).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().ends_with("}\n"));
+        let again = import_from(&db, &file).unwrap();
+        assert_eq!((again.name.as_str(), db.load_flow(again.id).unwrap().1), ("Deploy", db.load_flow(flow.id).unwrap().1));
+        let missing = file.with_file_name("missing.json");
+        assert!(import_from(&db, &missing).unwrap_err().starts_with("cannot read "), "says which file");
     }
 
     #[test]
@@ -740,7 +915,7 @@ mod tests {
         let path = temp_db("terminal-resume");
         let db = Db::open(path.clone()).unwrap();
         let shell = tab(RunningKind::Terminal { command: None, claude_session: Some(session()) });
-        let resume = |t: &TabLaunch| plan_spawn(t, &exe(), &db, None).unwrap().resume;
+        let resume = |t: &TabLaunch| plan_spawn(t, &exe(), &db, &TabDirs::default()).unwrap().resume;
         assert_eq!(resume(&shell), Some(Resume::NoConversation));
 
         let transcript = path.with_extension("jsonl");
@@ -749,7 +924,7 @@ mod tests {
             .unwrap();
         assert_eq!(resume(&shell), Some(Resume::Session(session())));
         assert_eq!(resume_input(&session()), format!("claude --resume {ID}\r"));
-        let plan = plan_spawn(&shell, &exe(), &db, None).unwrap();
+        let plan = plan_spawn(&shell, &exe(), &db, &TabDirs::default()).unwrap();
         assert_eq!(plan.request.launch, Launch::LoginShell);
         assert!(!plan.tracked, "the hook watch is for Claude tabs");
 
@@ -775,7 +950,7 @@ mod tests {
             .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let resume = plan_spawn(&shell, &exe(), &db, None).unwrap().resume;
+        let resume = plan_spawn(&shell, &exe(), &db, &TabDirs::default()).unwrap().resume;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(resume, Some(Resume::Unknown(m)) if m.contains("cannot check")));
     }
@@ -879,7 +1054,7 @@ mod tests {
         let db = Db::open(temp_db("plan-args")).unwrap();
         let request = claude_tab();
         let exe = exe();
-        assert!(!plan_spawn(&request, &exe, &db, None).unwrap().skips_permissions);
+        assert!(!plan_spawn(&request, &exe, &db, &TabDirs::default()).unwrap().skips_permissions);
 
         db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap();
         let plan = launch_plan(&request, &exe, &db).unwrap();
@@ -887,8 +1062,8 @@ mod tests {
         let mut expected = vec!["--dangerously-skip-permissions".to_string()];
         expected.extend(claude::args(&session(), false, db.hook_path().map(|_| Path::new(EXE)), Default::default()));
         assert_eq!(args, expected);
-        assert!(plan_spawn(&request, &exe, &db, None).unwrap().skips_permissions);
-        assert!(!plan_spawn(&terminal_tab(), &exe, &db, None).unwrap().skips_permissions, "only Claude tabs");
+        assert!(plan_spawn(&request, &exe, &db, &TabDirs::default()).unwrap().skips_permissions);
+        assert!(!plan_spawn(&terminal_tab(), &exe, &db, &TabDirs::default()).unwrap().skips_permissions, "only Claude tabs");
     }
 
     #[test]
@@ -960,13 +1135,13 @@ mod tests {
         let gone = Some("/definitely/not/here".to_string());
         // Without the fallback the directory is kept, and starting there fails visibly.
         let strict = TabLaunch { cwd: gone.clone(), ..terminal_tab() };
-        let plan = plan_spawn(&strict, &exe(), &db, None).unwrap();
+        let plan = plan_spawn(&strict, &exe(), &db, &TabDirs::default()).unwrap();
         assert_eq!((plan.request.cwd.as_deref(), plan.fell_back_to_home), (gone.as_deref(), false));
         let err: CommandError = Sessions::default().spawn(plan.request, |_| true, |_| {}).unwrap_err().into();
         assert_eq!(err.code, ErrorCode::CwdMissing);
 
         let lenient = TabLaunch { cwd: gone, fallback_to_home: true, ..terminal_tab() };
-        let plan = plan_spawn(&lenient, &exe(), &db, None).unwrap();
+        let plan = plan_spawn(&lenient, &exe(), &db, &TabDirs::default()).unwrap();
         assert!(plan.fell_back_to_home);
         assert_eq!(plan.request.cwd, None);
         assert!(!plan.tracked, "terminal tabs are not tracked");
@@ -975,9 +1150,9 @@ mod tests {
     #[test]
     fn claude_spawn_plans_are_tracked_only_with_a_database() {
         let db = Db::open(temp_db("spawn-tracked")).unwrap();
-        assert!(plan_spawn(&claude_tab(), &exe(), &db, None).unwrap().tracked);
+        assert!(plan_spawn(&claude_tab(), &exe(), &db, &TabDirs::default()).unwrap().tracked);
         let memory = Db::open_or_recover(Err("no data dir".into()));
-        let plan = plan_spawn(&claude_tab(), &exe(), &memory, None).unwrap();
+        let plan = plan_spawn(&claude_tab(), &exe(), &memory, &TabDirs::default()).unwrap();
         assert!(!plan.tracked);
         assert!(plan.request.env.is_empty());
     }
@@ -1023,11 +1198,13 @@ mod tests {
             store: StoreStatus::NotSaving { reason: "x".into() },
             hook_problem: Some(HookProblem { at: 7, message: "y".into(), log: "/d/hook.log".into() }),
             wrapper_problem: Some("read-only".into()),
+            cli_problem: Some("full".into()),
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["store"]["state"], "notSaving");
         assert_eq!(json["store"]["reason"], "x");
         assert_eq!(json["hookProblem"], serde_json::json!({ "at": 7, "message": "y", "log": "/d/hook.log" }));
         assert_eq!(json["wrapperProblem"], "read-only");
+        assert_eq!(json["cliProblem"], "full");
     }
 }
