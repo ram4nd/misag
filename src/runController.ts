@@ -138,7 +138,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   async function confirmed(flow: Flow): Promise<boolean> {
     if (!flow.unconfirmed) return true;
     const sure = await ask(
-      `"${flow.name}" was added from a tab with misag flow import, possibly by Claude. Its steps are sent to Claude as they are, so open it and read them before running it. Run it now?`,
+      `"${flow.name}" was added from a tab with misag flow import, possibly by Claude, or its Start has text an older misag did not show. Its steps and Start's base info are sent to Claude as they are, so open it and read them before running it. Run it now?`,
       { title: "Run a flow added from a tab", kind: "warning", okLabel: "Run it", cancelLabel: "Not now" },
     );
     if (!sure) return false;

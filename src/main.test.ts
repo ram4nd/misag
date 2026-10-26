@@ -3265,8 +3265,17 @@ describe("flow editor", () => {
     text.dispatchEvent(new Event("input", { bubbles: true }));
     await afterSave();
     expect(saved()!.nodes.find((n) => n.id === "start")).toMatchObject({ text: "The app is in src/." });
+    expect((field("text") as HTMLTextAreaElement).maxLength).toBe(4000);
+    // The canvas shows that Start sends something, so reading the flow does not miss it.
+    expect(node("Start").querySelector(".info")!.textContent).toBe("info");
     await select("P");
     expect(panel().querySelector(".text-label")!.textContent).toBe("Prompt");
+    expect((field("text") as HTMLTextAreaElement).maxLength).toBe(20000);
+    await select("Start");
+    text.value = "  ";
+    text.dispatchEvent(new Event("input", { bubbles: true }));
+    await afterSave();
+    expect(node("Start").querySelector(".info")).toBeNull();
   });
 
   test("▶ saves a change to the flow first, so a just-ticked /clear counts", async () => {
@@ -3586,6 +3595,7 @@ describe("flow runs", () => {
     await openClaudeTabs(1);
     await play("Deploy");
     expect(picker.asked).toEqual([expect.stringContaining("added from a tab")]);
+    expect(picker.asked[0]).toContain("Start's base info");
     expect(callsOf("flow_confirm")).toHaveLength(0);
     expect(callsOf("flow_start")).toHaveLength(0);
     picker.answer = true;

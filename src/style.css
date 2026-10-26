@@ -319,7 +319,8 @@ svg.lucide { display: block; flex: none; }
 }
 .flow-editor .drawflow .drawflow-node.selected { border-color: var(--accent); background: var(--surface); box-shadow: 0 0 0 2px var(--accent); }
 .flow-editor .drawflow .drawflow-node .limit,
-.flow-editor .drawflow .drawflow-node .clears { float: right; color: var(--fg); text-transform: none; letter-spacing: 0; }
+.flow-editor .drawflow .drawflow-node .clears,
+.flow-editor .drawflow .drawflow-node .info { float: right; margin-left: 6px; color: var(--fg); text-transform: none; letter-spacing: 0; }
 .flow-editor .drawflow .drawflow-node .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .flow-editor .drawflow .drawflow-node .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-editor .drawflow .drawflow-node.start { border-left: 4px solid #1e8e3e; }

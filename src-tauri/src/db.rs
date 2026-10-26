@@ -147,6 +147,18 @@ const MIGRATIONS: &[&str] = &[r#"
     -- 1 for a flow a program in a tab added (`misag flow import` with MISAG_TAB set),
     -- until the person confirms it in the app; runs::start refuses it until then.
     ALTER TABLE flows ADD COLUMN unconfirmed INTEGER NOT NULL DEFAULT 0 CHECK (unconfirmed IN (0, 1));
+"#, r#"
+    -- 0 while Claude lacks Start's base info: from a run's start, and after each
+    -- /clear in its tab, until a prompt carries it (see runs::go). Runs started
+    -- before base info sent none, and owe none.
+    ALTER TABLE flow_runs ADD COLUMN briefed INTEGER NOT NULL DEFAULT 1 CHECK (briefed IN (0, 1));
+    -- Start's text was neither shown nor sent before base info, so a flow holding
+    -- some may send Claude what no one has read: it asks before its next run.
+    UPDATE flows SET unconfirmed = 1
+    WHERE json_valid(graph) AND COALESCE(json_extract(graph, '$.version'), 1) < 4 AND EXISTS (
+        SELECT 1 FROM json_each(graph, '$.nodes')
+        WHERE json_extract(value, '$.kind') = 'start' AND trim(COALESCE(json_extract(value, '$.text'), '')) <> ''
+    );
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -1966,6 +1978,37 @@ pub(crate) mod tests {
         assert_eq!(schema_version(&connect(&path).unwrap()).unwrap(), MIGRATIONS.len() as i64);
         assert_eq!(flow_names(&db), names(&["Deploy"]));
         assert!(crate::runs::active(&connect_existing(&path).unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrading_asks_before_running_a_flow_whose_hidden_start_text_now_goes_to_claude() {
+        let path = temp_db("upgrade-base-info");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.len() - 1;
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        let start = |text: &str, version: u32| {
+            format!(r#"{{"version": {version}, "nodes": [{{"id": "start", "kind": "start", "text": "{text}", "outputs": ["next"], "x": 0, "y": 0}}], "edges": []}}"#)
+        };
+        for (name, graph) in [("hidden", start("Do more.", 3)), ("blank", start(" ", 3)), ("none", r#"{"nodes":[],"edges":[]}"#.into())] {
+            conn.execute(
+                "INSERT INTO flows (name, position, graph, created_at, updated_at) VALUES (?1, 0, ?2, 0, 0)",
+                params![name, graph],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at) VALUES (1, 't1', '{}', 'p', 'running', 0, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(path.clone()).unwrap();
+        let unconfirmed: Vec<_> = db.list_flows().unwrap().into_iter().map(|f| (f.name, f.unconfirmed)).collect();
+        assert_eq!(unconfirmed, [("hidden".to_string(), true), ("blank".to_string(), false), ("none".to_string(), false)]);
+        // A run started before had sent no base info, and owes none.
+        let briefed: bool = connect_existing(&path).unwrap().query_row("SELECT briefed FROM flow_runs", [], |r| r.get(0)).unwrap();
+        assert!(briefed);
     }
 
     #[test]

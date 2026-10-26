@@ -198,6 +198,8 @@ struct Stored {
     steps: i64,
     resume: Option<Resume>,
     clear: Option<Clear>,
+    /// Whether Claude has Start's base info: false from the start and after a clear.
+    briefed: bool,
 }
 
 impl Stored {
@@ -220,7 +222,7 @@ impl Stored {
 fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, String> {
     let row = tx
         .query_row(
-            &format!("SELECT id, graph, node_id, status, steps, resume, clear FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
+            &format!("SELECT id, graph, node_id, status, steps, resume, clear, briefed FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
             [key],
             |r| {
                 Ok((
@@ -231,12 +233,13 @@ fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Resu
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             },
         )
         .optional()
         .map_err(sql)?;
-    row.map(|(id, graph, node_id, status, steps, resume, clear)| {
+    row.map(|(id, graph, node_id, status, steps, resume, clear, briefed)| {
         Ok(Stored {
             id,
             graph: parse_graph(&graph)?,
@@ -245,6 +248,7 @@ fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Resu
             steps,
             resume: Resume::parse(resume)?,
             clear: Clear::parse(clear)?,
+            briefed,
         })
     })
     .transpose()
@@ -296,17 +300,14 @@ fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
     Ok(earlier + i64::from(run.node_id == step))
 }
 
-/// Whether the run has left a prompt step, so Claude has had Start's base info.
-fn sent_a_prompt(tx: &Transaction, run: &Stored) -> Result<bool, String> {
-    let mut stmt = tx.prepare_cached("SELECT DISTINCT node_id FROM flow_run_events WHERE run_id = ?1").map_err(sql)?;
-    let ids = stmt.query_map([run.id], |r| r.get::<_, String>(0)).map_err(sql)?;
-    for id in ids {
-        let id = id.map_err(sql)?;
-        if run.graph.nodes.iter().any(|n| n.id == id && n.kind == Kind::Prompt) {
-            return Ok(true);
-        }
+/// The prompt of `node` for the run, led by Start's base info if Claude lacks it,
+/// which it then has.
+fn prompt_for(tx: &Transaction, run: &Stored, node: &Node) -> Result<String, String> {
+    if run.briefed {
+        return Ok(flows::prompt_text(node));
     }
-    Ok(false)
+    tx.execute("UPDATE flow_runs SET briefed = 1 WHERE id = ?1", [run.id]).map_err(sql)?;
+    Ok(flows::first_prompt_text(&run.graph, node))
 }
 
 /// Moves the run from `from` along `output` to the step it leads to, if any, with
@@ -332,7 +333,6 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
             }
         }
     }
-    let first = from.kind != Kind::Prompt && !sent_a_prompt(tx, run)?;
     left(tx, run.id, &from.id, output)?;
     let Some(next) = next else {
         // The output leads nowhere: the flow is done.
@@ -342,7 +342,7 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
     match next.kind {
         Kind::Prompt => {
             set(tx, run.id, &next.id, Status::Running, steps + 1, None)?;
-            Ok(Some(if first { flows::first_prompt_text(&run.graph, next) } else { flows::prompt_text(next) }))
+            prompt_for(tx, run, next).map(Some)
         }
         Kind::Manual => set(tx, run.id, &next.id, Status::Manual, steps, None).map(|()| None),
         Kind::End | Kind::Start => set(tx, run.id, &next.id, Status::Done, steps, None).map(|()| None),
@@ -371,8 +371,8 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
     let now = now();
     let clear = flows::clears(&graph);
     let inserted = tx.execute(
-        "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, clear, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, ?6, ?6)",
+        "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, clear, briefed, started_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, 0, ?6, ?6)",
         params![
             flow_id,
             tab_id.as_str(),
@@ -394,7 +394,7 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
         tx.commit().map_err(sql)?;
         return Ok(Started { run_id, clear, prompt: None });
     }
-    let run = Stored { id: run_id, graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None, clear: None };
+    let run = Stored { id: run_id, graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None, clear: None, briefed: false };
     let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, By::Flow)?;
     tx.commit().map_err(sql)?;
     Ok(Started { run_id, clear, prompt })
@@ -513,8 +513,8 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Strin
     set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
     let prompt = match how {
         Resume::Remind => flows::resume_text(node),
-        // The clear took Start's base info too.
-        Resume::Prompt => flows::first_prompt_text(&run.graph, node),
+        // With the base info, if a clear took that too.
+        Resume::Prompt => prompt_for(&tx, &run, node)?,
     };
     tx.commit().map_err(sql)?;
     Ok(prompt)
@@ -522,15 +522,22 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Strin
 
 /// Claude in tab `tab_id` cleared its conversation: a run waiting for that clear
 /// can take its first step (see `cleared`); a running step will get no reply, so
-/// its run waits for the person, saying `why` (see `pause_tab`).
+/// its run waits for the person, saying `why` (see `pause_tab`). Either way, the
+/// run's next prompt carries Start's base info again.
 pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
-    let changed = conn
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+    tx.execute(&format!("UPDATE flow_runs SET briefed = 0 WHERE tab_id = ?1 AND status IN {ACTIVE}"), [tab_id.as_str()])
+        .map_err(sql)?;
+    let changed = tx
         .execute(
             "UPDATE flow_runs SET clear = 'done', updated_at = ?2 WHERE tab_id = ?1 AND status = 'running' AND clear = 'pending'",
             params![tab_id.as_str(), now()],
         )
         .map_err(sql)?;
-    if changed == 0 { pause_tab(conn, tab_id, why) } else { Ok(()) }
+    if changed == 0 {
+        pause(&tx, tab_id, why)?;
+    }
+    tx.commit().map_err(sql)
 }
 
 /// Makes the tab's running run wait for the person, saying why: Claude will not
@@ -538,6 +545,10 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
 /// Continue sends the step's prompt again. A run still at Start waiting for its
 /// clear has no step to reply to, and is left alone.
 pub fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+    pause(conn, tab_id, why)
+}
+
+fn pause(conn: &Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     conn.execute(
         "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running' AND clear IS NULL",
         params![tab_id.as_str(), why, now()],
@@ -770,6 +781,71 @@ mod tests {
         assert_eq!(started.prompt, None);
         assert_eq!(pick(&mut conn, started.run_id, "redo").unwrap(), None);
         assert_eq!(pick(&mut conn, started.run_id, "ok").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
+    }
+
+    /// `graph` with `info` as Start's base info.
+    fn briefing(mut graph: Graph, info: &str) -> Graph {
+        graph.nodes[0].text = info.into();
+        graph
+    }
+
+    #[test]
+    fn picking_an_output_after_a_clear_sends_base_info_again() {
+        let g = briefing(runnable(), "The app is in src/.");
+        let (_db, mut conn, flow) = setup("runs-base-info-pick", &g);
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        let prompt = pick(&mut conn, started.run_id, "fail").unwrap().unwrap();
+        assert!(prompt.starts_with("The app is in src/.\n\ndo p"), "{prompt}");
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), prompt_of(&g, "p"));
+    }
+
+    #[test]
+    fn a_clear_at_a_manual_step_owes_base_info_to_the_next_prompt() {
+        let g = briefing(
+            graph(
+                vec![node("m", Kind::Manual, &["ok"]), node("p", Kind::Prompt, &["done"])],
+                vec![edge("start", "next", "m"), edge("m", "ok", "p"), edge("p", "done", "m")],
+            ),
+            "The app is in src/.",
+        );
+        let (_db, mut conn, flow) = setup("runs-base-info-manual-clear", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        assert_eq!(pick(&mut conn, run, "ok").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap(), None);
+        // Back at the manual step, Claude still has it.
+        assert_eq!(pick(&mut conn, run, "ok").unwrap(), prompt_of(&g, "p"));
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap(), None);
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Manual, "a clear does not hold up a manual step");
+        assert_eq!(pick(&mut conn, run, "ok").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
+    }
+
+    #[test]
+    fn continue_after_a_failed_hook_does_not_send_base_info_again() {
+        // The conversation still has it.
+        let g = briefing(runnable(), "The app is in src/.");
+        let (_db, mut conn, flow) = setup("runs-base-info-hook", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        pause_tab(&mut conn, &tab("t1"), "The Stop hook failed.").unwrap();
+        assert_eq!(Some(go_on(&mut conn, run).unwrap()), prompt_of(&g, "p"));
+    }
+
+    #[test]
+    fn a_run_that_clears_sends_base_info_with_its_first_prompt() {
+        let mut g = briefing(runnable(), "The app is in src/.");
+        g.nodes[0].clear = true;
+        let (_db, mut conn, flow) = setup("runs-base-info-clears", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(cleared(&mut conn, run).unwrap(), Cleared::Ready { prompt: Some(flows::first_prompt_text(&g, &g.nodes[1])) });
+    }
+
+    #[test]
+    fn blank_base_info_sends_the_prompt_as_it_is() {
+        let g = briefing(runnable(), " \n ");
+        let (_db, mut conn, flow) = setup("runs-base-info-blank", &g);
+        assert_eq!(start(&mut conn, flow, &tab("t1")).unwrap().prompt, prompt_of(&g, "p"));
     }
 
     #[test]

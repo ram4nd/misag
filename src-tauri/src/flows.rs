@@ -11,6 +11,9 @@ pub const MAX_STEPS: usize = 200;
 pub const MAX_OUTPUTS: usize = 8;
 const MAX_TITLE: usize = 200;
 const MAX_TEXT: usize = 20_000;
+/// The most Start's base info can be, in characters: it goes with a prompt, which
+/// can have `MAX_TEXT` of its own.
+pub const MAX_INFO: usize = 4_000;
 const MAX_ID: usize = 40;
 const MAX_OUTPUT: usize = 24;
 /// The most a step's `max_runs` can be.
@@ -188,6 +191,9 @@ fn check_node(node: &Node) -> Result<(), String> {
             c as u32
         ));
     }
+    if node.kind == Kind::Start && node.text.chars().count() > MAX_INFO {
+        return Err(format!("Start's base info can be at most {MAX_INFO} characters"));
+    }
     if !node.x.is_finite() || !node.y.is_finite() {
         return Err(format!("\"{}\" has no valid position", node.name()));
     }
@@ -291,8 +297,8 @@ pub fn prompt_text(node: &Node) -> String {
     typeable(format!("{}\n\n{}", node.text.trim_end(), reply_rule(node)))
 }
 
-/// `prompt_text` for the first prompt Claude gets in a run, or after the run's
-/// conversation was cleared: led by Start's base info, if it has any.
+/// `prompt_text` for the first prompt Claude gets in a run, or the first after the
+/// run's conversation was cleared: led by Start's base info (trimmed), if it has any.
 pub fn first_prompt_text(graph: &Graph, node: &Node) -> String {
     let info = graph.nodes.iter().find(|n| n.kind == Kind::Start).map_or("", |n| n.text.trim());
     if info.is_empty() {
@@ -593,6 +599,15 @@ pub(crate) mod tests {
         g.nodes[0].text = "The app is in src/.".into();
         assert_eq!(stored(g.clone()).version, 4);
         check(&stored(g)).unwrap();
+    }
+
+    #[test]
+    fn base_info_is_short_enough_to_leave_room_for_the_prompt() {
+        let mut g = runnable();
+        g.nodes[0].text = "x".repeat(MAX_INFO);
+        check(&g).unwrap();
+        g.nodes[0].text.push('x');
+        rejected(&g, "base info");
     }
 
     #[test]

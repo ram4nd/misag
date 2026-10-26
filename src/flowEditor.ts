@@ -41,8 +41,10 @@ interface FlowDetail {
 const SAVE_DELAY_MS = 400;
 /** Outputs as the backend accepts them (see `flows::plain_output`); "attention" is reserved. */
 const OUTPUT = /^[a-z0-9][a-z0-9_-]{0,23}$/;
-/** The backend's limits (`flows::MAX_STEPS`, `MAX_OUTPUTS`, `MAX_RUNS`, and the title and text lengths). */
+/** The backend's limits (`flows::MAX_STEPS`, `MAX_OUTPUTS`, `MAX_RUNS`, `MAX_TEXT`, `MAX_INFO`, and the title length). */
 const MAX_STEPS = 200;
+const MAX_TEXT = 20000;
+const MAX_INFO = 4000;
 const MAX_OUTPUTS = 8;
 const MAX_RUNS = 100;
 /** The steps the toolbar adds. There is no End to add: an output with no next step ends the flow. */
@@ -216,6 +218,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     clear.checked = s.clear === true;
     clear.closest("label")!.hidden = s.kind !== "start";
     $(".text-label").textContent = { start: "Base info", prompt: "Prompt", manual: "What the person does", end: "" }[s.kind];
+    text.maxLength = s.kind === "start" ? MAX_INFO : MAX_TEXT;
     text.placeholder = s.kind === "start" ? "Optional: where things are and what Claude should know, sent ahead of the first prompt" : "";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
@@ -297,8 +300,10 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   text.oninput = () => {
     const s = find(selected);
     if (!s) return;
+    // The canvas marks a Start with base info.
+    const marked = s.kind === "start" && s.text.trim() !== "";
     s.text = text.value;
-    changed(false);
+    changed(s.kind === "start" && marked !== (s.text.trim() !== ""));
   };
   /** Applies the outputs field to the selected step, or says why it cannot. */
   function commitOutputs() {
