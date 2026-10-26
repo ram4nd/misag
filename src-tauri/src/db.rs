@@ -143,6 +143,10 @@ const MIGRATIONS: &[&str] = &[r#"
     -- For a run whose Start clears, while it waits at Start for Claude's /clear
     -- (see runs::Clear); NULL otherwise.
     ALTER TABLE flow_runs ADD COLUMN clear TEXT CHECK (clear IN ('pending', 'done'));
+"#, r#"
+    -- 1 for a flow a program in a tab added (`misag flow import` with MISAG_TAB set),
+    -- until the person confirms it in the app; runs::start refuses it until then.
+    ALTER TABLE flows ADD COLUMN unconfirmed INTEGER NOT NULL DEFAULT 0 CHECK (unconfirmed IN (0, 1));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -669,13 +673,21 @@ pub struct FlowSummary {
     /// Whether a run begins by clearing the conversation (`flows::clears`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub clear: bool,
+    /// Added by a program in a tab and not yet confirmed by the person, so it does
+    /// not run (see `import_unconfirmed_flow`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unconfirmed: bool,
 }
 
-/// A flow's name as stored: trimmed, not empty, and plain text, as it is printed in
-/// terminals (`misag flow list`) and read by Claude.
+/// The longest flow name, in characters, as long as a step title.
+const MAX_FLOW_NAME: usize = 200;
+
+/// A flow's name as stored: trimmed, not empty, at most `MAX_FLOW_NAME` characters,
+/// and plain text, as it is printed in terminals (`misag flow list`) and read by Claude.
 fn flow_name(name: &str) -> Result<&str, String> {
     match name.trim() {
         "" => Err("a flow needs a name".into()),
+        name if name.chars().count() > MAX_FLOW_NAME => Err(format!("a flow name can be at most {MAX_FLOW_NAME} characters")),
         name => match name.chars().find(|&c| c.is_control() || flows::hidden(c)) {
             Some(c) => Err(format!("a flow name cannot hold control or hidden characters (U+{:04X})", c as u32)),
             None => Ok(name),
@@ -707,12 +719,14 @@ impl Db {
                 "SELECT id, name, archived, CASE WHEN json_valid(graph) THEN EXISTS (
                     SELECT 1 FROM json_each(graph, '$.nodes')
                     WHERE json_extract(value, '$.kind') = 'start' AND json_extract(value, '$.clear') = 1
-                 ) ELSE 0 END
+                 ) ELSE 0 END, unconfirmed
                  FROM flows ORDER BY position, id",
             )
             .map_err(sql)?;
         let flows = stmt
-            .query_map([], |r| Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)?, clear: r.get(3)? }))
+            .query_map([], |r| {
+                Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)?, clear: r.get(3)?, unconfirmed: r.get(4)? })
+            })
             .map_err(sql)?
             .collect::<Result<_, _>>()
             .map_err(sql);
@@ -721,29 +735,43 @@ impl Db {
 
     /// Adds a flow after the others, with only its Start step.
     pub fn create_flow(&self, name: &str) -> Result<FlowSummary, String> {
-        self.add_flow(name, &Graph::default())
+        self.add_flow(name, &Graph::default(), false)
     }
 
     /// Adds a flow after the others with these steps, if they pass `flows::check`
     /// (see `flow_file` for where they come from).
     pub fn import_flow(&self, name: &str, graph: &Graph) -> Result<FlowSummary, String> {
         flows::check(graph)?;
-        self.add_flow(name, &flows::stored(graph.clone()))
+        self.add_flow(name, &flows::stored(graph.clone()), false)
     }
 
-    fn add_flow(&self, name: &str, graph: &Graph) -> Result<FlowSummary, String> {
+    /// Like `import_flow`, for a flow a program in a tab added (Claude, say, which a
+    /// file or page it read may have steered): it runs only once the person has
+    /// confirmed it (`confirm_flow`), as ▶ would otherwise send its steps unseen.
+    pub fn import_unconfirmed_flow(&self, name: &str, graph: &Graph) -> Result<FlowSummary, String> {
+        flows::check(graph)?;
+        self.add_flow(name, &flows::stored(graph.clone()), true)
+    }
+
+    /// The person has seen the flow and lets it run.
+    pub fn confirm_flow(&self, id: i64) -> Result<(), String> {
+        let changed = self.conn().execute("UPDATE flows SET unconfirmed = 0 WHERE id = ?1", [id]).map_err(sql)?;
+        one_flow(id, changed)
+    }
+
+    fn add_flow(&self, name: &str, graph: &Graph, unconfirmed: bool) -> Result<FlowSummary, String> {
         let name = flow_name(name)?;
         let clear = flows::clears(graph);
         let graph = graph_json(graph)?;
         let conn = self.conn();
         let now = now_secs();
         conn.execute(
-            "INSERT INTO flows (name, position, graph, created_at, updated_at)
-             VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM flows), ?3, ?2, ?2)",
-            params![name, now, graph],
+            "INSERT INTO flows (name, position, graph, created_at, updated_at, unconfirmed)
+             VALUES (?1, (SELECT COALESCE(MAX(position), -1) + 1 FROM flows), ?3, ?2, ?2, ?4)",
+            params![name, now, graph, unconfirmed],
         )
         .map_err(sql)?;
-        Ok(FlowSummary { id: conn.last_insert_rowid(), name: name.into(), archived: false, clear })
+        Ok(FlowSummary { id: conn.last_insert_rowid(), name: name.into(), archived: false, clear, unconfirmed })
     }
 
     pub fn rename_flow(&self, id: i64, name: &str) -> Result<(), String> {
@@ -789,10 +817,10 @@ impl Db {
     /// The flow and its steps; one stored without any steps (the column's default)
     /// loads as a new flow.
     pub fn load_flow(&self, id: i64) -> Result<(FlowSummary, Graph), String> {
-        let (name, archived, graph): (String, bool, String) = self
+        let (name, archived, graph, unconfirmed): (String, bool, String, bool) = self
             .conn()
-            .query_row("SELECT name, archived, graph FROM flows WHERE id = ?1", [id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            .query_row("SELECT name, archived, graph, unconfirmed FROM flows WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             })
             .optional()
             .map_err(sql)?
@@ -800,7 +828,7 @@ impl Db {
         let graph: Graph = serde_json::from_str(&graph)
             .map_err(|e| format!("the steps of \"{name}\" cannot be read ({e})"))?;
         let graph = if graph.nodes.is_empty() && graph.edges.is_empty() { Graph::default() } else { graph };
-        Ok((FlowSummary { id, name, archived, clear: flows::clears(&graph) }, graph))
+        Ok((FlowSummary { id, name, archived, clear: flows::clears(&graph), unconfirmed }, graph))
     }
 
     /// Stores the flow's steps if they pass `flows::check`.
@@ -857,12 +885,12 @@ impl Db {
         runs::cleared(&mut self.conn(), run_id)
     }
 
-    pub fn proceed_run(&self, run_id: i64, output: &str) -> Result<Option<String>, String> {
-        runs::proceed(&mut self.conn(), run_id, output)
+    pub fn proceed_run(&self, run_id: i64, step_id: &str, output: &str) -> Result<Option<String>, String> {
+        runs::proceed(&mut self.conn(), run_id, step_id, output)
     }
 
-    pub fn resume_run(&self, run_id: i64) -> Result<String, String> {
-        runs::resume(&mut self.conn(), run_id)
+    pub fn resume_run(&self, run_id: i64, step_id: &str) -> Result<String, String> {
+        runs::resume(&mut self.conn(), run_id, step_id)
     }
 
     pub fn stop_run(&self, run_id: i64) -> Result<(), String> {
@@ -876,8 +904,10 @@ impl Db {
 
 /// Copies the database at `old` to `path` if there is no database there yet, and
 /// returns the notice that says whether it worked. The copy is a snapshot taken
-/// through SQLite, so it is consistent even while raterm still runs and writes.
-/// A failed copy leaves nothing at `path`, so the app starts fresh and says why.
+/// through SQLite, so it is consistent even while raterm still runs and writes;
+/// conversations still open in a running raterm are left out of the copy (see
+/// `release_open_sessions`). A failed copy leaves nothing at `path`, so the app
+/// starts fresh and says why.
 fn import(path: &Path, old: &Path) -> Option<String> {
     match (path.try_exists(), old.try_exists()) {
         (Ok(false), Ok(true)) => {}
@@ -893,7 +923,7 @@ fn import(path: &Path, old: &Path) -> Option<String> {
     }
     // Written under another name first, so a copy cut short is never opened.
     let copying = PathBuf::from(format!("{}.importing", path.display()));
-    let copied = (|| -> Result<(), String> {
+    let copied = (|| -> Result<usize, String> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -903,23 +933,78 @@ fn import(path: &Path, old: &Path) -> Option<String> {
         let into = copying.to_str().ok_or("the path is not UTF-8")?;
         from.execute("VACUUM INTO ?1", [into]).map_err(|e| e.to_string())?;
         drop(from);
-        move_files(&database_files(&copying), &database_files(path)).map_err(|e| e.to_string())
+        let released = release_open_sessions(&Connection::open(&copying).map_err(|e| e.to_string())?)?;
+        move_files(&database_files(&copying), &database_files(path)).map_err(|e| e.to_string())?;
+        Ok(released)
     })();
-    if let Err(e) = copied {
-        eprintln!("misag: could not copy raterm's database from {}: {e}; starting fresh", old.display());
-        remove_files(&database_files(&copying));
-        return Some(format!(
-            "Saved tabs, settings and flows could not be copied from raterm, the app's old name ({e}). \
-             raterm's database is still at {}. To try again, quit Mischief of Agents, delete {} and start it again.",
-            old.display(),
-            path.display()
-        ));
-    }
+    let released = match copied {
+        Ok(released) => released,
+        Err(e) => {
+            eprintln!("misag: could not copy raterm's database from {}: {e}; starting fresh", old.display());
+            remove_files(&database_files(&copying));
+            return Some(format!(
+                "Saved tabs, settings and flows could not be copied from raterm, the app's old name ({e}). \
+                 raterm's database is still at {}. To try again, quit Mischief of Agents, delete {} and start it again.",
+                old.display(),
+                path.display()
+            ));
+        }
+    };
     eprintln!("misag: copied raterm's database from {} to {}", old.display(), path.display());
+    let open = match released {
+        0 => String::new(),
+        1 => " raterm is still running, so the 1 Claude conversation open in it was not reopened here; \
+              once you quit raterm, find it in Session history."
+            .to_owned(),
+        n => format!(
+            " raterm is still running, so the {n} Claude conversations open in it were not reopened here; \
+             once you quit raterm, find them in Session history."
+        ),
+    };
     Some(format!(
-        "Saved tabs, settings and flows were copied from raterm, the app's old name. raterm's own database was left at {}.",
+        "Saved tabs, settings and flows were copied from raterm, the app's old name. raterm's own database was left at {}.{open}",
         old.display()
     ))
+}
+
+/// In a fresh copy of raterm's database: forgets the Claude session of each tab
+/// whose Claude still runs (raterm is running, and has it open), so its tab starts
+/// a new conversation rather than resuming one open in two places, and stops that
+/// tab's flow run, which raterm still drives. Returns how many were forgotten.
+fn release_open_sessions(conn: &Connection) -> Result<usize, String> {
+    let has_pids = conn
+        .prepare("SELECT tab_id, claude_pid FROM claude_sessions WHERE claude_pid IS NOT NULL")
+        .and_then(|mut stmt| stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<Result<Vec<_>, _>>());
+    let tabs = match has_pids {
+        Ok(rows) => rows.into_iter().filter(|&(_, pid)| alive(pid)).map(|(tab, _)| tab).collect::<Vec<_>>(),
+        // A raterm too old to record pids: nothing to tell by.
+        Err(e) => {
+            eprintln!("misag: could not tell which of raterm's conversations are still open: {e}");
+            return Ok(0);
+        }
+    };
+    let has_runs: bool = conn
+        .query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'flow_runs')", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    for tab in &tabs {
+        conn.execute("UPDATE tabs SET claude_session = NULL WHERE tab_id = ?1", [tab]).map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM claude_sessions WHERE tab_id = ?1", [tab]).map_err(|e| e.to_string())?;
+        if has_runs {
+            conn.execute(&format!("UPDATE flow_runs SET status = 'stopped' WHERE tab_id = ?1 AND status IN {}", runs::ACTIVE), [tab])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(tabs.len())
+}
+
+/// Whether process `pid` exists (one owned by another user counts).
+fn alive(pid: i64) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists; nothing is sent.
+    (unsafe { libc::kill(pid, 0) } == 0) || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Removes those of `files` that exist, logging what could not be removed.
@@ -1086,6 +1171,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn conversations_still_open_in_a_running_raterm_are_not_reopened() {
+        const S2: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+        let old = crate::test_support::temp_dir("import-live-old").join(RATERM_FILE);
+        let raterm = Db::open(old.clone()).unwrap();
+        raterm.save_layout(Layout { active: 0, tabs: vec![claude_tab("a", Some(S1)), claude_tab("b", Some(S2))] }).unwrap();
+        // Tab a's Claude still runs (this process stands in for it); tab b's has quit.
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let dead = ended.id();
+        ended.wait().unwrap();
+        let conn = connect_existing(&old).unwrap();
+        for (tab, session, pid) in [("a", S1, std::process::id()), ("b", S2, dead)] {
+            let (tab_id, session_id) = (tid(tab), sid(session));
+            let report = SessionReport { claude_pid: Some(pid), ..report(&tab_id, &session_id) };
+            record_claude_session(&conn, &report).unwrap();
+        }
+        let path = crate::test_support::temp_dir("import-live-new").join(FILE);
+        let db = Db::open_or_import(Ok(path), Some(old));
+        let sessions: Vec<_> = db
+            .load_layout()
+            .unwrap()
+            .tabs
+            .into_iter()
+            .map(|t| match t.kind {
+                TabKind::Claude { claude_session } => claude_session,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(sessions, [None, Some(sid(S2))]);
+        let StoreStatus::Recovered { notice } = db.status() else { panic!("expected a notice") };
+        assert!(notice.contains("1 Claude conversation"), "{notice}");
+        // raterm's own database still has it.
+        assert_eq!(raterm.load_layout().unwrap().tabs[0].kind, TabKind::Claude { claude_session: Some(sid(S1)) });
+    }
+
+    #[test]
     fn a_raterm_database_never_replaces_an_existing_one() {
         let old = crate::test_support::temp_dir("import-kept-old").join(RATERM_FILE);
         Db::open(old.clone()).unwrap().save_layout(Layout { active: 0, tabs: vec![claude_tab("a", None)] }).unwrap();
@@ -1231,7 +1351,8 @@ pub(crate) mod tests {
     fn upgrading_adds_no_pinned_sessions() {
         let path = temp_db("upgrade-pins");
         let conn = Connection::open(&path).unwrap();
-        let before = MIGRATIONS.len() - 1;
+        // The schema just before the migration that adds the pins.
+        let before = MIGRATIONS.iter().position(|m| m.contains("CREATE TABLE pinned_sessions")).unwrap();
         conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
         conn.pragma_update(None, "user_version", before as i64).unwrap();
         drop(conn);
@@ -1691,6 +1812,10 @@ pub(crate) mod tests {
         assert_eq!(flow_names(&db), names(&["Ship it"]));
         let err = db.rename_flow(id + 100, "Gone").unwrap_err();
         assert!(err.contains("no flow"), "{err}");
+        assert!(db.rename_flow(id, &"x".repeat(MAX_FLOW_NAME)).is_ok());
+        let err = db.rename_flow(id, &"x".repeat(MAX_FLOW_NAME + 1)).unwrap_err();
+        assert!(err.contains("at most"), "{err}");
+        assert!(db.create_flow(&"x".repeat(MAX_FLOW_NAME + 1)).is_err());
     }
 
     #[test]

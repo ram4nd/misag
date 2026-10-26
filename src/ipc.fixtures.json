@@ -1,0 +1,54 @@
+{
+  "cleared": [
+    {
+      "state": "pending"
+    },
+    {
+      "prompt": "Go",
+      "state": "ready"
+    },
+    {
+      "state": "gone"
+    }
+  ],
+  "flow": {
+    "archived": false,
+    "clear": true,
+    "id": 1,
+    "name": "Deploy",
+    "unconfirmed": true
+  },
+  "page": {
+    "more": true,
+    "sessions": [
+      {
+        "cwd": "/p",
+        "id": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "modified": 1,
+        "pinned": true,
+        "title": "Fix it"
+      }
+    ],
+    "unreadable": 0
+  },
+  "run": {
+    "flowId": 2,
+    "flowName": "Deploy",
+    "id": 1,
+    "note": "Why",
+    "outputs": [
+      "done"
+    ],
+    "resumable": true,
+    "status": "attention",
+    "step": "Fix",
+    "stepId": "p",
+    "steps": 3,
+    "tabId": "tab-1"
+  },
+  "started": {
+    "clear": true,
+    "prompt": "Go",
+    "runId": 1
+  }
+}

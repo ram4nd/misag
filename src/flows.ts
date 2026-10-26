@@ -30,6 +30,8 @@ export interface Flow {
   archived: boolean;
   /** Whether a run begins by typing /clear; absent: it does not. */
   clear?: boolean;
+  /** Added by a program in a tab and not yet confirmed, so ▶ asks first; absent: it was not. */
+  unconfirmed?: boolean;
 }
 
 export interface FlowsOptions {

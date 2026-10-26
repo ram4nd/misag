@@ -104,8 +104,6 @@ fn open_store(dir: Result<PathBuf, String>, old_dir: Option<PathBuf>) -> db::Db 
     db
 }
 
-/// Where raterm, misag's old name, kept its data, given misag's app data directory:
-/// the same place under raterm's identifier.
 /// Where this build keeps its data in the app data directory `dir`: debug builds in
 /// a subdirectory, so even a dev build run without the dev config's identifier never
 /// touches an installed misag's.
@@ -113,6 +111,8 @@ pub(crate) fn in_build(dir: PathBuf) -> PathBuf {
     if cfg!(debug_assertions) { dir.join("dev") } else { dir }
 }
 
+/// Where raterm, misag's old name, kept its data, given misag's app data directory:
+/// the same place under raterm's identifier.
 fn raterm_data_dir(dir: &std::path::Path) -> Option<PathBuf> {
     let name = dir.file_name()?.to_str()?;
     let suffix = name.strip_prefix("io.github.ram4nd.misag")?;
@@ -197,6 +197,7 @@ pub fn run() {
             commands::flow_create,
             commands::flow_rename,
             commands::flow_set_archived,
+            commands::flow_confirm,
             commands::flows_reorder,
             commands::flow_delete,
             commands::flow_load,
@@ -251,6 +252,41 @@ mod tests {
     use super::*;
     use claude::SessionId;
     use layout::{Layout, Tab, TabId, TabKind};
+
+    /// The values the page reads, one of each shape, as src/ipc.fixtures.json holds
+    /// them; src/ipc.test.ts checks the TypeScript mirrors against that file, so a
+    /// field renamed, added or dropped on either side fails a test.
+    #[test]
+    fn the_page_s_mirrors_match_the_values_sent() {
+        let session = SessionId::parse("0f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
+        let past = history::Past { id: session, title: "Fix it".into(), cwd: "/p".into(), modified: 1, pinned: true };
+        let values = serde_json::json!({
+            "run": runs::Run {
+                id: 1,
+                flow_id: 2,
+                flow_name: "Deploy".into(),
+                tab_id: "tab-1".into(),
+                step_id: "p".into(),
+                step: "Fix".into(),
+                status: runs::Status::Attention,
+                note: Some("Why".into()),
+                outputs: vec!["done".into()],
+                steps: 3,
+                resumable: true,
+            },
+            "started": runs::Started { run_id: 1, clear: true, prompt: Some("Go".into()) },
+            "cleared": [runs::Cleared::Pending, runs::Cleared::Ready { prompt: Some("Go".into()) }, runs::Cleared::Gone],
+            "flow": db::FlowSummary { id: 1, name: "Deploy".into(), archived: false, clear: true, unconfirmed: true },
+            "page": history::Page { sessions: vec![past], more: true, unreadable: 0, gone_pins: Vec::new() },
+        });
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/ipc.fixtures.json");
+        let text = serde_json::to_string_pretty(&values).unwrap() + "\n";
+        if std::env::var_os("UPDATE_IPC_FIXTURES").is_some() {
+            std::fs::write(&file, &text).unwrap();
+        }
+        let stored = std::fs::read_to_string(&file).unwrap_or_default();
+        assert!(stored == text, "{} is out of date: run UPDATE_IPC_FIXTURES=1 cargo test, then fix the TypeScript mirrors", file.display());
+    }
 
     #[test]
     fn opening_the_store_prunes_reports_for_closed_tabs() {

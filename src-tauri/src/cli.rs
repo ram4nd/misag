@@ -9,9 +9,14 @@ use std::path::{Path, PathBuf};
 
 /// The first argument that runs this instead of the app.
 pub const FLOW_COMMAND: &str = "flow";
-/// The app's identifier, which names its data directory: a dev build's (as in
-/// tauri.dev.conf.json, which `pnpm app:dev` uses) or a release's (tauri.conf.json).
-const APP_ID: &str = if cfg!(debug_assertions) { "io.github.ram4nd.misag.dev" } else { "io.github.ram4nd.misag" };
+/// The app's identifiers, which name its data directory: a release's (tauri.conf.json)
+/// and a dev build's (tauri.dev.conf.json, which `pnpm app:dev` uses).
+const RELEASE_ID: &str = "io.github.ram4nd.misag";
+const DEV_ID: &str = "io.github.ram4nd.misag.dev";
+/// Those this build's app may run under. A debug build can be started with the dev
+/// config (`pnpm app:dev`) or without it (`pnpm tauri dev`, which keeps the release
+/// identifier); `in_build` keeps both apart from an installed misag's data.
+const APP_IDS: &[&str] = if cfg!(debug_assertions) { &[DEV_ID, RELEASE_ID] } else { &[RELEASE_ID] };
 
 pub const APP_HELP: &str = "\
 Mischief of Agents (misag): tabs of Claude Code and terminals, and flows of prompts.
@@ -77,6 +82,8 @@ Steps ("nodes"):
               the output, so the text need not mention the outputs.
             "manual": waits for the person, who picks an output in the app;
               "text" says what to do.
+            "end": from flows made by older versions; it ends the run and has
+              no outputs. Not needed: an output that leads nowhere ends it.
   title     The step's name on the canvas (up to 200 characters).
   text      The prompt, or what the person does (up to 20000 characters).
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
@@ -180,7 +187,8 @@ fn command(args: Vec<OsString>, stdin: &mut impl Read, out: &mut impl Write) -> 
         ("list", 1) => {
             for flow in open(line.db)?.list_flows()? {
                 let archived = if flow.archived { "\t(archived)" } else { "" };
-                written(writeln!(out, "{}\t{}{archived}", flow.id, shown(&flow.name)))?;
+                let unconfirmed = if flow.unconfirmed { "\t(not yet confirmed)" } else { "" };
+                written(writeln!(out, "{}\t{}{archived}{unconfirmed}", flow.id, shown(&flow.name)))?;
             }
             Ok(())
         }
@@ -205,8 +213,15 @@ fn command(args: Vec<OsString>, stdin: &mut impl Read, out: &mut impl Write) -> 
                 text = std::fs::read_to_string(from).map_err(|e| format!("cannot read {}: {e}", from.display()))?;
             }
             let (file_name, graph) = flow_file::parse(&text)?;
-            let flow = open(line.db)?.import_flow(line.name.as_deref().unwrap_or(&file_name), &graph)?;
+            let db = open(line.db)?;
+            let name = line.name.as_deref().unwrap_or(&file_name);
+            // From one of misag's tabs, a program (such as Claude) may be adding it.
+            let in_tab = std::env::var_os(claude::TAB_ENV).is_some_and(|t| !t.is_empty());
+            let flow = if in_tab { db.import_unconfirmed_flow(name, &graph)? } else { db.import_flow(name, &graph)? };
             let mut report = format!("Added \"{}\" as flow {}.\n", shown(&flow.name), flow.id);
+            if flow.unconfirmed {
+                report.push_str("It was added from a misag tab, so it runs only once you confirm it in the app (its ▶ asks).\n");
+            }
             let problems = flows::problems(&graph);
             if !problems.is_empty() {
                 report.push_str("Before it can run:\n");
@@ -235,10 +250,10 @@ fn shown(text: &str) -> String {
 /// the app uses, and only the app migrates (this may be a newer misag than the one
 /// running, just after an upgrade).
 fn open(path: Option<PathBuf>) -> Result<db::Db, String> {
-    let path = path
-        .or_else(|| std::env::var_os(claude::DB_ENV).filter(|p| !p.is_empty()).map(PathBuf::from))
-        .or_else(data_dir_db)
-        .ok_or("cannot find the app's database: HOME is not set; give it with --db")?;
+    let path = match path.or_else(|| std::env::var_os(claude::DB_ENV).filter(|p| !p.is_empty()).map(PathBuf::from)) {
+        Some(path) => path,
+        None => data_dir_db()?,
+    };
     if !path.exists() {
         return Err(format!(
             "there is no Mischief of Agents database at {}; start the app once, or give it with --db",
@@ -250,13 +265,38 @@ fn open(path: Option<PathBuf>) -> Result<db::Db, String> {
     })
 }
 
-/// Where the app keeps its database: its data directory, as Tauri finds it on Linux.
-fn data_dir_db() -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(crate::in_build(data.join(APP_ID)).join(db::FILE))
+/// The directory Tauri puts app data directories in (its `app_data_dir` is this
+/// joined with the identifier), as the `dirs` crate it uses finds it.
+fn data_home() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        var("HOME").map(|h| h.join("Library/Application Support"))
+    } else if cfg!(windows) {
+        var("APPDATA")
+    } else {
+        var("XDG_DATA_HOME").or_else(|| var("HOME").map(|h| h.join(".local/share")))
+    }
+}
+
+/// Where the app keeps its database: in its data directory, under whichever of
+/// `APP_IDS` the app runs as (see `pick_db`).
+fn data_dir_db() -> Result<PathBuf, String> {
+    let home = data_home().ok_or("cannot find the app's data directory (HOME is not set); give the database with --db")?;
+    pick_db(APP_IDS.iter().map(|id| crate::in_build(home.join(id)).join(db::FILE)).collect())
+}
+
+/// The one of `candidates` that exists, else the first (which `open` then says is
+/// missing); more than one is an error, as the app may run as either.
+fn pick_db(candidates: Vec<PathBuf>) -> Result<PathBuf, String> {
+    let found: Vec<&PathBuf> = candidates.iter().filter(|p| p.exists()).collect();
+    match found[..] {
+        [one] => Ok(one.clone()),
+        [] => candidates.into_iter().next().ok_or_else(|| "this build has no app identifier".to_owned()),
+        _ => Err(format!(
+            "there is a database for each way this build can run ({}); give the one to use with --db",
+            found.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        )),
+    }
 }
 
 /// The flow `which` names: its id, else its name, which must be one flow's.
@@ -280,10 +320,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_data_directory_is_named_by_the_app_s_identifier() {
+    fn the_data_directory_is_named_by_the_app_s_identifiers() {
         let release: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let dev: serde_json::Value = serde_json::from_str(include_str!("../tauri.dev.conf.json")).unwrap();
-        assert_eq!(if cfg!(debug_assertions) { &dev } else { &release }["identifier"], APP_ID);
+        assert_eq!((&release["identifier"], &dev["identifier"]), (&RELEASE_ID.into(), &DEV_ID.into()));
+        assert_eq!(APP_IDS.contains(&DEV_ID), cfg!(debug_assertions));
+    }
+
+    #[test]
+    fn the_database_is_the_one_that_exists_under_either_identifier() {
+        let dir = crate::test_support::temp_dir("cli-pick-db");
+        let (dev, release) = (dir.join("dev.db"), dir.join("release.db"));
+        let both = || vec![dev.clone(), release.clone()];
+        assert_eq!(pick_db(both()).unwrap(), dev, "neither: the first, which open says is missing");
+        std::fs::write(&release, "").unwrap();
+        assert_eq!(pick_db(both()).unwrap(), release);
+        std::fs::write(&dev, "").unwrap();
+        assert!(pick_db(both()).unwrap_err().contains("--db"));
     }
 
     #[test]

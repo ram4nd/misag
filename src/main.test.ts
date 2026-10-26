@@ -205,7 +205,7 @@ let fsTree: Record<string, { name: string; dir: boolean }[]>;
 /** settings_load waits for this, so a test can hold the load back. */
 let settingsLoadGate: Promise<void>;
 const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: 14 };
-type Flow = { id: number; name: string; archived: boolean };
+type Flow = { id: number; name: string; archived: boolean; unconfirmed?: boolean };
 /** The stored flows in order, archived ones included; the flow commands change it like the backend. */
 let storedFlows: Flow[];
 /** Flows that flow_delete refuses, as the runner will for running ones. */
@@ -371,6 +371,9 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
       find(args.id);
       if (importRefusal) throw { code: "failed", message: importRefusal };
       return flowPicked;
+    case "flow_confirm":
+      find(args.id).unconfirmed = undefined;
+      return null;
     case "flow_stop":
       activeRuns = activeRuns.filter((r) => r.id !== args.runId);
       return null;
@@ -3559,6 +3562,24 @@ describe("flow runs", () => {
     expect(callsOf("pty_write")[0].args.id).toBe(1);
   });
 
+  test("▶ on a flow added from a tab asks first, and runs it only once it is confirmed", async () => {
+    runPrompt = "Fix the tests.";
+    storedFlows[0].unconfirmed = true;
+    await boot();
+    await openClaudeTabs(1);
+    await play("Deploy");
+    expect(picker.asked).toEqual([expect.stringContaining("added from a tab")]);
+    expect(callsOf("flow_confirm")).toHaveLength(0);
+    expect(callsOf("flow_start")).toHaveLength(0);
+    picker.answer = true;
+    await play("Deploy");
+    expect(callsOf("flow_confirm").map((c) => c.args)).toEqual([{ id: 1 }]);
+    expect(callsOf("flow_start")).toHaveLength(1);
+    expect(typed()).toEqual(["\x1b[200~Fix the tests.\x1b[201~", "\r"]);
+    // Confirmed once: the next ▶ does not ask again.
+    expect(storedFlows[0].unconfirmed).toBeUndefined();
+  });
+
   /** Presses ▶ on a flow, then lets the paste's Enter go. */
   async function playAndEnter(name: string) {
     flowRow(name).querySelector<HTMLButtonElement>("button.run")!.click();
@@ -3718,7 +3739,7 @@ describe("flow runs", () => {
     row.querySelector<HTMLButtonElement>("button.resume")!.click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5, stepId: "p" }]);
     expect(callsOf("flow_load")).toHaveLength(0);
     expect(typed()).toEqual(["\x1b[200~Go on with the flow step.\x1b[201~", "\r"]);
   });
@@ -3735,7 +3756,7 @@ describe("flow runs", () => {
     picks[0].click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "approve" }]);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, stepId: "m", output: "approve" }]);
     // Picking does not open the editor.
     expect(callsOf("flow_load")).toHaveLength(0);
     expect(typed()).toEqual(["\x1b[200~Ship it.\x1b[201~", "\r"]);
@@ -3760,7 +3781,7 @@ describe("flow runs", () => {
     go.click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "done" }]);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, stepId: "m", output: "done" }]);
     expect(callsOf("flow_load")).toHaveLength(0);
     expect(typed()).toEqual(["\x1b[200~Submit the form.\x1b[201~", "\r"]);
   });
@@ -3794,7 +3815,7 @@ describe("flow runs", () => {
     runBar().querySelector<HTMLButtonElement>("button.resume")!.click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5, stepId: "p" }]);
     expect(typed()).toEqual(["\x1b[200~Go on.\x1b[201~", "\r"]);
   });
 
@@ -3825,7 +3846,7 @@ describe("flow runs", () => {
     outputs()[0].click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, output: "pass" }]);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, stepId: "p", output: "pass" }]);
     expect(typed()).toEqual(["\x1b[200~Deploy it.\x1b[201~", "\r"]);
   });
 

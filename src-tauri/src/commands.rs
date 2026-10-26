@@ -521,6 +521,12 @@ pub fn flow_rename(db: State<'_, Db>, id: i64, name: String) -> Result<(), Comma
     Ok(db.rename_flow(id, &name)?)
 }
 
+/// The person has seen a flow a program in a tab added, and lets it run.
+#[tauri::command(async)]
+pub fn flow_confirm(db: State<'_, Db>, id: i64) -> Result<(), CommandError> {
+    Ok(db.confirm_flow(id)?)
+}
+
 #[tauri::command(async)]
 pub fn flow_set_archived(db: State<'_, Db>, id: i64, archived: bool) -> Result<(), CommandError> {
     Ok(db.set_flow_archived(id, archived)?)
@@ -682,14 +688,14 @@ pub fn flow_cleared(db: State<'_, Db>, run_id: i64) -> Result<crate::runs::Clear
 }
 
 #[tauri::command(async)]
-pub fn flow_continue(db: State<'_, Db>, run_id: i64, output: String) -> Result<Option<String>, CommandError> {
-    Ok(db.proceed_run(run_id, &output)?)
+pub fn flow_continue(db: State<'_, Db>, run_id: i64, step_id: String, output: String) -> Result<Option<String>, CommandError> {
+    Ok(db.proceed_run(run_id, &step_id, &output)?)
 }
 
 /// Has Claude go on with the run's step that needs attention; returns the text to send.
 #[tauri::command(async)]
-pub fn flow_resume(db: State<'_, Db>, run_id: i64) -> Result<String, CommandError> {
-    Ok(db.resume_run(run_id)?)
+pub fn flow_resume(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<String, CommandError> {
+    Ok(db.resume_run(run_id, &step_id)?)
 }
 
 #[tauri::command(async)]
@@ -809,7 +815,7 @@ mod tests {
 
     #[test]
     fn a_loaded_flow_is_one_flat_object() {
-        let flow = FlowSummary { id: 3, name: "Deploy".into(), archived: false, clear: false };
+        let flow = FlowSummary { id: 3, name: "Deploy".into(), archived: false, clear: false, unconfirmed: false };
         let detail = FlowDetail { flow, graph: Graph::default(), problems: vec!["x".into()] };
         let json = serde_json::to_value(detail).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();

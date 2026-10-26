@@ -8,8 +8,9 @@ import "@wterm/dom/css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
 import { folderLabel, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
-import { createFlows, type Flow, type Run } from "./flows";
+import { createFlows, type Flow } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
+import { createRunController } from "./runController";
 import { createHistory, type Page as HistoryPage, type Past } from "./history";
 import { DRAG_THRESHOLD, forget, remember, remembered, setupToolboxes, slide } from "./toolbox";
 
@@ -568,7 +569,7 @@ function showActive() {
     pageOf(id).tabEl?.classList.toggle("active", id === shownPage);
   }
   if (shownPage !== null) pageOf(shownPage).shown?.();
-  showTabRuns();
+  runs.show();
 }
 
 /** Shows the given tab or page again (as they were before a tab that could not be opened), or nothing. */
@@ -587,7 +588,7 @@ function close(s: Session) {
   // Its run can never be answered again: the tab's id is not reused.
   invoke("flow_stop_tab", { tabId: s.tabId }).catch((err) => console.error("misag: could not end the tab's flow run", err));
   // Not one of a closed tab while the stop is on its way; if it fails, the next poll shows it as one.
-  runs = runs.filter((r) => r.tabId !== s.tabId);
+  runs.forgetTab(s);
   const i = sessions.indexOf(s);
   sessions.splice(i, 1);
   // A missing session (already exited) is a no-op on the backend.
@@ -607,7 +608,7 @@ function close(s: Session) {
     else active = next;
   }
   showHistory();
-  showTabRuns();
+  runs.show();
   scheduleSave();
 }
 
@@ -654,7 +655,7 @@ function renderSessions() {
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = tabLabel(s);
-      tab.classList.toggle("needs-you", waitingTabs.has(s.tabId));
+      tab.classList.toggle("needs-you", runs.waiting(s));
 
       const x = document.createElement("button");
       x.className = "x";
@@ -1502,10 +1503,10 @@ const flows = createFlows({
   showError: (message) => showPageError(pages.flows, message),
   onOpen: openFlowEditor,
   onChange: followFlows,
-  onRun: startFlow,
-  onStop: stopRun,
-  onResume: async (run) => flows.showBoxError(await resumeRun(run)),
-  onContinue: async (run, output) => flows.showBoxError(await continueRun(run, output)),
+  onRun: (flow) => void runs.start(flow),
+  onStop: (run) => void runs.stop(run),
+  onResume: async (run) => flows.showBoxError(await runs.resume(run)),
+  onContinue: async (run, output) => flows.showBoxError(await runs.proceed(run, output)),
 });
 
 /** What a terminal can paste: the backend command that reads it, and its name. */
@@ -1539,68 +1540,20 @@ async function pasteFrom(term: WTerm, source: keyof typeof PASTE_SOURCES) {
   term.onData?.(bracketed ? `\x1b[200~${clean}\x1b[201~` : clean);
 }
 
-/** How long after pasting a prompt Claude gets the Enter that sends it, so the paste is not taken as typing. */
-const PASTE_SUBMIT_MS = 150;
-/**
- * For a flow whose Start clears: how often to ask whether Claude has reported the
- * clear (the SessionStart hook does), and how long to wait for it before the run
- * is stopped.
- */
-const CLEAR_POLL_MS = 250;
-const CLEAR_TIMEOUT_MS = 30_000;
-/** Tabs a flow is being started in (through its clear), so ▶ is not taken twice. */
-const startingTabs = new Set<string>();
-/** Tabs whose flow run waits for the person, marked in the tab bar. */
-const waitingTabs = new Set<string>();
-/** The active runs, as last read. */
-let runs: Run[] = [];
-/** Until the saved tabs are back, a run's tab may just not be open yet. */
-let tabsRestored = false;
-
-/**
- * Shows the active tab's runs, their flows marked in the toolbox and their steps in
- * the editors, and in the toolbox the runs whose tab is gone, so they can be stopped.
- */
-function showTabRuns() {
-  const here = runs.filter((r) => r.tabId === active?.tabId);
-  const orphans = tabsRestored ? runs.filter((r) => !sessions.some((s) => s.tabId === r.tabId)) : [];
-  flows.showRuns(here, orphans);
-  for (const [id, { editor }] of editorPages) editor.showRun(here.find((r) => `flow:${r.flowId}` === id) ?? null);
-}
-
-/**
- * Types `text` into the tab as one paste and sends it, as if the person had. The
- * backend drops control characters from prompts, so the text cannot end the paste.
- * If Claude is busy (mid-turn, or in a menu), the paste lands there instead. Claude
- * is checked before the paste and again before the Enter: in a terminal tab it may
- * have been suspended or quit meanwhile, and the shell must not run a flow's text.
- * Resolves to whether it was sent; false if Claude had left, when it was not.
- */
-async function typePrompt(s: Session, text: string): Promise<boolean> {
-  const left = () => {
-    console.warn(`misag: Claude left ${tabLabel(s)} before its flow prompt was sent; it was not sent`);
-    return false;
-  };
-  if (!(await claudeLive(s))) return left();
-  write(s, encoder.encode(`\x1b[200~${text}\x1b[201~`));
-  await new Promise((resolve) => setTimeout(resolve, PASTE_SUBMIT_MS));
-  if (!(await claudeLive(s))) return left();
-  write(s, encoder.encode("\r"));
-  return true;
-}
-
-/** Why a prompt typed into `s` was not sent, for the person. */
-const notSent = (s: Session) => `Claude left ${tabLabel(s)} before the prompt was sent, so it was not sent`;
-
-/** Mirrors `runs::Started` in src-tauri/src/runs.rs. */
-interface Started {
-  runId: number;
-  clear: boolean;
-  prompt: string | null;
-}
-
-/** Mirrors `runs::Cleared`. */
-type Cleared = { state: "pending" | "gone" } | { state: "ready"; prompt: string | null };
+const runs = createRunController<Session>({
+  flows,
+  errorText,
+  tabs: () => sessions,
+  active: () => active,
+  label: tabLabel,
+  busy: showsBusy,
+  live: claudeLive,
+  write,
+  *editors() {
+    for (const [id, { editor }] of editorPages) yield [Number(id.slice("flow:".length)), editor];
+  },
+  markWaiting: (isWaiting) => sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", isWaiting(s))),
+});
 
 /**
  * Whether Claude runs in the tab right now, so a prompt typed there goes to Claude
@@ -1612,157 +1565,11 @@ async function claudeLive(s: Session): Promise<boolean> {
   return (await claudeStates([s]))[s.id]?.state === "open";
 }
 
-async function startFlow(flow: Flow) {
-  const s = active;
-  // A start already under way here (it may be waiting for its clear) is the one.
-  if (!s || startingTabs.has(s.tabId)) return;
-  startingTabs.add(s.tabId);
-  try {
-    await startIn(s, flow);
-  } finally {
-    startingTabs.delete(s.tabId);
-  }
-  await pollRuns();
-}
-
-async function startIn(s: Session, flow: Flow) {
-  if (!(await claudeLive(s))) {
-    flows.showBoxError("Flows run in a Claude tab: select one (or a terminal tab running claude) and press ▶ again.");
-    return;
-  }
-  let started: Started;
-  try {
-    // The run starts from the stored flow, so the editor's latest change goes first;
-    // one that cannot be saved says so in the editor.
-    await editorPages.get(`flow:${flow.id}`)?.editor.flush();
-    // The backend takes the tab before anything is typed, so a start it refuses
-    // (the tab runs a flow, the flow is not ready) clears nothing.
-    started = await invoke<Started>("flow_start", { flowId: flow.id, tabId: s.tabId });
-  } catch (err) {
-    console.error("misag: could not start the flow", err);
-    flows.showBoxError(`Could not start "${flow.name}": ${errorText(err)}`);
-    return;
-  }
-  flows.showBoxError(null);
-  if (!started.clear) {
-    if (started.prompt !== null && !(await typePrompt(s, started.prompt))) {
-      flows.showBoxError(`${notSent(s)}. Start Claude there and pick an output to go on, or stop the run.`);
-    }
-    return;
-  }
-  await pollRuns();
-  if (showsBusy(s)) {
-    // Claude would take /clear only after its turn, which may outlast the wait.
-    await stopStart(started.runId, `Claude is working in ${tabLabel(s)}, so "${flow.name}" was not started; press ▶ again when it is idle.`);
-    return;
-  }
-  if (!(await typePrompt(s, "/clear"))) {
-    await stopStart(started.runId, `Claude left ${tabLabel(s)} before /clear was sent, so "${flow.name}" was stopped.`);
-    return;
-  }
-  for (let waited = 0; waited < CLEAR_TIMEOUT_MS; waited += CLEAR_POLL_MS) {
-    await new Promise((resolve) => setTimeout(resolve, CLEAR_POLL_MS));
-    let cleared: Cleared;
-    try {
-      cleared = await invoke<Cleared>("flow_cleared", { runId: started.runId });
-    } catch (err) {
-      console.error("misag: could not check the flow's clear", err);
-      flows.showBoxError(`Could not go on with "${flow.name}" after /clear: ${errorText(err)}. Stop the run and press ▶ again.`);
-      return;
-    }
-    // Stopped meanwhile: nothing to do.
-    if (cleared.state === "gone") return;
-    if (cleared.state === "ready") {
-      if (cleared.prompt !== null && !(await typePrompt(s, cleared.prompt))) {
-        flows.showBoxError(`${notSent(s)}. Start Claude there and pick an output to go on, or stop the run.`);
-      }
-      return;
-    }
-  }
-  await stopStart(started.runId, `Claude did not clear the conversation in ${tabLabel(s)} within ${CLEAR_TIMEOUT_MS / 1000} seconds, so "${flow.name}" was stopped; press ▶ again when it is idle.`);
-}
-
-/** Stops a run whose start could not go through its clear, saying why. */
-async function stopStart(runId: number, why: string) {
-  try {
-    await invoke("flow_stop", { runId });
-    flows.showBoxError(why);
-  } catch (err) {
-    console.error("misag: could not stop the run", err);
-    flows.showBoxError(`${why} It could not be stopped (${errorText(err)}); stop it with ■.`);
-  }
-}
-
-/**
- * Moves the run on with `go`, typing the prompt it returns into the run's tab;
- * resolves to why it could not, for the run bar it was picked in, or null.
- */
-async function goOn(run: Run, go: () => Promise<string | null>): Promise<string | null> {
-  const s = sessions.find((s) => s.tabId === run.tabId);
-  let error: string | null = null;
-  if (!s || !(await claudeLive(s))) {
-    error = `Claude is not running in ${s ? tabLabel(s) : "the run's tab"}; start it there first, or stop the run.`;
-  } else {
-    try {
-      const prompt = await go();
-      if (prompt !== null && !(await typePrompt(s, prompt))) error = `${notSent(s)}; start Claude there and go on again.`;
-    } catch (err) {
-      console.error("misag: could not continue the run", err);
-      error = `Could not go on: ${errorText(err)}`;
-    }
-  }
-  await pollRuns();
-  return error;
-}
-
-/** Goes on as `output`. */
-function continueRun(run: Run, output: string): Promise<string | null> {
-  return goOn(run, () => invoke<string | null>("flow_continue", { runId: run.id, output }));
-}
-
-/** Has Claude go on with the run's step that needs attention. */
-function resumeRun(run: Run): Promise<string | null> {
-  return goOn(run, () => invoke<string>("flow_resume", { runId: run.id }));
-}
-
-async function stopRun(run: Run) {
-  try {
-    await invoke("flow_stop", { runId: run.id });
-    flows.showBoxError(null);
-  } catch (err) {
-    console.error("misag: could not stop the run", err);
-    flows.showBoxError(`Could not stop the run: ${errorText(err)}`);
-  }
-  await pollRuns();
-}
-
-/** The error pollRuns shows, so a later good poll clears only its own. */
-let runsError: string | null = null;
-
-/** Shows the active tab's runs, and marks the tabs whose run waits for the person. */
-async function pollRuns() {
-  try {
-    runs = await invoke<Run[]>("flow_runs");
-    if (runsError !== null) flows.showBoxError(null);
-    runsError = null;
-    showTabRuns();
-    waitingTabs.clear();
-    for (const run of runs) {
-      if (run.status !== "running") waitingTabs.add(run.tabId);
-    }
-    sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", waitingTabs.has(s.tabId)));
-  } catch (err) {
-    console.error("misag: could not read the flow runs", err);
-    runsError = `Flow runs could not be read: ${errorText(err)}`;
-    flows.showBoxError(runsError);
-  }
-}
-
 /** Opens the flow's editor tab, creating it the first time. */
 function openFlowEditor(flow: Flow) {
   const id: EditorPageId = `flow:${flow.id}`;
   if (!editorPages.has(id)) {
-    const editor = createFlowEditor(flow.id, { errorText, onContinue: continueRun, onResume: resumeRun });
+    const editor = createFlowEditor(flow.id, { errorText, onContinue: runs.proceed, onResume: runs.resume });
     termsEl.append(editor.el);
     const page: Page = {
       title: flow.name,
@@ -1777,7 +1584,7 @@ function openFlowEditor(flow: Flow) {
       shown: editor.shown,
     };
     editorPages.set(id, { page, editor });
-    showTabRuns();
+    runs.show();
   }
   openPage(id);
 }
@@ -1965,7 +1772,7 @@ setInterval(checkStore, STORE_POLL_MS);
 // Directories and the Claude in terminal tabs change without telling misag, and
 // flow runs move on in the Stop hook.
 setInterval(pollTabs, TAB_POLL_MS);
-setInterval(pollRuns, TAB_POLL_MS);
+setInterval(runs.poll, TAB_POLL_MS);
 // `misag flow import` adds flows without telling the app.
 setInterval(() => void flows.refresh(), TAB_POLL_MS);
 setInterval(reloadHistoryIfShown, HISTORY_POLL_MS);
@@ -1976,6 +1783,5 @@ restore()
     setNotice("load", "Saved tabs could not be restored, so changes are not saved this session.", false);
   })
   .finally(() => {
-    tabsRestored = true;
-    showTabRuns();
+    runs.restored();
   });

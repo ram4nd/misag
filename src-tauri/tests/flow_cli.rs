@@ -31,10 +31,19 @@ fn database(name: &str) -> PathBuf {
     path
 }
 
-/// Runs `misag <args>` with `MISAG_DB` set to `db` (unset with None), feeding it `input`.
+/// Runs `misag <args>` with `MISAG_DB` set to `db` (unset with None), feeding it
+/// `input`, as from a terminal outside misag's tabs.
 fn misag(db: Option<&Path>, args: &[&str], input: &str) -> Output {
+    misag_in(None, db, args, input)
+}
+
+/// `misag`, run in misag's tab `tab` when given (`MISAG_TAB` set).
+fn misag_in(tab: Option<&str>, db: Option<&Path>, args: &[&str], input: &str) -> Output {
     let mut command = Command::new(EXE);
-    command.args(args).env_remove(claude::DB_ENV).env("HOME", temp_dir("flow-cli-home"));
+    command.args(args).env_remove(claude::DB_ENV).env_remove(claude::TAB_ENV).env("HOME", temp_dir("flow-cli-home"));
+    if let Some(tab) = tab {
+        command.env(claude::TAB_ENV, tab);
+    }
     command.env_remove("XDG_DATA_HOME");
     if let Some(db) = db {
         command.env(claude::DB_ENV, db);
@@ -90,6 +99,18 @@ fn a_flow_from_stdin_is_added_and_listed_with_what_keeps_it_from_running() {
     assert_eq!(out(&o), "Added \"Fix it\" as flow 1.\nBefore it can run:\n- \"Check\" cannot be reached from Start.\n");
     let o = misag(Some(&db), &["flow", "list"], "");
     assert_eq!(out(&o), "1\tFix it\n");
+}
+
+#[test]
+fn a_flow_added_from_a_tab_must_be_confirmed_in_the_app_before_it_runs() {
+    let db = database("flow-cli-import-tab");
+    let o = misag_in(Some("tab-1"), Some(&db), &["flow", "import", "-"], FLOW);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("confirm it in the app"), "{}", out(&o));
+    let o = misag(Some(&db), &["flow", "list"], "");
+    assert_eq!(out(&o), "1\tFix it\t(not yet confirmed)\n");
+    let app = db::Db::open(db).unwrap();
+    assert!(app.list_flows().unwrap()[0].unconfirmed);
 }
 
 #[test]
