@@ -100,6 +100,8 @@ const win = vi.hoisted(() => ({
   closeRequested: undefined as undefined | (() => Promise<unknown>),
   /** Whether the last close request was cancelled. */
   prevented: false,
+  /** How often the window was brought to the front. */
+  focused: 0,
 }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -110,17 +112,23 @@ vi.mock("@tauri-apps/api/window", () => ({
       };
       return () => {};
     },
+    setFocus: async () => {
+      win.focused++;
+    },
   }),
 }));
 
-// The webview is faked the same way: `drop.files` drops paths on it as a file manager would.
+// The webview is faked like the window above: `drop.emit` sends it a drag-and-drop event
+// as a file manager would, and `drop.fails` makes listening for them fail.
 const drop = vi.hoisted(() => ({
-  files: undefined as undefined | ((paths: string[]) => void),
+  emit: undefined as undefined | ((payload: { type: string; paths?: string[] }) => void),
+  fails: false,
 }));
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({
     onDragDropEvent: async (handler: (event: { payload: { type: string; paths?: string[] } }) => void) => {
-      drop.files = (paths) => handler({ payload: { type: "drop", paths } });
+      if (drop.fails) throw new Error("no events");
+      drop.emit = (payload) => handler({ payload });
       return () => {};
     },
   }),
@@ -421,6 +429,8 @@ beforeEach(() => {
   claudeCheckGate = Promise.resolve();
   resumeReport = { state: "typed" };
   failing = new Set();
+  drop.fails = false;
+  win.focused = 0;
   storeReport = { store: { state: "saving" }, hookProblem: null };
   reported = new Set();
   missingDirs = new Set();
@@ -1963,23 +1973,6 @@ describe("file tree", () => {
     row("my notes.txt").click();
     await settle();
     expect(noticeText()).toContain("could not be typed");
-  });
-
-  test("files dropped on the window are typed into the active tab, shell-quoted", async () => {
-    await boot();
-    await openClaudeTabs(1);
-    drop.files!(["/home/u/a.txt", "/home/u/my notes.txt"]);
-    await settle();
-    expect(typed()).toEqual(["/home/u/a.txt '/home/u/my notes.txt' "]);
-  });
-
-  test("a dropped file that could act as keys types nothing, and says why", async () => {
-    await boot();
-    await openClaudeTabs(1);
-    drop.files!(["/home/u/a.txt", "/home/u/b\rc"]);
-    await settle();
-    expect(noticeText()).toContain("control characters");
-    expect(callsOf("pty_write")).toHaveLength(0);
   });
 
   test("clicking a file while a page is shown types it into the tab and shows the tab", async () => {
@@ -4860,5 +4853,92 @@ describe("sidebar width", () => {
     localStorage.setItem("misag.sidebarWidth", value);
     await boot();
     expect(width()).toBe(expected);
+  });
+});
+
+describe("dropping files on the window", () => {
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) await flush();
+  };
+  const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
+  const dropFiles = async (paths: string[]) => {
+    drop.emit!({ type: "drop", paths });
+    await settle();
+  };
+
+  test("types the dropped paths into the active tab, shell-quoted on one line, and brings the window to the front", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await dropFiles(["/home/u/a.txt", "/home/u/my notes.txt"]);
+    expect(typed()).toEqual(["/home/u/a.txt '/home/u/my notes.txt' "]);
+    expect(win.focused).toBe(1);
+  });
+
+  test("types them as a bracketed paste when the program in the tab asked for one", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    terms()[0].bracketed = true;
+    await dropFiles(["/home/u/a.txt"]);
+    expect(typed()).toEqual(["\x1b[200~/home/u/a.txt \x1b[201~"]);
+  });
+
+  test("ignores dragging over the window, leaving it and an empty drop", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    drop.emit!({ type: "enter", paths: ["/home/u/a.txt"] });
+    drop.emit!({ type: "over" });
+    drop.emit!({ type: "leave" });
+    await dropFiles([]);
+    expect(callsOf("pty_write")).toHaveLength(0);
+    expect(noticeVisible()).toBe(false);
+  });
+
+  test("one path that could act as keys types none, and the notice says so", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await dropFiles(["/home/u/b\rc", "/home/u/a.txt"]);
+    expect(noticeText()).toContain('"/home/u/b\\rc" was not typed: its name contains control characters');
+    expect(noticeText()).toContain("none of the 2 dropped files were");
+    expect(callsOf("pty_write")).toHaveLength(0);
+  });
+
+  test("links and files that are not local are not typed", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await dropFiles(["/home/u/a.txt", "https://example.com/x"]);
+    expect(noticeText()).toContain('"https://example.com/x" was not typed: it is not a local file');
+    await dropFiles(["/home/u/\ufffd.txt"]);
+    expect(noticeText()).toContain("its name could not be read");
+    expect(callsOf("pty_write")).toHaveLength(0);
+  });
+
+  test("too many files at once are not typed, and the notice names only the first", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    await dropFiles(Array.from({ length: 101 }, (_, i) => `/home/u/f${i}`));
+    expect(noticeText()).toContain('"/home/u/f0" and 100 more were not typed: more than 100 files were dropped.');
+    expect(callsOf("pty_write")).toHaveLength(0);
+  });
+
+  test("without a running tab, a notice says so", async () => {
+    await boot();
+    await dropFiles(["/home/u/a.txt", "/home/u/b.txt"]);
+    expect(noticeText()).toContain('"/home/u/a.txt" and 1 more were not typed: no tab is running.');
+  });
+
+  test("a drop while a page is shown is not typed, and says where to drop", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    await settle();
+    await dropFiles(["/home/u/a.txt"]);
+    expect(callsOf("pty_write")).toHaveLength(0);
+    expect(noticeText()).toContain("Drop files on a terminal tab to type their paths.");
+  });
+
+  test("when drops cannot be watched, a notice says so", async () => {
+    drop.fails = true;
+    await boot();
+    expect(noticeText()).toContain("Dropping files on the window will not type their paths");
   });
 });

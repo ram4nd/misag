@@ -7,7 +7,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 import "@wterm/dom/css";
 import { CLAUDE_ICON, fillIcons, icon, type IconName } from "./icons";
-import { folderLabel, shellQuote, untypeable } from "./paths";
+import { folderLabel, notLocal, shellQuote, untypeable } from "./paths";
 import { createTree, type Listing } from "./tree";
 import { createFlows, type Flow } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
@@ -1310,29 +1310,69 @@ async function chooseWorkspace() {
   if (typeof picked === "string") setWorkspace(picked);
 }
 
+/** The most files one drop types; more would flood the tab's prompt. */
+const MAX_DROPPED = 100;
+
+/** `paths` as a notice names them: the first, and how many more. */
+function namePaths(paths: string[]): string {
+  const first = JSON.stringify(paths[0]);
+  return paths.length > 1 ? `${first} and ${paths.length - 1} more` : first;
+}
+
+/** Says why none of `paths` was typed. */
+function refusePaths(paths: string[], why: string) {
+  setNotice("path", `${namePaths(paths)} ${paths.length > 1 ? "were" : "was"} not typed: ${why}.`);
+}
+
+/** Says why `path`, one of `paths`, cannot be typed, and so none of them was. */
+function refusePath(paths: string[], path: string, why: string) {
+  const rest = paths.length > 1 ? `, so none of the ${paths.length} dropped files were` : "";
+  setNotice("path", `${JSON.stringify(path)} was not typed: ${why}${rest}.`);
+}
+
 /**
  * Types the shell-quoted `paths`, each followed by a space, into the active tab, as if
- * the user had, and shows the tab. Says why in a notice when there is no running tab or
- * a path cannot be typed safely, and then types none of them.
+ * the user had (as a bracketed paste if its program asked for one), and shows the tab.
+ * Types none of them and says why in a notice when there is no running tab or a path
+ * cannot be typed safely, and says so when the write fails.
  */
 function insertPaths(paths: string[]) {
   const s = active;
-  const shown = paths.map((p) => JSON.stringify(p)).join(", ");
-  if (!s || s.exited || s.id === null) return setNotice("path", `${shown} was not typed: no tab is running.`);
+  if (!s || s.exited || s.id === null) return refusePaths(paths, "no tab is running");
   for (const path of paths) {
     const why = untypeable(path);
-    if (why) return setNotice("path", `${JSON.stringify(path)} was not typed: ${why}.`);
+    if (why) return refusePath(paths, path, why);
   }
   const text = paths.map((p) => `${shellQuote(p)} `).join("");
-  invoke("pty_write", { id: s.id, data: Array.from(encoder.encode(text)) })
+  const bracketed = s.term.bridge?.bracketedPaste() ?? false;
+  invoke("pty_write", { id: s.id, data: Array.from(encoder.encode(bracketed ? `\x1b[200~${text}\x1b[201~` : text)) })
     .then(() => {
       setNotice("path", null);
       if (sessions.includes(s)) activate(s);
     })
     .catch((err) => {
-      console.error("misag: could not type the path", err);
-      setNotice("path", `${shown} could not be typed: ${errorText(err)}.`);
+      console.error("misag: could not type the paths", s.id, err);
+      setNotice("path", `${namePaths(paths)} could not be typed: ${errorText(err)}.`);
     });
+}
+
+/**
+ * Types the paths of files dropped on the window into the active tab, and brings the
+ * window to the front so the keys typed next go there, not to the file manager. A drop
+ * on a page, of more than MAX_DROPPED files, or of anything but local files types none.
+ */
+function dropFiles(paths: string[]) {
+  if (!paths.length) return;
+  getCurrentWindow()
+    .setFocus()
+    .catch((err) => console.error("misag: could not bring the window to the front", err));
+  if (shownPage !== null) return setNotice("path", "Drop files on a terminal tab to type their paths.");
+  if (paths.length > MAX_DROPPED) return refusePaths(paths, `more than ${MAX_DROPPED} files were dropped`);
+  for (const path of paths) {
+    const why = notLocal(path);
+    if (why) return refusePath(paths, path, why);
+  }
+  insertPaths(paths);
 }
 
 // ---------- spawn dialog, wiring ----------
@@ -1717,6 +1757,13 @@ workspaceInput.onkeydown = (e) => {
 };
 pages.workspace.el.querySelector<HTMLButtonElement>(".home-workspace")!.onclick = () => setWorkspace(null);
 
+/** Watches for files dragged in from a file manager, which reach the app as paths, not as an HTML drop. */
+async function watchFileDrops() {
+  await getCurrentWebview().onDragDropEvent((e) => {
+    if (e.payload.type === "drop") dropFiles(e.payload.paths);
+  });
+}
+
 /**
  * Saves on window close; the handler finishes before the window is destroyed. If
  * saving fails, the first close is cancelled with a warning, and closing again quits.
@@ -1745,13 +1792,6 @@ async function watchWindowClose() {
   });
 }
 
-// Files dragged in from a file manager reach the app as paths, not as an HTML drop.
-getCurrentWebview()
-  .onDragDropEvent((e) => {
-    if (e.payload.type === "drop" && e.payload.paths.length) insertPaths(e.payload.paths);
-  })
-  .catch((err) => console.error("misag: could not watch file drops", err));
-
 renderSessions();
 renderNotices();
 // The tree waits for the stored folder; if the settings cannot be read it shows home, and says so.
@@ -1771,6 +1811,10 @@ queueSettings(async () => {
 watchWindowClose().catch((err) => {
   console.error("misag: could not watch window close", err);
   setNotice("close", "Tabs are saved after each change, but not when the window closes.");
+});
+watchFileDrops().catch((err) => {
+  console.error("misag: could not watch file drops", err);
+  setNotice("drop", `Dropping files on the window will not type their paths: ${errorText(err)}.`);
 });
 const checkStore = () =>
   showStoreStatus().catch((err) => {

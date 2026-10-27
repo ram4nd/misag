@@ -14,6 +14,17 @@ export function untypeable(path: string): string | null {
   return null;
 }
 
+/**
+ * Why dropped `path` is not a local file's path, or null if it is. The webview passes
+ * links and files on remote locations on as they are, and reads names that are not
+ * UTF-8 lossily.
+ */
+export function notLocal(path: string): string | null {
+  if (!path.startsWith("/")) return "it is not a local file";
+  if (path.includes("\ufffd")) return "its name could not be read";
+  return null;
+}
+
 /** What a tab shows for directory `path`: its last folder, `~` for `home` and `/` for the root. */
 export function folderLabel(path: string, home: string | null): string {
   const trimmed = path.replace(/\/+$/, "");

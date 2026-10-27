@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { folderLabel, shellQuote, untypeable } from "./paths";
+import { folderLabel, notLocal, shellQuote, untypeable } from "./paths";
 
 describe("shellQuote", () => {
   test("leaves plain paths alone and single-quotes the rest", () => {
@@ -9,6 +9,16 @@ describe("shellQuote", () => {
     for (const risky of ["$HOME", "`id`", "a;b", "*", "a|b", "~x", "-rf"]) {
       expect(shellQuote(risky).startsWith("'"), risky).toBe(risky !== "-rf");
     }
+  });
+});
+
+describe("notLocal", () => {
+  test("refuses links, remote files, relative paths and names read lossily", () => {
+    expect(notLocal("/p/ok name.txt")).toBeNull();
+    for (const remote of ["https://example.com/x", "sftp://host/x", "trash:///x", "host/x"]) {
+      expect(notLocal(remote), remote).toContain("not a local file");
+    }
+    expect(notLocal("/p/\ufffd.txt")).toContain("could not be read");
   });
 });
 
