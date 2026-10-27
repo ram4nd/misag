@@ -113,6 +113,19 @@ vi.mock("@tauri-apps/api/window", () => ({
   }),
 }));
 
+// The webview is faked the same way: `drop.files` drops paths on it as a file manager would.
+const drop = vi.hoisted(() => ({
+  files: undefined as undefined | ((paths: string[]) => void),
+}));
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (handler: (event: { payload: { type: string; paths?: string[] } }) => void) => {
+      drop.files = (paths) => handler({ payload: { type: "drop", paths } });
+      return () => {};
+    },
+  }),
+}));
+
 // The folder picker answers with `picker.picked` (null: cancelled), or fails if `picker.fails`.
 const picker = vi.hoisted(() => ({
   picked: null as string | null,
@@ -1950,6 +1963,23 @@ describe("file tree", () => {
     row("my notes.txt").click();
     await settle();
     expect(noticeText()).toContain("could not be typed");
+  });
+
+  test("files dropped on the window are typed into the active tab, shell-quoted", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    drop.files!(["/home/u/a.txt", "/home/u/my notes.txt"]);
+    await settle();
+    expect(typed()).toEqual(["/home/u/a.txt '/home/u/my notes.txt' "]);
+  });
+
+  test("a dropped file that could act as keys types nothing, and says why", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    drop.files!(["/home/u/a.txt", "/home/u/b\rc"]);
+    await settle();
+    expect(noticeText()).toContain("control characters");
+    expect(callsOf("pty_write")).toHaveLength(0);
   });
 
   test("clicking a file while a page is shown types it into the tab and shows the tab", async () => {

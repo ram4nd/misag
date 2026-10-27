@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { WTerm } from "@wterm/dom";
 import { homeDir } from "@tauri-apps/api/path";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -1279,7 +1280,7 @@ const workspaceBox = $<HTMLElement>("#workspace-box");
 const tree = createTree(workspaceBox.querySelector<HTMLUListElement>(".tree")!, {
   list: (dir) => invoke<Listing>("fs_list", { dir }),
   errorText,
-  onPickFile: insertPath,
+  onPickFile: (path) => insertPaths([path]),
   onOpenClaude: (dir) => openClaudeTab(undefined, dir),
 });
 
@@ -1310,17 +1311,20 @@ async function chooseWorkspace() {
 }
 
 /**
- * Types the shell-quoted `path` and a space into the active tab, as if the user had,
- * and shows the tab. Says why in a notice when there is no running tab or the path
- * cannot be typed safely.
+ * Types the shell-quoted `paths`, each followed by a space, into the active tab, as if
+ * the user had, and shows the tab. Says why in a notice when there is no running tab or
+ * a path cannot be typed safely, and then types none of them.
  */
-function insertPath(path: string) {
+function insertPaths(paths: string[]) {
   const s = active;
-  const shown = JSON.stringify(path);
+  const shown = paths.map((p) => JSON.stringify(p)).join(", ");
   if (!s || s.exited || s.id === null) return setNotice("path", `${shown} was not typed: no tab is running.`);
-  const why = untypeable(path);
-  if (why) return setNotice("path", `${shown} was not typed: ${why}.`);
-  invoke("pty_write", { id: s.id, data: Array.from(encoder.encode(`${shellQuote(path)} `)) })
+  for (const path of paths) {
+    const why = untypeable(path);
+    if (why) return setNotice("path", `${JSON.stringify(path)} was not typed: ${why}.`);
+  }
+  const text = paths.map((p) => `${shellQuote(p)} `).join("");
+  invoke("pty_write", { id: s.id, data: Array.from(encoder.encode(text)) })
     .then(() => {
       setNotice("path", null);
       if (sessions.includes(s)) activate(s);
@@ -1740,6 +1744,13 @@ async function watchWindowClose() {
     }
   });
 }
+
+// Files dragged in from a file manager reach the app as paths, not as an HTML drop.
+getCurrentWebview()
+  .onDragDropEvent((e) => {
+    if (e.payload.type === "drop" && e.payload.paths.length) insertPaths(e.payload.paths);
+  })
+  .catch((err) => console.error("misag: could not watch file drops", err));
 
 renderSessions();
 renderNotices();
