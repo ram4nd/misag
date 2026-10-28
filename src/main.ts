@@ -51,6 +51,8 @@ interface Session {
   renamed: boolean;
   /** The terminal title starts with a spinner frame: Claude is working, if it runs in the tab (see `showsBusy`). */
   busy: boolean;
+  /** Claude's last turn ended with background tasks in flight, which wake it again (see `showsBusy`). */
+  background: boolean;
   /** Directory the tab was opened in; saves use its live directory when they can. */
   cwd?: string;
   /** The process's current directory, last time it was checked. */
@@ -290,7 +292,7 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, skipsPermissions: false, inClaude: false,
+    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, background: false, skipsPermissions: false, inClaude: false,
     claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
@@ -781,9 +783,14 @@ function tabTitle(s: Session): string {
   return s.skipsPermissions ? `${text}\n(Claude runs tools without asking: --dangerously-skip-permissions)` : text;
 }
 
-/** Whether the tab shows Claude working: another tool's spinner in a plain shell does not count. */
-function showsBusy(s: Session): boolean {
+/** Whether Claude is mid-turn in the tab: another tool's spinner in a plain shell does not count. */
+function claudeWorking(s: Session): boolean {
   return s.busy && !s.exited && (s.run.kind === "claude" || s.inClaude);
+}
+
+/** Whether the tab shows Claude working: mid-turn, or waiting on its background tasks. */
+function showsBusy(s: Session): boolean {
+  return claudeWorking(s) || (s.background && !s.exited && (s.run.kind === "claude" || s.inClaude));
 }
 
 /** The tab's icon: a loader while Claude works in it, Claude's while Claude runs in it, else a terminal. */
@@ -828,8 +835,8 @@ homeDir().then(
 let polling = false;
 
 /**
- * Checks the running tabs' directories and the Claude in terminal tabs, so labels
- * and icons follow them. When either changed it saves (a Claude starting or
+ * Checks the running tabs' directories, the Claude in terminal tabs and whether
+ * it waits on background tasks, so labels and icons follow them. When either changed it saves (a Claude starting or
  * quitting in a terminal tab changes nothing else) and redraws the Session history
  * box, whose marks of the tabs that have a session open may have changed. Answers for a tab that exited,
  * restarted or closed meanwhile are dropped.
@@ -841,15 +848,20 @@ async function pollTabs() {
   polling = true;
   try {
     const terminals = running.filter(({ s }) => s.run.kind === "terminal");
-    const [cwds, claudes] = await Promise.all([
+    const [cwds, claudes, background] = await Promise.all([
       liveCwds(running.map(({ id }) => id)),
       claudeStates(terminals.map(({ s }) => s)),
+      backgroundTabs(),
     ]);
     let changed = false;
     for (const { s, id, starts } of running) {
       if (s.exited || s.starts !== starts || !sessions.includes(s)) continue;
       const before = { dir: s.liveCwd, claude: s.claudeOpen };
       if (s.run.kind === "terminal") followClaude(s, claudes[id]);
+      if (background && background.has(s.tabId) !== s.background) {
+        s.background = !s.background;
+        updateTab(s);
+      }
       if (cwds[id]) s.liveCwd = cwds[id];
       if (s.liveCwd === before.dir && s.claudeOpen === before.claude) continue;
       changed = true;
@@ -1151,6 +1163,14 @@ async function liveCwds(ids: number[]): Promise<Record<number, string>> {
     console.error("misag: could not read tab directories", err);
     return {};
   });
+}
+
+/** The tabs whose Claude waits on background tasks, by tab id; undefined (nothing known) if that cannot be checked. */
+async function backgroundTabs(): Promise<Set<string> | undefined> {
+  return invoke<string[]>("background_tabs").then(
+    (tabs) => new Set(tabs),
+    (err) => void console.error("misag: could not check for background tasks", err),
+  );
 }
 
 /** Whether each of the given tabs has a Claude session open, by PTY id; empty (nothing known) if that cannot be checked. */
@@ -1590,7 +1610,8 @@ const runs = createRunController<Session>({
   tabs: () => sessions,
   active: () => active,
   label: tabLabel,
-  busy: showsBusy,
+  // Claude waiting on background tasks takes /clear, and they may never end.
+  busy: claudeWorking,
   live: claudeLive,
   write,
   *editors() {

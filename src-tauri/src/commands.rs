@@ -488,6 +488,12 @@ pub fn claude_open_sessions(
     claude_states(tabs, |id| state.foreground(id), |tab, pid| db.session_run_by(tab, pid), Sessions::process_name, skips)
 }
 
+/// The tabs whose Claude ended its last turn waiting on background tasks.
+#[tauri::command(async)]
+pub fn background_tabs(db: State<'_, Db>) -> Result<Vec<String>, CommandError> {
+    Ok(db.background_tabs()?)
+}
+
 /// Current working directory of each live session, keyed by id.
 #[tauri::command(async)]
 pub fn pty_cwds(state: State<'_, Sessions>, ids: Vec<u32>) -> HashMap<u32, String> {

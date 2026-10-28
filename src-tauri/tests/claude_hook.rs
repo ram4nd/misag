@@ -237,3 +237,32 @@ fn stop_payloads_it_cannot_use_are_logged_without_output() {
     assert!(log.contains("could not move the flow run on"), "{log}");
     assert!(log.contains("Notification"), "{log}");
 }
+
+#[test]
+fn a_stop_records_whether_claude_waits_on_background_tasks() {
+    let dir = temp_dir("hook-background");
+    let (app, db_path) = app_db(&dir);
+    let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
+    let stop = |tasks: serde_json::Value| {
+        let payload = serde_json::json!({
+            "session_id": SESSION, "hook_event_name": "Stop", "last_assistant_message": "Waiting.", "background_tasks": tasks,
+        });
+        assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, &payload.to_string()).success());
+    };
+    let shell = serde_json::json!([{ "id": "b1", "type": "shell", "status": "running", "command": "sleep 60" }]);
+
+    // Without a session start there is no Claude to mark.
+    stop(shell.clone());
+    assert!(app.background_tabs().unwrap().is_empty());
+
+    assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, &payload(SESSION)).success());
+    stop(shell.clone());
+    assert_eq!(app.background_tabs().unwrap(), ["t1"]);
+    stop(serde_json::json!([]));
+    assert!(app.background_tabs().unwrap().is_empty());
+
+    // A new session starts with nothing in flight.
+    stop(shell);
+    assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, &payload(SESSION)).success());
+    assert!(app.background_tabs().unwrap().is_empty());
+}

@@ -182,6 +182,7 @@ pub fn run() {
             commands::pty_kill,
             commands::pty_reset,
             commands::pty_cwds,
+            commands::background_tabs,
             commands::layout_load,
             commands::layout_save,
             commands::store_status,

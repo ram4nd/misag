@@ -355,9 +355,14 @@ struct Event {
     hook_event_name: Option<String>,
 }
 
-/// The part of Claude's Stop payload the flow runner reads.
+/// The part of Claude's Stop payload misag reads.
 #[derive(Deserialize)]
 struct Stop {
+    session_id: Option<String>,
+    /// Tasks still in flight, such as background shells and subagents, which wake
+    /// Claude when they finish; older Claude Code versions do not report them.
+    #[serde(default)]
+    background_tasks: Vec<serde_json::Value>,
     /// Claude's final reply; older Claude Code versions do not report it, and the
     /// run then waits for the person, saying so.
     last_assistant_message: Option<String>,
@@ -386,13 +391,21 @@ fn continuation(prompt: &str) -> String {
     output.to_string()
 }
 
-/// Moves the tab's flow run on after Claude ended a turn, returning the hook output
+/// Records whether Claude waits on background tasks and moves the tab's flow run
+/// on after Claude ended a turn, returning the hook output
 /// that hands Claude the next prompt, if there is one.
 fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
     let event: Stop = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
     // Across an upgrade (the app not yet restarted) runs cannot be read; every turn
     // of every tab ends here, so that is not logged each time.
     let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
+    if let Some(session) = &event.session_id {
+        // So the tab shows Claude still working while it waits on them. Logged
+        // rather than returned, so the flow run still moves on.
+        if let Err(e) = db::record_background(&conn, tab_id, session, !event.background_tasks.is_empty()) {
+            log_failure(Some(db_path), Some(tab_id), &format!("could not record background tasks: {e}"));
+        }
+    }
     match crate::runs::on_stop(&mut conn, tab_id, event.last_assistant_message.as_deref()) {
         Ok(prompt) => Ok(prompt.as_deref().map(continuation)),
         Err(e) => {

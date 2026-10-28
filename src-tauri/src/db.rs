@@ -159,6 +159,10 @@ const MIGRATIONS: &[&str] = &[r#"
         SELECT 1 FROM json_each(graph, '$.nodes')
         WHERE json_extract(value, '$.kind') = 'start' AND trim(COALESCE(json_extract(value, '$.text'), '')) <> ''
     );
+"#, r#"
+    -- 1 while the tab's Claude ended its turn with background tasks in flight,
+    -- which wake it again (see claude::stopped).
+    ALTER TABLE claude_sessions ADD COLUMN background INTEGER NOT NULL DEFAULT 0 CHECK (background IN (0, 1));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -661,6 +665,13 @@ impl Db {
             .map_err(sql)
     }
 
+    /// The tabs whose Claude ended its last turn waiting on background tasks.
+    pub fn background_tabs(&self) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT tab_id FROM claude_sessions WHERE background = 1 ORDER BY tab_id").map_err(sql)?;
+        stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)
+    }
+
     /// Drops hook reports for tabs that no longer exist, and forgets the Claude
     /// processes of the last run: they are gone, and a new process could reuse a
     /// pid. Run at startup; the single-instance guard means no other misag's tabs
@@ -669,7 +680,7 @@ impl Db {
         self.conn()
             .execute_batch(
                 "DELETE FROM claude_sessions WHERE tab_id NOT IN (SELECT tab_id FROM tabs);
-                 UPDATE claude_sessions SET claude_pid = NULL;",
+                 UPDATE claude_sessions SET claude_pid = NULL, background = 0;",
             )
             .map_err(sql)
     }
@@ -1102,7 +1113,7 @@ pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Resul
          ON CONFLICT (tab_id) DO UPDATE SET
             session_id = excluded.session_id, source = excluded.source, cwd = excluded.cwd,
             transcript_path = excluded.transcript_path, updated_at = excluded.updated_at,
-            claude_pid = excluded.claude_pid",
+            claude_pid = excluded.claude_pid, background = 0",
         params![
             report.tab_id.as_str(),
             report.session_id.as_str(),
@@ -1112,6 +1123,17 @@ pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Resul
             now,
             report.claude_pid
         ],
+    )
+    .map(drop)
+    .map_err(sql)
+}
+
+/// Records whether the session `session_id` in `tab_id` ended its turn with
+/// background tasks in flight; a session the tab is no longer in is left alone.
+pub fn record_background(conn: &Connection, tab_id: &TabId, session_id: &str, background: bool) -> Result<(), String> {
+    conn.execute(
+        "UPDATE claude_sessions SET background = ?3 WHERE tab_id = ?1 AND session_id = ?2 AND background <> ?3",
+        params![tab_id.as_str(), session_id, background],
     )
     .map(drop)
     .map_err(sql)
@@ -1543,7 +1565,9 @@ pub(crate) mod tests {
         db.save_layout(Layout { active: 0, tabs: vec![terminal_tab("t")] }).unwrap();
         let conn = connect_existing(&path).unwrap();
         record_claude_session(&conn, &SessionReport { claude_pid: Some(42), ..report(&tid("t"), &sid(S1)) }).unwrap();
+        record_background(&conn, &tid("t"), S1, true).unwrap();
         db.prune_claude_sessions().unwrap();
+        assert!(db.background_tabs().unwrap().is_empty(), "its background tasks went with it");
         // A new process reusing pid 42 must not look like the old Claude.
         assert_eq!(db.session_run_by(&tid("t"), 42).unwrap(), None);
         assert_eq!(db.reported_session(&tid("t")).unwrap(), Some(sid(S1)), "the report itself is kept");
@@ -1984,7 +2008,7 @@ pub(crate) mod tests {
     fn upgrading_asks_before_running_a_flow_whose_hidden_start_text_now_goes_to_claude() {
         let path = temp_db("upgrade-base-info");
         let conn = Connection::open(&path).unwrap();
-        let before = MIGRATIONS.len() - 1;
+        let before = MIGRATIONS.iter().position(|m| m.contains("ADD COLUMN briefed")).unwrap();
         conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
         conn.pragma_update(None, "user_version", before as i64).unwrap();
         let start = |text: &str, version: u32| {

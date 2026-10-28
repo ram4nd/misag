@@ -200,6 +200,8 @@ let openClaudes: Record<number, string>;
 let claudeStates: Record<number, { state: "unknown" } | { state: "untracked"; pid: number; skipsPermissions?: boolean }>;
 /** PTY ids whose open Claude was started with --dangerously-skip-permissions. */
 let skippingClaudes: Set<number>;
+/** The tab ids background_tabs reports: their Claude waits on background tasks. */
+let backgroundTabs: string[];
 /** claude_open_sessions waits for this, so a test can hold a check back. */
 let claudeCheckGate: Promise<void>;
 /** What pty_spawn reports about a terminal tab's saved Claude session. */
@@ -426,6 +428,7 @@ beforeEach(() => {
   openClaudes = {};
   claudeStates = {};
   skippingClaudes = new Set();
+  backgroundTabs = [];
   claudeCheckGate = Promise.resolve();
   resumeReport = { state: "typed" };
   failing = new Set();
@@ -541,6 +544,7 @@ beforeEach(() => {
         ]),
       ));
     }
+    if (cmd === "background_tabs") return backgroundTabs;
     if (cmd === "pty_cwds") {
       // Like the backend, only the requested sessions are answered.
       const ids = (args as { ids: number[] }).ids;
@@ -805,6 +809,34 @@ describe("tab icons", () => {
     terms()[0].onTitle!("◑ Greeting reply");
     expect(busy()).toEqual([true]);
     terms()[0].onTitle!("✳ Greeting reply");
+    expect(busy()).toEqual([false]);
+  });
+
+  test("a tab shows Claude working while it waits on background tasks", async () => {
+    await boot();
+    await clickClaude();
+    const tabId = spawns()[0].tabId;
+    terms()[0].onTitle!("✳ Claude Code");
+    backgroundTabs = [tabId];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([true]);
+    expect(kind(0)).toBe("loader");
+    backgroundTabs = [];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
+    expect(kind(0)).toBe("claude");
+  });
+
+  test("waiting on background tasks shows only while Claude runs in the tab", async () => {
+    await boot();
+    await clickTerminal();
+    backgroundTabs = [spawns()[0].tabId];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
+    openClaudes[1] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([true]);
+    spawns()[0].onExit.onmessage(0);
     expect(busy()).toEqual([false]);
   });
 
