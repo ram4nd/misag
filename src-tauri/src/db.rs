@@ -160,9 +160,11 @@ const MIGRATIONS: &[&str] = &[r#"
         WHERE json_extract(value, '$.kind') = 'start' AND trim(COALESCE(json_extract(value, '$.text'), '')) <> ''
     );
 "#, r#"
-    -- 1 while the tab's Claude ended its turn with background tasks in flight,
-    -- which wake it again (see claude::stopped).
-    ALTER TABLE claude_sessions ADD COLUMN background INTEGER NOT NULL DEFAULT 0 CHECK (background IN (0, 1));
+    -- When (unix ms) the tab's session last ended a turn with background tasks in
+    -- flight, which wake Claude again; NULL while it waits on none. Set and cleared
+    -- by the Stop hook, cleared by SessionStart, SessionEnd and startup pruning
+    -- (see claude::stopped).
+    ALTER TABLE claude_sessions ADD COLUMN background_at INTEGER;
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -665,22 +667,25 @@ impl Db {
             .map_err(sql)
     }
 
-    /// The tabs whose Claude ended its last turn waiting on background tasks.
-    pub fn background_tabs(&self) -> Result<Vec<String>, String> {
+    /// When (unix ms) each tab's Claude ended its last turn waiting on background
+    /// tasks, by tab id; tabs waiting on none are left out.
+    pub fn background_tabs(&self) -> Result<HashMap<String, i64>, String> {
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT tab_id FROM claude_sessions WHERE background = 1 ORDER BY tab_id").map_err(sql)?;
-        stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)
+        let mut stmt = conn
+            .prepare("SELECT tab_id, background_at FROM claude_sessions WHERE background_at IS NOT NULL")
+            .map_err(sql)?;
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)
     }
 
     /// Drops hook reports for tabs that no longer exist, and forgets the Claude
-    /// processes of the last run: they are gone, and a new process could reuse a
-    /// pid. Run at startup; the single-instance guard means no other misag's tabs
+    /// processes of the last run and the background tasks they waited on: they are
+    /// gone, and a new process could reuse a pid. Run at startup; the single-instance guard means no other misag's tabs
     /// can be reporting.
     pub fn prune_claude_sessions(&self) -> Result<(), String> {
         self.conn()
             .execute_batch(
                 "DELETE FROM claude_sessions WHERE tab_id NOT IN (SELECT tab_id FROM tabs);
-                 UPDATE claude_sessions SET claude_pid = NULL, background = 0;",
+                 UPDATE claude_sessions SET claude_pid = NULL, background_at = NULL;",
             )
             .map_err(sql)
     }
@@ -1102,8 +1107,8 @@ pub fn load_settings(conn: &Connection) -> Result<Settings, String> {
     .map_err(sql)
 }
 
-/// Records the session a tab is now in, replacing any earlier report for it. The
-/// tab may not be saved yet (the hook can run before the first save), so this does
+/// Records the session a tab is now in, replacing any earlier report for it; a new
+/// session waits on no background tasks yet. The tab may not be saved yet (the hook can run before the first save), so this does
 /// not require a `tabs` row; startup pruning removes reports for tabs that are gone.
 pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Result<(), String> {
     let now = i64::try_from(unix_secs(SystemTime::now())).unwrap_or(i64::MAX);
@@ -1113,7 +1118,7 @@ pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Resul
          ON CONFLICT (tab_id) DO UPDATE SET
             session_id = excluded.session_id, source = excluded.source, cwd = excluded.cwd,
             transcript_path = excluded.transcript_path, updated_at = excluded.updated_at,
-            claude_pid = excluded.claude_pid, background = 0",
+            claude_pid = excluded.claude_pid, background_at = NULL",
         params![
             report.tab_id.as_str(),
             report.session_id.as_str(),
@@ -1129,11 +1134,16 @@ pub fn record_claude_session(conn: &Connection, report: &SessionReport) -> Resul
 }
 
 /// Records whether the session `session_id` in `tab_id` ended its turn with
-/// background tasks in flight; a session the tab is no longer in is left alone.
+/// background tasks in flight, and when, so the app can tell a later turn that
+/// ended unreported (an interrupt) from this one; a session the tab is no longer
+/// in is left alone.
 pub fn record_background(conn: &Connection, tab_id: &TabId, session_id: &str, background: bool) -> Result<(), String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    // Clearing what is already clear writes nothing, as most turns end with no tasks.
     conn.execute(
-        "UPDATE claude_sessions SET background = ?3 WHERE tab_id = ?1 AND session_id = ?2 AND background <> ?3",
-        params![tab_id.as_str(), session_id, background],
+        "UPDATE claude_sessions SET background_at = ?3
+         WHERE tab_id = ?1 AND session_id = ?2 AND (?3 IS NOT NULL OR background_at IS NOT NULL)",
+        params![tab_id.as_str(), session_id, background.then_some(now)],
     )
     .map(drop)
     .map_err(sql)
@@ -1571,6 +1581,39 @@ pub(crate) mod tests {
         // A new process reusing pid 42 must not look like the old Claude.
         assert_eq!(db.session_run_by(&tid("t"), 42).unwrap(), None);
         assert_eq!(db.reported_session(&tid("t")).unwrap(), Some(sid(S1)), "the report itself is kept");
+    }
+
+    #[test]
+    fn background_tasks_are_recorded_only_for_the_tabs_current_session() {
+        let path = temp_db("background-session");
+        let db = Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        record_claude_session(&conn, &report(&tid("t"), &sid(S1))).unwrap();
+        // A late Stop from a session the tab has left.
+        record_background(&conn, &tid("t"), S2, true).unwrap();
+        assert!(db.background_tabs().unwrap().is_empty());
+        record_background(&conn, &tid("t"), S1, true).unwrap();
+        assert_eq!(db.background_tabs().unwrap().into_keys().collect::<Vec<_>>(), ["t"]);
+        record_background(&conn, &tid("t"), S1, false).unwrap();
+        assert!(db.background_tabs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrading_leaves_reported_sessions_waiting_on_nothing() {
+        let path = temp_db("upgrade-background");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.iter().position(|m| m.contains("ADD COLUMN background_at")).unwrap();
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        conn.execute(
+            "INSERT INTO claude_sessions (tab_id, session_id, updated_at) VALUES ('t', ?1, 0)",
+            [S1],
+        )
+        .unwrap();
+        drop(conn);
+        let db = Db::open(path.clone()).unwrap();
+        assert!(db.background_tabs().unwrap().is_empty());
+        assert_eq!(db.reported_session(&tid("t")).unwrap(), Some(sid(S1)));
     }
 
     #[test]
@@ -2064,7 +2107,7 @@ pub(crate) mod tests {
     fn upgrading_keeps_the_settings_and_adds_the_font_size() {
         let path = temp_db("upgrade-font-size");
         let conn = Connection::open(&path).unwrap();
-        let before = MIGRATIONS.len() - 1;
+        let before = MIGRATIONS.iter().position(|m| m.contains("ADD COLUMN font_size")).unwrap();
         conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
         conn.pragma_update(None, "user_version", before as i64).unwrap();
         conn.execute("UPDATE settings SET skip_permissions = 1", []).unwrap();

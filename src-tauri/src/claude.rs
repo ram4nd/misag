@@ -1,13 +1,15 @@
 //! Launching Claude Code in Claude tabs, and the hook that reports which session
-//! each tab is in and moves the tab's flow run on.
+//! each tab is in, whether its Claude waits on background tasks, and moves the
+//! tab's flow run on.
 //!
 //! Each Claude tab runs `claude` with a hook passed through `--settings`, so the
 //! user's own Claude configuration is untouched. The hook is misag's own binary
 //! in `--claude-hook` mode, for the tab named by `MISAG_TAB`. Claude runs it
 //! whenever a session starts (launch, `--resume`, `/resume`, `/clear`, compaction),
-//! and it records the session in the database; and whenever Claude ends a turn
-//! (Stop), and it moves the tab's flow run on (see `runs`), printing the next
-//! prompt for Claude when there is one.
+//! and it records the session in the database; whenever Claude ends a turn
+//! (Stop), and it records whether Claude waits on background tasks and moves the
+//! tab's flow run on (see `runs`), printing the next prompt for Claude when there
+//! is one; and when the session ends (SessionEnd), so the tab waits on nothing.
 //!
 //! Terminal tabs find a `claude` wrapper first on their `PATH` (see
 //! `install_wrapper`), which hands `claude` to `misag --claude-launch`: that
@@ -185,15 +187,16 @@ pub fn hook_command(exe: &Path) -> String {
 }
 
 /// The `--settings` JSON: `keys` (from misag's own settings) plus, with `hook_exe`,
-/// misag's hook for SessionStart (to record the tab's session) and Stop (to move
-/// the tab's flow run on). None when there are no keys and no hook, so no
+/// misag's hook for SessionStart (to record the tab's session), Stop (to record
+/// background tasks and move the tab's flow run on) and SessionEnd (to forget the
+/// background tasks). None when there are no keys and no hook, so no
 /// `--settings` is passed.
 fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
     if let Some(exe) = hook_exe {
         debug_assert!(!keys.contains_key("hooks"), "a setting would replace misag's hook");
         let command = hook_command(exe);
         let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]);
-        keys.insert("hooks".into(), serde_json::json!({ "SessionStart": hook, "Stop": hook }));
+        keys.insert("hooks".into(), serde_json::json!({ "SessionStart": hook, "Stop": hook, "SessionEnd": hook }));
     }
     (!keys.is_empty()).then(|| Value::Object(keys).to_string())
 }
@@ -358,14 +361,31 @@ struct Event {
 /// The part of Claude's Stop payload misag reads.
 #[derive(Deserialize)]
 struct Stop {
+    /// Claude Code always sends it; without it the tab's session cannot be matched.
     session_id: Option<String>,
     /// Tasks still in flight, such as background shells and subagents, which wake
-    /// Claude when they finish; older Claude Code versions do not report them.
+    /// Claude when they finish: a list, empty when there are none. Older Claude Code
+    /// versions do not report them. Any value is accepted, and only a non-empty
+    /// list counts, so a payload shape this version does not expect cannot stop the
+    /// flow run from moving on.
     #[serde(default)]
-    background_tasks: Vec<serde_json::Value>,
+    background_tasks: Option<Value>,
     /// Claude's final reply; older Claude Code versions do not report it, and the
     /// run then waits for the person, saying so.
     last_assistant_message: Option<String>,
+}
+
+impl Stop {
+    /// Whether Claude ended the turn waiting on background tasks.
+    fn waits(&self) -> bool {
+        matches!(&self.background_tasks, Some(Value::Array(tasks)) if !tasks.is_empty())
+    }
+}
+
+/// The part of Claude's SessionEnd payload misag reads.
+#[derive(Deserialize)]
+struct SessionEnd {
+    session_id: String,
 }
 
 /// What the hook did.
@@ -373,9 +393,12 @@ struct Stop {
 enum Outcome {
     /// Recorded the session a tab is now in.
     Recorded,
-    /// Handled a Stop (the tab's flow run, if any, moved on), with the hook output
+    /// Handled a Stop (background tasks recorded, the tab's flow run, if any, moved
+    /// on), with the hook output
     /// that hands Claude the next prompt, if there is one.
     Stopped(Option<String>),
+    /// Recorded that a session ended, so its tab waits on no background tasks.
+    Ended,
 }
 
 /// The hook output that has Claude go on with `prompt`. Context rather than a
@@ -391,20 +414,22 @@ fn continuation(prompt: &str) -> String {
     output.to_string()
 }
 
-/// Records whether Claude waits on background tasks and moves the tab's flow run
-/// on after Claude ended a turn, returning the hook output
-/// that hands Claude the next prompt, if there is one.
+/// After Claude ended a turn, records whether it waits on background tasks, then
+/// moves the tab's flow run on, returning the hook output that hands Claude the
+/// next prompt, if there is one.
 fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
     let event: Stop = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
     // Across an upgrade (the app not yet restarted) runs cannot be read; every turn
     // of every tab ends here, so that is not logged each time.
     let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
-    if let Some(session) = &event.session_id {
-        // So the tab shows Claude still working while it waits on them. Logged
-        // rather than returned, so the flow run still moves on.
-        if let Err(e) = db::record_background(&conn, tab_id, session, !event.background_tasks.is_empty()) {
-            log_failure(Some(db_path), Some(tab_id), &format!("could not record background tasks: {e}"));
-        }
+    // So the tab keeps showing Claude working while it waits on background tasks.
+    // A failure is logged rather than returned, so the flow run still moves on.
+    let recorded = match &event.session_id {
+        Some(session) => db::record_background(&conn, tab_id, session, event.waits()),
+        None => Err("the Stop payload had no session id".into()),
+    };
+    if let Err(e) = recorded {
+        log_failure(Some(db_path), Some(tab_id), &format!("could not record background tasks: {e}"));
     }
     match crate::runs::on_stop(&mut conn, tab_id, event.last_assistant_message.as_deref()) {
         Ok(prompt) => Ok(prompt.as_deref().map(continuation)),
@@ -419,8 +444,17 @@ fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>
     }
 }
 
+/// Records that a session ended, so its tab no longer shows Claude waiting on
+/// background tasks, which end with it.
+fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
+    let event: SessionEnd = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
+    let Some(conn) = db::connect_if_current(db_path)? else { return Ok(()) };
+    db::record_background(&conn, tab_id, &event.session_id, false)
+}
+
 /// Reads one hook payload from `input`: a SessionStart is recorded for `tab_id`,
-/// with the Claude process that sent it, and a Stop moves the tab's flow run on.
+/// with the Claude process that sent it, a Stop records the background tasks and
+/// moves the tab's flow run on, and a SessionEnd forgets the background tasks.
 fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<Outcome, String> {
     let (Some(tab_id), Some(db_path)) = (tab_id, db_path) else {
         return Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}"));
@@ -434,6 +468,9 @@ fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, cl
         Some("Stop") => stopped(&payload, tab_id, db_path)
             .map(Outcome::Stopped)
             .map_err(|e| format!("could not move the flow run on: {e}")),
+        Some("SessionEnd") => ended(&payload, tab_id, db_path)
+            .map(|()| Outcome::Ended)
+            .map_err(|e| format!("could not record the end of the Claude session: {e}")),
         Some("SessionStart") | None => record(&payload, tab_id, db_path, claude_pid)
             .map(|()| Outcome::Recorded)
             .map_err(|e| format!("could not record the Claude session: {e}")),
@@ -560,7 +597,7 @@ pub fn run_hook() -> i32 {
             tab_id.as_ref(),
             &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
         ),
-        Ok(Outcome::Recorded | Outcome::Stopped(None)) => {}
+        Ok(Outcome::Recorded | Outcome::Stopped(None) | Outcome::Ended) => {}
         Ok(Outcome::Stopped(Some(output))) => println!("{output}"),
     }
     0
@@ -607,8 +644,10 @@ mod tests {
         let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["command"], "'/opt/my apps/misag' --claude-hook");
-        // The same command runs when Claude ends a turn, to move a flow run on.
+        // The same command runs when Claude ends a turn, to move a flow run on, and
+        // when its session ends, so nothing is left waiting on background tasks.
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0], *hook);
+        assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0], *hook);
         assert_eq!(settings.as_object().unwrap().len(), 1, "only the hook");
     }
 

@@ -49,10 +49,12 @@ interface Session {
   name: string;
   /** True once the user renamed the tab, so terminal titles stop overwriting it. */
   renamed: boolean;
-  /** The terminal title starts with a spinner frame: Claude is working, if it runs in the tab (see `showsBusy`). */
+  /** The terminal title starts with a spinner frame: Claude is working, if it runs in the tab (see `claudeWorking`). */
   busy: boolean;
-  /** Claude's last turn ended with background tasks in flight, which wake it again (see `showsBusy`). */
-  background: boolean;
+  /** When (ms) the tab's Claude last ended a turn with background tasks in flight, which wake it again; null if not (see `waitsInBackground`). */
+  background: number | null;
+  /** When (ms) the latest turn of the tab's Claude began, or this Claude started: a turn ending after the report above makes it stale. */
+  turnStarted: number;
   /** Directory the tab was opened in; saves use its live directory when they can. */
   cwd?: string;
   /** The process's current directory, last time it was checked. */
@@ -292,7 +294,7 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, background: false, skipsPermissions: false, inClaude: false,
+    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, background: null, turnStarted: 0, skipsPermissions: false, inClaude: false,
     claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
@@ -384,6 +386,8 @@ async function spawn(opts: SpawnOptions) {
   term.onTitle = (title) => {
     const busy = BUSY_TITLE.test(title);
     if (busy !== s.busy) {
+      // A turn that ends unreported (interrupted) leaves an earlier wait on background tasks behind.
+      if (busy) s.turnStarted = Date.now();
       s.busy = busy;
       updateTab(s);
     }
@@ -403,6 +407,9 @@ async function spawn(opts: SpawnOptions) {
 async function start(s: Session, fallbackToHome: boolean) {
   const { term } = s;
   const startNo = ++s.starts;
+  // What an earlier Claude in the tab waited on is not this one's.
+  s.turnStarted = Date.now();
+  s.background = null;
   const onData = new Channel<ArrayBuffer>();
   onData.onmessage = (buf) => show(s, new Uint8Array(buf));
   // Attached before pty_spawn runs, so an immediate exit is not missed.
@@ -532,6 +539,7 @@ function markExited(s: Session, message: string, error = false) {
   if (s.closing) return;
   s.exited = true;
   s.busy = false;
+  s.background = null;
   if (s.run.kind === "terminal") {
     s.inClaude = false;
     s.skipsPermissions = false;
@@ -776,21 +784,35 @@ function tabLabel(s: Session): string {
   return s.renamed || !dir ? s.name : folderLabel(dir, home);
 }
 
-/** The tab's tooltip: its title and directory, and a warning while Claude runs tools without asking. */
+/**
+ * The tab's tooltip: its title and directory, whether Claude only waits on
+ * background tasks, and a warning while Claude runs tools without asking.
+ */
 function tabTitle(s: Session): string {
   const dir = tabDir(s);
-  const text = dir ? `${s.name}\n${dir}` : s.name;
+  let text = dir ? `${s.name}\n${dir}` : s.name;
+  if (waitsInBackground(s) && !claudeWorking(s)) text += "\n(Claude is waiting on background tasks)";
   return s.skipsPermissions ? `${text}\n(Claude runs tools without asking: --dangerously-skip-permissions)` : text;
+}
+
+/** Whether Claude runs in the tab now. */
+function claudeHere(s: Session): boolean {
+  return !s.exited && (s.run.kind === "claude" || s.inClaude);
 }
 
 /** Whether Claude is mid-turn in the tab: another tool's spinner in a plain shell does not count. */
 function claudeWorking(s: Session): boolean {
-  return s.busy && !s.exited && (s.run.kind === "claude" || s.inClaude);
+  return s.busy && claudeHere(s);
+}
+
+/** Whether Claude in the tab ended its latest turn waiting on background tasks. */
+function waitsInBackground(s: Session): boolean {
+  return s.background !== null && s.background >= s.turnStarted && claudeHere(s);
 }
 
 /** Whether the tab shows Claude working: mid-turn, or waiting on its background tasks. */
 function showsBusy(s: Session): boolean {
-  return claudeWorking(s) || (s.background && !s.exited && (s.run.kind === "claude" || s.inClaude));
+  return claudeWorking(s) || waitsInBackground(s);
 }
 
 /** The tab's icon: a loader while Claude works in it, Claude's while Claude runs in it, else a terminal. */
@@ -835,10 +857,12 @@ homeDir().then(
 let polling = false;
 
 /**
- * Checks the running tabs' directories, the Claude in terminal tabs and whether
- * it waits on background tasks, so labels and icons follow them. When either changed it saves (a Claude starting or
+ * Checks the running tabs' directories, the Claude in terminal tabs, and which
+ * tabs' Claude waits on background tasks, so labels and icons follow them. When a
+ * directory or a terminal tab's Claude changed it saves (a Claude starting or
  * quitting in a terminal tab changes nothing else) and redraws the Session history
- * box, whose marks of the tabs that have a session open may have changed. Answers for a tab that exited,
+ * box, whose marks of the tabs that have a session open may have changed; a change
+ * in what Claude waits on only redraws its tab. Answers for a tab that exited,
  * restarted or closed meanwhile are dropped.
  */
 async function pollTabs() {
@@ -858,8 +882,9 @@ async function pollTabs() {
       if (s.exited || s.starts !== starts || !sessions.includes(s)) continue;
       const before = { dir: s.liveCwd, claude: s.claudeOpen };
       if (s.run.kind === "terminal") followClaude(s, claudes[id]);
-      if (background && background.has(s.tabId) !== s.background) {
-        s.background = !s.background;
+      const since = background && (background[s.tabId] ?? null);
+      if (since !== undefined && since !== s.background) {
+        s.background = since;
         updateTab(s);
       }
       if (cwds[id]) s.liveCwd = cwds[id];
@@ -1165,10 +1190,13 @@ async function liveCwds(ids: number[]): Promise<Record<number, string>> {
   });
 }
 
-/** The tabs whose Claude waits on background tasks, by tab id; undefined (nothing known) if that cannot be checked. */
-async function backgroundTabs(): Promise<Set<string> | undefined> {
-  return invoke<string[]>("background_tabs").then(
-    (tabs) => new Set(tabs),
+/**
+ * When (ms) each tab's Claude last ended a turn waiting on background tasks, by tab
+ * id; undefined (nothing known) if that cannot be checked, so the tabs keep what
+ * they show.
+ */
+async function backgroundTabs(): Promise<Record<string, number> | undefined> {
+  return invoke<Record<string, number>>("background_tabs").catch(
     (err) => void console.error("misag: could not check for background tasks", err),
   );
 }
@@ -1219,6 +1247,11 @@ function showClaudeIn(s: Session, inClaude: boolean, skipsPermissions: boolean) 
   if (inClaude === s.inClaude && skipsPermissions === s.skipsPermissions) return;
   // A Claude that quit mid-turn leaves its spinner in the title.
   if (!inClaude) s.busy = false;
+  // Nor is what an earlier Claude waited on this one's.
+  if (inClaude !== s.inClaude) {
+    s.turnStarted = Date.now();
+    s.background = null;
+  }
   s.inClaude = inClaude;
   s.skipsPermissions = skipsPermissions;
   updateTab(s);

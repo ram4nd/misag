@@ -200,8 +200,8 @@ let openClaudes: Record<number, string>;
 let claudeStates: Record<number, { state: "unknown" } | { state: "untracked"; pid: number; skipsPermissions?: boolean }>;
 /** PTY ids whose open Claude was started with --dangerously-skip-permissions. */
 let skippingClaudes: Set<number>;
-/** The tab ids background_tabs reports: their Claude waits on background tasks. */
-let backgroundTabs: string[];
+/** What background_tabs reports: when each tab's Claude last ended a turn waiting on background tasks (ms), by tab id. */
+let backgroundTabs: Record<string, number>;
 /** claude_open_sessions waits for this, so a test can hold a check back. */
 let claudeCheckGate: Promise<void>;
 /** What pty_spawn reports about a terminal tab's saved Claude session. */
@@ -428,7 +428,7 @@ beforeEach(() => {
   openClaudes = {};
   claudeStates = {};
   skippingClaudes = new Set();
-  backgroundTabs = [];
+  backgroundTabs = {};
   claudeCheckGate = Promise.resolve();
   resumeReport = { state: "typed" };
   failing = new Set();
@@ -544,7 +544,10 @@ beforeEach(() => {
         ]),
       ));
     }
-    if (cmd === "background_tabs") return backgroundTabs;
+    if (cmd === "background_tabs") {
+      if (failing.has(cmd)) throw "background_tabs failed";
+      return backgroundTabs;
+    }
     if (cmd === "pty_cwds") {
       // Like the backend, only the requested sessions are answered.
       const ids = (args as { ids: number[] }).ids;
@@ -798,6 +801,11 @@ describe("tab icons", () => {
   });
 
   const busy = () => tabs().map((t) => t.classList.contains("busy"));
+  /** Waits for the clock to pass the current millisecond, so what happens next is later than what came before. */
+  const nextMs = () => {
+    const now = Date.now();
+    while (Date.now() === now);
+  };
 
   test("a tab shows Claude working while its title has a spinner", async () => {
     await boot();
@@ -816,28 +824,81 @@ describe("tab icons", () => {
     await boot();
     await clickClaude();
     const tabId = spawns()[0].tabId;
+    terms()[0].onTitle!("◐ Claude Code");
     terms()[0].onTitle!("✳ Claude Code");
-    backgroundTabs = [tabId];
+    backgroundTabs = { [tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     expect(busy()).toEqual([true]);
     expect(kind(0)).toBe("loader");
-    backgroundTabs = [];
+    expect(tabs()[0].title).toContain("waiting on background tasks");
+    backgroundTabs = {};
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     expect(busy()).toEqual([false]);
     expect(kind(0)).toBe("claude");
+    expect(tabs()[0].title).not.toContain("background");
+  });
+
+  test("a turn that ends without reporting, such as an interrupted one, stops the wait on background tasks", async () => {
+    await boot();
+    await clickClaude();
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([true]);
+    // The tasks woke Claude, and the person interrupted that turn: no Stop hook ran.
+    nextMs();
+    terms()[0].onTitle!("◐ Claude Code");
+    terms()[0].onTitle!("✳ Claude Code");
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
+  });
+
+  test("a restarted Claude tab does not show what the Claude before it waited on", async () => {
+    await boot();
+    await clickClaude();
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() - 1000 };
+    spawns()[0].onExit.onmessage(1);
+    expect(busy()).toEqual([false]);
+    terms()[0].onData!("\r");
+    await flush();
+    expect(spawns()).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
   });
 
   test("waiting on background tasks shows only while Claude runs in the tab", async () => {
     await boot();
     await clickTerminal();
-    backgroundTabs = [spawns()[0].tabId];
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     expect(busy()).toEqual([false]);
+    // Claude starting in the tab begins after that report, so it is not this Claude's.
+    nextMs();
     openClaudes[1] = SESSION;
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
+    nextMs();
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     expect(busy()).toEqual([true]);
+    delete openClaudes[1];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([false]);
     spawns()[0].onExit.onmessage(0);
     expect(busy()).toEqual([false]);
+  });
+
+  test("a failed check for background tasks keeps what the tabs showed, and the rest of the check still runs", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickClaude();
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    failing.add("background_tabs");
+    liveCwds[1] = "/home/me/other";
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(busy()).toEqual([true]);
+    expect(tabs()[0].querySelector(".name")!.textContent).toBe("other");
+    expect(error).toHaveBeenCalledWith("misag: could not check for background tasks", "background_tabs failed");
   });
 
   test("a working Claude tab shows a loader in place of the Claude icon", async () => {
@@ -3764,6 +3825,18 @@ describe("flow runs", () => {
     expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
     expect(typed()).toEqual([]);
     expect(box().querySelector(".error")!.textContent).toContain("working");
+  });
+
+  test("a flow that clears still starts while Claude only waits on background tasks, as Claude is idle", async () => {
+    storedGraphs[1].nodes[0] = { ...START, clear: true };
+    await boot();
+    await openClaudeTabs(1);
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(tabs()[0].classList.contains("busy")).toBe(true);
+    await playAndEnter("Deploy");
+    expect(callsOf("flow_stop")).toHaveLength(0);
+    expect(typed()).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
   });
 
   test("pressing ▶ again while a flow starts in the tab does not start it twice", async () => {

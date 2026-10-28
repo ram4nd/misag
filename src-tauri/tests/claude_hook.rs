@@ -238,31 +238,84 @@ fn stop_payloads_it_cannot_use_are_logged_without_output() {
     assert!(log.contains("Notification"), "{log}");
 }
 
+/// The tabs the app shows waiting on background tasks.
+fn waiting(app: &db::Db) -> Vec<String> {
+    let mut tabs: Vec<String> = app.background_tabs().unwrap().into_keys().collect();
+    tabs.sort();
+    tabs
+}
+
 #[test]
 fn a_stop_records_whether_claude_waits_on_background_tasks() {
     let dir = temp_dir("hook-background");
     let (app, db_path) = app_db(&dir);
     let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
     let stop = |tasks: serde_json::Value| {
         let payload = serde_json::json!({
             "session_id": SESSION, "hook_event_name": "Stop", "last_assistant_message": "Waiting.", "background_tasks": tasks,
         });
-        assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, &payload.to_string()).success());
+        assert!(run_hook(exe, &env, &payload.to_string()).success());
     };
     let shell = serde_json::json!([{ "id": "b1", "type": "shell", "status": "running", "command": "sleep 60" }]);
 
     // Without a session start there is no Claude to mark.
     stop(shell.clone());
-    assert!(app.background_tabs().unwrap().is_empty());
+    assert!(waiting(&app).is_empty());
 
-    assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, &payload(SESSION)).success());
+    assert!(run_hook(exe, &env, &payload(SESSION)).success());
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
     stop(shell.clone());
-    assert_eq!(app.background_tabs().unwrap(), ["t1"]);
+    let since = app.background_tabs().unwrap()["t1"];
+    assert!(since >= before, "marked with when the turn ended");
     stop(serde_json::json!([]));
-    assert!(app.background_tabs().unwrap().is_empty());
+    assert!(waiting(&app).is_empty());
 
     // A new session starts with nothing in flight.
+    stop(shell.clone());
+    assert!(run_hook(exe, &env, &payload(SESSION)).success());
+    assert!(waiting(&app).is_empty());
+
+    // Nor does a Claude that ended its session leave anything waiting.
     stop(shell);
-    assert!(run_hook(Path::new(env!("CARGO_BIN_EXE_misag")), &env, &payload(SESSION)).success());
-    assert!(app.background_tabs().unwrap().is_empty());
+    assert_eq!(waiting(&app), ["t1"]);
+    let end = serde_json::json!({ "session_id": SESSION, "hook_event_name": "SessionEnd", "reason": "prompt_input_exit" });
+    assert!(run_hook(exe, &env, &end.to_string()).success());
+    assert!(waiting(&app).is_empty());
+    assert!(!dir.join(claude::HOOK_LOG).exists(), "nothing went wrong");
+}
+
+#[test]
+fn a_stop_whose_background_tasks_cannot_be_read_still_moves_the_run_on() {
+    use misag_lib::{flows, runs};
+    let dir = temp_dir("hook-background-odd");
+    let (app, db_path) = app_db(&dir);
+    let graph: flows::Graph = serde_json::from_value(serde_json::json!({ "version": 1, "nodes": [
+        { "id": "start", "kind": "start", "title": "Start", "outputs": ["next"], "x": 0, "y": 0 },
+        { "id": "p", "kind": "prompt", "title": "Fix", "text": "Fix the tests.", "outputs": ["pass"], "x": 0, "y": 0 }
+    ], "edges": [{ "from": "start", "output": "next", "to": "p" }] }))
+    .unwrap();
+    let flow = app.create_flow("F").unwrap().id;
+    app.save_flow_graph(flow, &graph).unwrap();
+    let conn = db::connect_existing(&db_path).unwrap();
+    let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
+    assert!(run_hook(exe, &env, &payload(SESSION)).success());
+
+    for odd in [serde_json::Value::Null, serde_json::json!({}), serde_json::json!("none")] {
+        runs::start(&mut db::connect_existing(&db_path).unwrap(), flow, &TabId::parse("t1").unwrap()).unwrap();
+        let stop = serde_json::json!({
+            "session_id": SESSION, "hook_event_name": "Stop", "last_assistant_message": "Fixed.\nFLOW: pass", "background_tasks": odd,
+        });
+        assert!(run_hook(exe, &env, &stop.to_string()).success());
+        assert!(runs::active(&conn).unwrap().is_empty(), "{odd}: the run ended");
+        assert!(waiting(&app).is_empty(), "{odd}: nothing waits");
+    }
+    assert!(!dir.join(claude::HOOK_LOG).exists(), "nothing went wrong");
+
+    // A Stop without a session id cannot be matched to the tab's session, and says so.
+    let anonymous = serde_json::json!({ "hook_event_name": "Stop", "last_assistant_message": "Done.", "background_tasks": [] });
+    assert!(run_hook(exe, &env, &anonymous.to_string()).success());
+    let log = std::fs::read_to_string(dir.join(claude::HOOK_LOG)).unwrap();
+    assert!(log.contains("no session id"), "{log}");
 }

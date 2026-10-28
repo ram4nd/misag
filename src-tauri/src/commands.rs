@@ -488,9 +488,10 @@ pub fn claude_open_sessions(
     claude_states(tabs, |id| state.foreground(id), |tab, pid| db.session_run_by(tab, pid), Sessions::process_name, skips)
 }
 
-/// The tabs whose Claude ended its last turn waiting on background tasks.
+/// When (unix ms) each tab's Claude ended its last turn waiting on background
+/// tasks, by tab id; tabs waiting on none are left out.
 #[tauri::command(async)]
-pub fn background_tabs(db: State<'_, Db>) -> Result<Vec<String>, CommandError> {
+pub fn background_tabs(db: State<'_, Db>) -> Result<HashMap<String, i64>, CommandError> {
     Ok(db.background_tabs()?)
 }
 
