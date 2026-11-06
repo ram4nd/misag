@@ -350,7 +350,8 @@ pub fn problems(graph: &Graph) -> Vec<String> {
         }
     }
     let mut problems = Vec::new();
-    for node in &graph.nodes {
+    // Steps Start cannot reach never run, so they are left alone.
+    for node in graph.nodes.iter().filter(|n| reached.contains(n.id.as_str())) {
         let name = node.name();
         if node.kind == Kind::Prompt && node.text.trim().is_empty() {
             problems.push(format!("\"{name}\" has no prompt."));
@@ -364,9 +365,6 @@ pub fn problems(graph: &Graph) -> Vec<String> {
         // Start must lead somewhere; other outputs with no next step end the flow there.
         if node.kind == Kind::Start && !graph.edges.iter().any(|e| e.from == node.id) {
             problems.push("Start is not connected to a step.".into());
-        }
-        if !reached.contains(node.id.as_str()) {
-            problems.push(format!("\"{name}\" cannot be reached from Start."));
         }
     }
     problems
@@ -658,16 +656,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn steps_start_cannot_reach_are_ignored() {
+        let mut g = runnable();
+        g.nodes.push(node("x", Kind::End, &[]));
+        g.nodes.push(Node { text: String::new(), ..node("q", Kind::Prompt, &["done"]) });
+        g.nodes.push(node("m", Kind::Manual, &["ok", "redo"]));
+        g.edges.push(edge("q", "done", "m"));
+        assert!(problems(&g).is_empty());
+    }
+
+    #[test]
     fn problems_name_the_steps_in_order() {
         let mut g = runnable();
         g.nodes[1].text = "  ".into();
         // An output with no next step ends the flow there, which is fine.
         g.edges.retain(|e| e.output != "fail");
         g.nodes.push(Node { title: String::new(), ..node("m", Kind::Manual, &["done"]) });
-        assert_eq!(
-            problems(&g),
-            vec!["\"P\" has no prompt.", "\"Manual step\" cannot be reached from Start."]
-        );
+        assert_eq!(problems(&g), vec!["\"P\" has no prompt."]);
         let mut g = runnable();
         g.nodes.remove(0);
         g.edges.remove(0);

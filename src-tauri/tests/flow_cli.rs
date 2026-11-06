@@ -17,7 +17,7 @@ const FLOW: &str = r#"{
   "graph": {
     "nodes": [
       {"id": "start", "kind": "start"},
-      {"id": "fix", "kind": "prompt", "title": "Fix", "text": "Fix the tests.", "outputs": ["done"]},
+      {"id": "fix", "kind": "prompt", "title": "Fix", "text": "", "outputs": ["done"]},
       {"id": "check", "kind": "manual", "title": "Check", "outputs": ["ok"]}
     ],
     "edges": [{"from": "start", "output": "next", "to": "fix"}]
@@ -96,7 +96,7 @@ fn a_flow_from_stdin_is_added_and_listed_with_what_keeps_it_from_running() {
     let db = database("flow-cli-import");
     let o = misag(Some(&db), &["flow", "import", "-"], FLOW);
     assert!(o.status.success(), "{}", err(&o));
-    assert_eq!(out(&o), "Added \"Fix it\" as flow 1.\nBefore it can run:\n- \"Check\" cannot be reached from Start.\n");
+    assert_eq!(out(&o), "Added \"Fix it\" as flow 1.\nBefore it can run:\n- \"Fix\" has no prompt.\n");
     let o = misag(Some(&db), &["flow", "list"], "");
     assert_eq!(out(&o), "1\tFix it\n");
 }
