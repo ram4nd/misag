@@ -23,7 +23,7 @@ Built with Tauri 2, a Rust PTY backend (`portable-pty`), wterm and SQLite.
 
 ## Install
 
-There are no prebuilt releases yet, so build it from source.
+Linux `.deb` and AppImage builds are attached to each GitHub Release. To build it from source instead:
 
 You need:
 
