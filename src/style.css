@@ -179,7 +179,7 @@ body.dragging-toolbox, body.dragging-toolbox * { cursor: grabbing !important; us
 }
 #empty-state {
   position: absolute; inset: 0; display: none; place-items: center; margin: 0;
-  color: #9aa0a6; font-size: 14px;
+  padding: 0 24px; text-align: center; color: #9aa0a6; font-size: 14px;
 }
 body.no-tabs #empty-state { display: grid; }
 
