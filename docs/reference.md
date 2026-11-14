@@ -64,11 +64,10 @@ How every part of Mischief of Agents (`misag`) behaves. For an overview, buildin
 
 ## Windows and macOS
 
-- The `.msi` installs `misag-cli.exe` beside the app: the same commands as a console program, which terminals wait for and show the output of. Terminal tabs find it on `PATH` as `misag.exe`, and as `claude.exe`, the `claude` wrapper: misag links both into its data folder at every start (a hard link, else a copy). The wrapper takes its own folder off `PATH`, starts the real `claude` (an `.exe`, `.cmd` or `.bat` in an absolute `PATH` folder) like `misag --claude-launch`, waits for it and passes Ctrl+C through.
+- The `.msi` installs `misag-cli.exe` beside the app (a second binary of the same crate, which Tauri bundles with every build): the same commands as a console program, which terminals wait for and show the output of. Terminal tabs find it on `PATH` as `misag.exe`, and as `claude.exe`, the `claude` wrapper: misag links both into its data folder at every start (a hard link, else a copy). The wrapper takes its own folder off `PATH`, starts the real `claude` (an `.exe`, `.cmd` or `.bat` in an absolute `PATH` folder) like `misag --claude-launch`, waits for it and passes Ctrl+C through.
 - On Windows misag passes its hook to Claude as a program with arguments rather than a command line for a shell, as Claude may use Git Bash or PowerShell there; that needs Claude Code from mid-May 2026 or later. An older one runs `misag-cli.exe` without arguments, which says so on stderr, and the tab's sessions are not remembered.
 - Which program runs in a Windows terminal tab is told from the shell's process tree (Windows has no foreground process group): the deepest `claude` or `node` below the shell, else the shell's newest child. Directories and command lines of 32-bit programs are not read.
 - The macOS `.dmg` is signed ad hoc, not notarized (see the README). Paste reads the clipboard with `pbpaste`.
-- Building on Windows needs `scripts/build-windows-cli.sh` (in Git Bash) before `pnpm tauri build` or `pnpm tauri dev`, which bundle the console program it builds.
 
 ## Troubleshooting
 

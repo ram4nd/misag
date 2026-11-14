@@ -25,7 +25,7 @@ Built with Tauri 2, a Rust PTY backend (`portable-pty`), wterm and SQLite.
 
 Each GitHub Release has a Linux `.deb` and AppImage, an Apple Silicon macOS `.dmg` and a Windows `.msi`. The macOS build is not notarized yet, so after copying it to Applications run `xattr -dr com.apple.quarantine "/Applications/Mischief of Agents.app"` once. On Windows, tabs run PowerShell (PowerShell 7 when installed).
 
-To build it from source instead (on Linux; on Windows run `scripts/build-windows-cli.sh` in Git Bash first, see [the reference](docs/reference.md#windows-and-macos)) you need:
+To build it from source instead (on Linux) you need:
 
 - Rust (stable), Node.js and pnpm
 - Tauri's system libraries: `webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator` (or `libappindicator-gtk3`) and `librsvg`. See https://tauri.app/start/prerequisites/

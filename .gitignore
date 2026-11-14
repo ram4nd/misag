@@ -21,6 +21,3 @@ packaging/arch/*.deb
 packaging/arch/*.pkg.tar.*
 packaging/arch/src
 packaging/arch/pkg
-
-# The console misag the Windows build bundles (see .github/workflows/release.yml)
-src-tauri/binaries

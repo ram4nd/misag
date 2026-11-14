@@ -70,13 +70,6 @@ jobs:
       # The Rust tests need the built page, which the app embeds.
       - run: pnpm build
 
-      # Windows terminals only wait for, and show the output of, console programs, so
-      # the app ships its console build misag-cli.exe beside it.
-      - name: Build the console misag for Windows
-        if: runner.os == 'Windows'
-        shell: bash
-        run: scripts/build-windows-cli.sh
-
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
