@@ -169,7 +169,8 @@ fn without_the_app_s_database_nothing_is_created() {
     let o = misag(None, &["flow", "list"], "");
     let id = if cfg!(debug_assertions) { "io.github.ram4nd.misag.dev" } else { "io.github.ram4nd.misag" };
     let db = if cfg!(debug_assertions) { "dev/misag.db" } else { "misag.db" };
-    assert!(err(&o).contains(&format!(".local/share/{id}/{db}")), "{}", err(&o));
+    let data = if cfg!(target_os = "macos") { "Library/Application Support" } else { ".local/share" };
+    assert!(err(&o).contains(&format!("{data}/{id}/{db}")), "{}", err(&o));
 }
 
 #[test]
@@ -188,6 +189,8 @@ fn a_database_of_another_version_is_left_alone() {
     assert_eq!(conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0)).unwrap(), known - 1);
 }
 
+// macOS's file system refuses names that are not UTF-8.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_file_name_that_is_not_utf8_is_read_as_given() {
     use std::os::unix::ffi::OsStrExt;

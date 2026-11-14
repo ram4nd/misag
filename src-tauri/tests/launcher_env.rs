@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! A tab started from a misag that Claude Code launched (as with a dev build run
 //! from Claude Code) must not inherit that session, but must keep the user's own
 //! settings. Its own test binary, because it changes this process's environment.
