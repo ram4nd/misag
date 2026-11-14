@@ -703,8 +703,8 @@ mod tests {
         assert_eq!(args[..3], ["--session-id", ID, "--settings"]);
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         let hook = &settings["hooks"]["SessionStart"][0]["hooks"][0];
-        assert_eq!(hook["type"], "command");
-        assert_eq!(hook["command"], "'/opt/my apps/misag' --claude-hook");
+        // This platform's form: a shell command line, or on Windows a program and arguments.
+        assert_eq!(*hook, hook_entry(Path::new(EXE), cfg!(windows)));
         // The same command runs when Claude ends a turn, to move a flow run on, and
         // when its session ends, so nothing is left waiting on background tasks.
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0], *hook);
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1);
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         assert_eq!(settings["autoMemoryEnabled"], false);
-        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "'/opt/my apps/misag' --claude-hook");
+        assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0], hook_entry(Path::new(EXE), cfg!(windows)));
     }
 
     #[test]
@@ -815,6 +815,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn without_a_real_claude_the_wrapper_fails_instead_of_calling_itself() {
         let base = crate::test_support::temp_dir("wrapper-missing");

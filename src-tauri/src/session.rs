@@ -962,7 +962,8 @@ mod unix_tests {
     #[test]
     fn a_deleted_directory_is_reported_without_the_deleted_suffix() {
         let s = sessions();
-        let dir = crate::test_support::temp_dir("gone");
+        // Canonical, as the kernel reports it (macOS's temp dir is under a symlink).
+        let dir = std::fs::canonicalize(crate::test_support::temp_dir("gone")).unwrap();
         let p = spawn_in(&s, "echo ready; sleep 60", Some(dir.to_str().unwrap()));
         p.wait_for("ready");
         std::fs::remove_dir(&dir).unwrap();
@@ -976,7 +977,9 @@ mod unix_tests {
         let s = sessions();
         let p = spawn(&s, "cd /tmp && echo ready && sleep 60");
         p.wait_for("ready");
-        assert_eq!(s.cwd(p.id).as_deref(), Some("/tmp"));
+        // macOS's /tmp is a symlink to /private/tmp, which the kernel reports.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
+        assert_eq!(s.cwd(p.id).as_deref(), tmp.to_str());
         assert_eq!(s.cwd(999), None);
         s.kill(p.id);
         p.exit_code();
@@ -1125,7 +1128,9 @@ mod unix_tests {
         let req = SpawnRequest { cwd: Some("/definitely/not/here".into()), ..req() };
         let err = s.spawn(req, |_| true, |_| {}).unwrap_err();
         assert_eq!(err, SpawnError::CwdMissing("/definitely/not/here".into()));
-        assert!(matches!(resolve_cwd(Some("/etc/hostname".into())), Err(SpawnError::Failed(_))), "a file is not missing");
+        let file = crate::test_support::temp_dir("not-a-dir").join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(matches!(resolve_cwd(Some(file.to_string_lossy().into_owned())), Err(SpawnError::Failed(_))), "a file is not missing");
     }
 
     #[test]
@@ -1157,7 +1162,9 @@ mod unix_tests {
         assert_eq!(cwd_or_home(Some("/definitely/not/here".into())), Ok((None, true)));
         assert_eq!(cwd_or_home(Some("/tmp".into())), Ok((Some("/tmp".into()), false)));
         assert_eq!(cwd_or_home(None), Ok((None, false)));
-        assert!(cwd_or_home(Some("/etc/hostname".into())).is_err(), "a file is not a missing directory");
+        let file = crate::test_support::temp_dir("file-not-home").join("file");
+        std::fs::write(&file, "").unwrap();
+        assert!(cwd_or_home(Some(file.to_string_lossy().into_owned())).is_err(), "a file is not a missing directory");
     }
 
     #[test]

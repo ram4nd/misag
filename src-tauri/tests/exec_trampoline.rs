@@ -53,7 +53,12 @@ fn exec_mode_reports_bad_program_lists_and_missing_programs() {
     assert_eq!(exec(Some("not json")).status.code(), Some(2), "not JSON");
     assert_eq!(exec(Some("[]")).status.code(), Some(2), "empty");
     assert_eq!(exec(Some(r#"["/no/such/program"]"#)).status.code(), Some(127), "not found");
-    assert_eq!(exec(Some(r#"["/etc/hostname"]"#)).status.code(), Some(126), "not runnable");
+    // A file that exists but is not executable (macOS has no /etc/hostname).
+    let file = std::env::temp_dir().join(format!("misag-not-runnable-{}", std::process::id()));
+    std::fs::write(&file, "data").unwrap();
+    let list = serde_json::to_string(&[file.to_str().unwrap()]).unwrap();
+    assert_eq!(exec(Some(&list)).status.code(), Some(126), "not runnable");
+    let _ = std::fs::remove_file(&file);
 }
 
 #[test]

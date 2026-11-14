@@ -556,16 +556,20 @@ mod tests {
 
     #[test]
     fn the_wrapper_finds_claude_but_never_itself() {
-        let dirs = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
-        let own = Path::new("/data/bin");
+        // Absolute on every platform; `/usr/bin` is not on Windows.
+        let base = std::env::temp_dir();
+        let at = |p: &str| base.join(p);
+        let own = at("data/bin");
+        let upper = PathBuf::from(own.to_string_lossy().to_uppercase());
         // Relative and empty entries (`;;`) would look in the tab's own folder.
-        let kept = path_without(dirs(&["/data/bin/", "", "rel", "/usr/bin", "/DATA/BIN", "/home/u/.local/bin"]), Some(own));
-        assert_eq!(kept, dirs(&["/usr/bin", "/home/u/.local/bin"]));
-        let present = ["/usr/bin/claude.cmd", "/home/u/.local/bin/claude.exe"];
-        let is_file = |p: &Path| present.contains(&p.to_str().unwrap());
-        assert_eq!(find_claude(&kept, None, is_file), Some(PathBuf::from("/usr/bin/claude.cmd")));
-        let own_exe = Path::new("/USR/BIN/Claude.cmd");
-        assert_eq!(find_claude(&kept, Some(own_exe), is_file), Some(PathBuf::from("/home/u/.local/bin/claude.exe")));
+        let given = vec![at("data/bin/"), PathBuf::new(), PathBuf::from("rel"), at("usr"), upper, at("local")];
+        let kept = path_without(given, Some(&own));
+        assert_eq!(kept, vec![at("usr"), at("local")]);
+        let present = [at("usr").join("claude.cmd"), at("local").join("claude.exe")];
+        let is_file = |p: &Path| present.iter().any(|f| f == p);
+        assert_eq!(find_claude(&kept, None, is_file), Some(at("usr").join("claude.cmd")));
+        let own_exe = PathBuf::from(at("usr").join("Claude.cmd").to_string_lossy().to_uppercase());
+        assert_eq!(find_claude(&kept, Some(&own_exe), is_file), Some(at("local").join("claude.exe")));
         assert_eq!(find_claude(&kept, None, |_| false), None, "not found: the caller exits 127");
     }
 
@@ -600,7 +604,8 @@ mod tests {
         if std::env::var_os("UPDATE_IPC_FIXTURES").is_some() {
             std::fs::write(&file, &text).unwrap();
         }
-        let stored = std::fs::read_to_string(&file).unwrap_or_default();
+        // A Windows checkout may have turned its line ends into CRLF.
+        let stored = std::fs::read_to_string(&file).unwrap_or_default().replace("\r\n", "\n");
         assert!(stored == text, "{} is out of date: run UPDATE_IPC_FIXTURES=1 cargo test, then fix the TypeScript mirrors", file.display());
     }
 
