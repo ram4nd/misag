@@ -41,8 +41,9 @@ Usage:
 
   --db PATH   The database to use. By default $MISAG_DB (set in misag's tabs,
               where `misag` is the misag that runs them), else misag.db in the
-              app's data directory: $XDG_DATA_HOME/io.github.ram4nd.misag, by
-              default ~/.local/share/io.github.ram4nd.misag.
+              app's data directory, io.github.ram4nd.misag in
+              $XDG_DATA_HOME or ~/.local/share (Linux), ~/Library/Application
+              Support (macOS) or %APPDATA% (Windows).
 
 The app shows an added flow within seconds. A flow that is not ready to run yet
 is still added; import lists what to fix, and its editor in the app shows it too.
@@ -286,7 +287,7 @@ fn data_home() -> Option<PathBuf> {
 /// Where the app keeps its database: in its data directory, under whichever of
 /// `APP_IDS` the app runs as (see `pick_db`).
 fn data_dir_db() -> Result<PathBuf, String> {
-    let home = data_home().ok_or("cannot find the app's data directory (HOME is not set); give the database with --db")?;
+    let home = data_home().ok_or("cannot find the app's data directory (HOME, or APPDATA on Windows, is not set); give the database with --db")?;
     pick_db(APP_IDS.iter().map(|id| crate::in_build(home.join(id)).join(db::FILE)).collect())
 }
 

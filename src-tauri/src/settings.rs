@@ -170,11 +170,13 @@ mod tests {
         assert_eq!(toggled.clone().validated(&stored), Ok(toggled));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_folder_that_cannot_be_read_says_why() {
         if crate::test_support::running_as_root() {
             return;
         }
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::test_support::temp_dir("settings-locked");
         std::fs::create_dir(dir.join("in")).unwrap();

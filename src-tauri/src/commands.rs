@@ -444,37 +444,49 @@ pub enum ClaudeState {
     Unknown,
 }
 
-/// The state of each tab, keyed by PTY id: `foreground` gives a session's
-/// foreground program, `run_by` the session a Claude process reported for a tab,
-/// `name` a process's name, and `skips` whether a Claude process skips permission
-/// prompts (None when its command line cannot be read).
+/// The state of each tab, keyed by PTY id: `foreground` gives the programs that may
+/// run in a session's foreground, most likely first (one on Unix; on Windows every
+/// `claude` or `node` below the shell, see `proc_tree`), `run_by` the session a Claude
+/// process reported for a tab, `name` a process's name, and `skips` whether a Claude
+/// process skips permission prompts (None when its command line cannot be read).
 pub fn claude_states(
     tabs: Vec<TabSession>,
-    foreground: impl Fn(u32) -> Result<Option<u32>, String>,
+    foreground: impl Fn(u32) -> Result<Vec<u32>, String>,
     run_by: impl Fn(&TabId, u32) -> Result<Option<SessionId>, String>,
     name: impl Fn(u32) -> Option<String>,
     skips: impl Fn(u32) -> Option<bool>,
 ) -> HashMap<u32, ClaudeState> {
     let state = |t: &TabSession| {
         // A session that is gone or cannot be asked is not known to be idle.
-        let Ok(foreground) = foreground(t.id) else { return ClaudeState::Unknown };
-        let Some(pid) = foreground else { return ClaudeState::Closed };
-        match run_by(&t.tab_id, pid) {
-            // A Claude that may skip permission prompts is not known to be safe, so
-            // without its command line the earlier warning stands.
-            Ok(Some(session)) => match skips(pid) {
-                Some(skips_permissions) => ClaudeState::Open { session, skips_permissions },
-                None => ClaudeState::Unknown,
-            },
-            Ok(None) if name(pid).as_deref() == Some("claude") => match skips(pid) {
+        let Ok(candidates) = foreground(t.id) else { return ClaudeState::Unknown };
+        let mut untracked = None;
+        for pid in candidates {
+            match run_by(&t.tab_id, pid) {
+                // A Claude that may skip permission prompts is not known to be safe, so
+                // without its command line the earlier warning stands.
+                Ok(Some(session)) => {
+                    return match skips(pid) {
+                        Some(skips_permissions) => ClaudeState::Open { session, skips_permissions },
+                        None => ClaudeState::Unknown,
+                    };
+                }
+                Ok(None) => {
+                    if untracked.is_none() && name(pid).as_deref() == Some("claude") {
+                        untracked = Some(pid);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("misag: could not look up the Claude session in tab {}: {e}", t.tab_id);
+                    return ClaudeState::Unknown;
+                }
+            }
+        }
+        match untracked {
+            Some(pid) => match skips(pid) {
                 Some(skips_permissions) => ClaudeState::Untracked { pid, skips_permissions },
                 None => ClaudeState::Unknown,
             },
-            Ok(None) => ClaudeState::Closed,
-            Err(e) => {
-                eprintln!("misag: could not look up the Claude session in tab {}: {e}", t.tab_id);
-                ClaudeState::Unknown
-            }
+            None => ClaudeState::Closed,
         }
     };
     tabs.iter().map(|t| (t.id, state(t))).collect()
@@ -603,7 +615,12 @@ pub fn clipboard_text(app: tauri::AppHandle) -> Result<Option<String>, CommandEr
 /// The general pasteboard's text, through `pbpaste`, which every macOS has.
 #[cfg(target_os = "macos")]
 fn pasteboard_text() -> Result<Option<String>, String> {
-    let out = std::process::Command::new("/usr/bin/pbpaste").output().map_err(|e| format!("cannot run pbpaste: {e}"))?;
+    let mut pbpaste = std::process::Command::new("/usr/bin/pbpaste");
+    // Started from Finder, misag has no locale, and pbpaste then mangles non-ASCII text.
+    if std::env::var_os("LANG").is_none() {
+        pbpaste.env("LANG", "en_US.UTF-8");
+    }
+    let out = pbpaste.output().map_err(|e| format!("cannot run pbpaste: {e}"))?;
     if !out.status.success() {
         return Err(format!("pbpaste failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -896,6 +913,7 @@ mod tests {
         assert_eq!(run(None), (Launch::LoginShell, vec![]));
     }
 
+    #[cfg(unix)]
     #[test]
     fn terminal_tabs_find_the_claude_wrapper_first_on_their_path() {
         let path = temp_db("terminal-hook");
@@ -928,6 +946,7 @@ mod tests {
         assert!(!plan.request.env.iter().any(|(k, _)| k.starts_with("MISAG")), "nothing to report to");
     }
 
+    #[cfg(unix)]
     #[test]
     fn claude_tabs_find_this_misag_first_on_their_path() {
         let path = temp_db("claude-cli");
@@ -948,12 +967,24 @@ mod tests {
     }
 
     #[test]
+    fn tab_paths_use_the_platforms_separator() {
+        let sep = PATH_SEPARATOR;
+        let first = [Path::new("/d/bin")];
+        let path = format!("/a{sep}/b");
+        assert_eq!(tab_path(Some(std::ffi::OsStr::new(&path)), &[], &first), Some(format!("/d/bin{sep}/a{sep}/b")));
+        let already = format!("/d/bin{sep}/a");
+        assert_eq!(tab_path(Some(std::ffi::OsStr::new(&already)), &[], &first), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tab_paths_put_the_given_directories_first_in_order() {
         let first = [Path::new("/d/bin"), Path::new("/d/cli")];
         assert_eq!(tab_path(Some(std::ffi::OsStr::new("/d/cli:/usr/bin")), &[], &first).as_deref(), Some("/d/bin:/d/cli:/usr/bin"));
         assert_eq!(tab_path(Some(std::ffi::OsStr::new("/d/bin:/d/cli:/usr/bin")), &[], &first), None, "already first");
     }
 
+    #[cfg(unix)]
     #[test]
     fn tab_paths_put_the_wrapper_first_and_drop_an_outer_misag_wrapper() {
         let os = |s: &str| std::ffi::OsString::from(s);
@@ -978,6 +1009,7 @@ mod tests {
         assert_eq!(path("", None, w).as_deref(), Some("/d/bin"));
         assert_eq!(tab_path(None, &[], w.as_slice()).as_deref(), Some("/d/bin"));
         // A PATH that is not UTF-8 is left alone rather than mangled.
+        #[cfg(unix)]
         use std::os::unix::ffi::OsStrExt;
         assert_eq!(tab_path(Some(std::ffi::OsStr::from_bytes(b"/\xff:/bin")), &[], w.as_slice()), None);
     }
@@ -1027,6 +1059,7 @@ mod tests {
         assert_eq!(resume(&terminal_tab()), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_resume_that_cannot_be_checked_is_unknown_not_dropped() {
         if crate::test_support::running_as_root() {
@@ -1041,6 +1074,7 @@ mod tests {
         let transcript = locked.join("t.jsonl");
         record_claude_session(&connect_existing(&path).unwrap(), &report(&shell.tab_id, &session(), transcript.to_str()))
             .unwrap();
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let resume = plan_spawn(&shell, &exe(), &db, &TabDirs::default()).unwrap().resume;
@@ -1055,24 +1089,38 @@ mod tests {
         // (pid 30); tab 4 a claude that never reported (pid 40); tab 5 cannot be asked;
         // tab 6's lookup fails; tab 7 runs the Claude that reported (pid 70), whose
         // command line cannot be read.
+        // Tab 8 is a Windows tab running an npm Claude (node, pid 81, reported) under
+        // the wrapper (claude.exe, pid 80); tab 9 the wrapper over a node that never
+        // reported, which counts as an untracked claude.
         let foreground = |id: u32| match id {
-            1 => Ok(Some(10)),
-            7 => Ok(Some(70)),
-            2 => Ok(None),
-            3 => Ok(Some(30)),
-            4 => Ok(Some(40)),
-            6 => Ok(Some(60)),
+            1 => Ok(vec![10]),
+            7 => Ok(vec![70]),
+            2 => Ok(vec![]),
+            3 => Ok(vec![30]),
+            4 => Ok(vec![40]),
+            6 => Ok(vec![60]),
+            8 => Ok(vec![81, 80]),
+            9 => Ok(vec![91, 90]),
             _ => Err("no session".to_string()),
         };
         let run_by = |tab: &TabId, pid: u32| match (tab.as_str(), pid) {
-            ("t1", 10) | ("t7", 70) => Ok(Some(session())),
+            ("t1", 10) | ("t7", 70) | ("t8", 81) => Ok(Some(session())),
             ("t6", _) => Err("database is locked".to_string()),
             _ => Ok(None),
         };
-        let name = |pid: u32| Some(if pid == 30 { "vim" } else { "claude" }.to_string());
+        let name = |pid: u32| {
+            Some(match pid {
+                30 => "vim",
+                81 | 91 => "node",
+                _ => "claude",
+            }
+            .to_string())
+        };
         // Only the untracked claude was started with --dangerously-skip-permissions.
         let skips = |pid: u32| if pid == 70 { None } else { Some(pid == 40) };
-        let states = claude_states(tabs(&[1, 2, 3, 4, 5, 6, 7]), foreground, run_by, name, skips);
+        let states = claude_states(tabs(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), foreground, run_by, name, skips);
+        assert_eq!(states[&8], ClaudeState::Open { session: session(), skips_permissions: false });
+        assert_eq!(states[&9], ClaudeState::Untracked { pid: 90, skips_permissions: false });
         assert_eq!(states[&1], ClaudeState::Open { session: session(), skips_permissions: false });
         assert_eq!(states[&2], ClaudeState::Closed);
         assert_eq!(states[&3], ClaudeState::Closed);
@@ -1214,8 +1262,10 @@ mod tests {
         assert!(launch_plan(&terminal_tab(), &AppExe::new(Err("gone".into())), &db).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_binary_path_must_be_utf8() {
+        #[cfg(unix)]
         use std::os::unix::ffi::OsStrExt;
         let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/opt/\xff/misag"));
         assert!(AppExe::new(Ok(bad)).path().unwrap_err().contains("not valid UTF-8"));

@@ -3,17 +3,20 @@
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// How long a closed session gets to exit on SIGHUP before it is sent SIGKILL.
+/// How long a closed session's processes get to exit after the hang-up (SIGHUP on
+/// Unix; on Windows their console closing) before they are killed.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// What a session runs, always through the user's login shell so PATH and the
-/// rest of their environment are set up.
+/// What a session runs: on Unix always through the user's login shell, so PATH and
+/// the rest of their environment are set up; on Windows, which has no login shells,
+/// through PowerShell, or a program directly.
 #[derive(Debug, PartialEq, Default)]
 pub enum Launch {
     #[default]
@@ -28,7 +31,7 @@ pub enum Launch {
 pub struct SpawnRequest {
     pub cols: u16,
     pub rows: u16,
-    /// None (or blank) for `$HOME`; a leading `~` is expanded.
+    /// None (or blank) for the home directory; a leading `~` is expanded.
     pub cwd: Option<String>,
     pub launch: Launch,
     /// Extra environment, set before the terminal variables so it cannot override them.
@@ -63,6 +66,7 @@ impl ExitFlag {
     }
 
     /// Waits up to `timeout` for the flag; returns whether it is set.
+    #[cfg(unix)]
     fn wait(&self, timeout: Duration) -> bool {
         let guard = lock(&self.done);
         let (done, _) = self.changed.wait_timeout_while(guard, timeout, |done| !*done).unwrap_or_else(|e| e.into_inner());
@@ -71,11 +75,13 @@ impl ExitFlag {
 }
 
 impl Session {
-    /// Sends SIGHUP, then SIGKILL to the child's process groups if it is still
-    /// alive after `grace`. The returned thread ends as soon as the child is reaped.
+    /// Hangs the child up, then kills what is left of it after `grace`: on Unix
+    /// SIGHUP, then SIGKILL to its process groups, in a thread that ends as soon as
+    /// the child is reaped; on Windows the shell ends at once and the tab's job
+    /// object gets the grace period (see `Job::end_within`).
     fn kill(&self, grace: Duration) -> Option<std::thread::JoinHandle<()>> {
         if let Err(e) = lock(&self.killer).kill() {
-            eprintln!("misag: SIGHUP to pid {:?} failed: {e}", self.pid);
+            eprintln!("misag: hanging up pid {:?} failed: {e}", self.pid);
         }
         let exited = self.exited.clone();
         #[cfg(unix)]
@@ -97,22 +103,20 @@ impl Session {
                 }
             }))
         }
-        // The shell is gone already (Windows has no hang-up signal); what it
-        // started gets the grace period to exit with the console closed.
+        // The shell is gone already (Windows has no hang-up signal). Once the session
+        // drops its console, what the shell started gets the grace period to exit;
+        // the job's processes are counted, not the shell's, which ended at once.
         #[cfg(windows)]
         {
+            let _ = exited;
             let job = self.job.clone()?;
-            Some(std::thread::spawn(move || {
-                if !exited.wait(grace) {
-                    job.terminate();
-                }
-            }))
+            Some(std::thread::spawn(move || job.end_within(grace)))
         }
     }
 }
 
 /// Why a session could not start. `CwdMissing` (the directory no longer exists)
-/// lets a restore fall back to `$HOME` for that reason only.
+/// lets a restore fall back to the home directory for that reason only.
 #[derive(Debug, PartialEq)]
 pub enum SpawnError {
     CwdMissing(String),
@@ -136,10 +140,10 @@ impl From<String> for SpawnError {
 
 /// Shells (matched by file name) whose `-c` takes `"$0" "$@"` the POSIX way. Any
 /// other shell is treated as non-POSIX and goes through the trampoline.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"];
 
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 fn is_posix_shell(shell: &str) -> bool {
     let name = Path::new(shell).file_name().and_then(|n| n.to_str()).unwrap_or(shell);
     POSIX_SHELLS.contains(&name)
@@ -201,7 +205,7 @@ pub const EXEC_FLAG: &str = "--exec";
 
 /// Whether `path` can be single-quoted the same way in every common shell (POSIX
 /// shells, fish and csh): it contains none of `'`, `\`, `!` or a newline.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 fn quotable_everywhere(path: &str) -> bool {
     !path.contains(['\'', '\\', '!', '\n'])
 }
@@ -232,18 +236,39 @@ fn default_shell() -> String {
     })
 }
 
-/// PowerShell 7 (`pwsh`) when installed, else the Windows PowerShell every Windows has.
+/// PowerShell 7 (`pwsh`) when installed, else the Windows PowerShell every Windows
+/// has. Only absolute PATH entries count, so a `pwsh.exe` in misag's own working
+/// folder is never picked.
 #[cfg(windows)]
 fn default_shell() -> String {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let pwsh = std::env::split_paths(&path).map(|dir| dir.join("pwsh.exe")).find(|exe| exe.is_file());
+    let pwsh = std::env::split_paths(&path).filter(|dir| dir.is_absolute()).map(|dir| dir.join("pwsh.exe")).find(|exe| exe.is_file());
     pwsh.map_or_else(|| "powershell.exe".into(), |exe| exe.to_string_lossy().into_owned())
 }
 
-/// The user's home directory: `$HOME`, or on Windows `%USERPROFILE%`.
+/// The user's home directory (`$HOME` on Unix, `%USERPROFILE%` on Windows), if it
+/// is UTF-8.
 pub fn home_dir() -> Option<String> {
-    let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
-    var("HOME").or_else(|| if cfg!(windows) { var("USERPROFILE") } else { None })
+    std::env::home_dir().and_then(|dir| dir.into_os_string().into_string().ok()).filter(|dir| !dir.is_empty())
+}
+
+/// What PowerShell runs before a terminal tab's first prompt: a prompt that also
+/// moves the process's current directory to PowerShell's location, which `cd`
+/// (`Set-Location`) alone does not, so the tab follows it (see `Sessions::cwd`).
+#[cfg(any(windows, test))]
+const POWERSHELL_FOLLOW_CD: &str = "$global:__misagPrompt = $function:prompt; \
+function global:prompt { $l = Get-Location; \
+if ($l.Provider.Name -eq 'FileSystem') { [Environment]::CurrentDirectory = $l.ProviderPath }; \
+& $global:__misagPrompt }";
+
+/// PowerShell's arguments for `launch` (a program runs without it): a terminal tab
+/// stays open (`-NoExit`) with its prompt following `cd`; a command runs and exits.
+#[cfg(any(windows, test))]
+fn powershell_args(launch: &Launch) -> Vec<&str> {
+    match launch {
+        Launch::Command(c) if !c.trim().is_empty() => vec!["-NoLogo", "-Command", c],
+        _ => vec!["-NoLogo", "-NoExit", "-Command", POWERSHELL_FOLLOW_CD],
+    }
 }
 
 impl Sessions {
@@ -264,59 +289,13 @@ impl Sessions {
         self
     }
 
-    /// Starts a session. `on_data` receives output and returns false once nobody
-    /// is listening; `on_exit` gets the exit code after all output was delivered.
-    pub fn spawn(
-        &self,
-        req: SpawnRequest,
-        mut on_data: impl FnMut(&[u8]) -> bool + Send + 'static,
-        on_exit: impl FnOnce(i32) + Send + 'static,
-    ) -> Result<u32, SpawnError> {
-        let dir = resolve_cwd(req.cwd)?;
+    /// What runs `launch`, before the environment and directory are set: the login
+    /// shell, with a program run through `exec` (or misag's trampoline).
+    #[cfg(unix)]
+    fn command(&self, launch: &Launch) -> Result<CommandBuilder, SpawnError> {
         let shell = &self.shell;
-
-        let pair = native_pty_system()
-            .openpty(PtySize { rows: req.rows.max(1), cols: req.cols.max(1), pixel_width: 0, pixel_height: 0 })
-            .map_err(|e| format!("could not open a PTY: {e:#}"))?;
-        // Take both ends before spawning so a failure here cannot orphan a child.
-        let mut reader = pair.master.try_clone_reader().map_err(|e| format!("PTY reader: {e:#}"))?;
-        let mut writer = pair.master.take_writer().map_err(|e| format!("PTY writer: {e:#}"))?;
-
         let mut cmd = CommandBuilder::new(shell);
-        // Launcher state first; `req.env` may still set any of these on purpose.
-        for key in &self.strip_env {
-            cmd.env_remove(key);
-        }
-        // Caller variables before the terminal type, so they cannot override it.
-        for (key, value) in &req.env {
-            cmd.env(key, value);
-        }
-        #[cfg(windows)]
-        let mut cmd = match &req.launch {
-            // Windows has no login shells: every PowerShell reads the profile and
-            // inherits the user's environment. A program needs no shell at all.
-            Launch::Program { program, args } => {
-                let mut program_cmd = CommandBuilder::new(program);
-                program_cmd.args(args);
-                for key in &self.strip_env {
-                    program_cmd.env_remove(key);
-                }
-                for (key, value) in &req.env {
-                    program_cmd.env(key, value);
-                }
-                program_cmd
-            }
-            Launch::Command(c) if !c.trim().is_empty() => {
-                cmd.args(["-NoLogo", "-Command", c]);
-                cmd
-            }
-            _ => {
-                cmd.arg("-NoLogo");
-                cmd
-            }
-        };
-        #[cfg(unix)]
-        match &req.launch {
+        match launch {
             Launch::LoginShell => cmd.arg("-l"),
             Launch::Command(c) if c.trim().is_empty() => cmd.arg("-l"),
             Launch::Command(c) => cmd.args(["-lc", c]),
@@ -343,6 +322,50 @@ impl Sessions {
                 cmd.env(EXEC_ENV, argv);
                 cmd.args(["-l", "-c", &format!("'{exe}' {EXEC_FLAG}")]);
             }
+        }
+        Ok(cmd)
+    }
+
+    /// What runs `launch` on Windows: a program directly (every program inherits the
+    /// user's environment there), anything else in PowerShell.
+    #[cfg(windows)]
+    fn command(&self, launch: &Launch) -> Result<CommandBuilder, SpawnError> {
+        if let Launch::Program { program, args } = launch {
+            let mut cmd = CommandBuilder::new(program);
+            cmd.args(args);
+            return Ok(cmd);
+        }
+        let mut cmd = CommandBuilder::new(&self.shell);
+        cmd.args(powershell_args(launch));
+        Ok(cmd)
+    }
+
+    /// Starts a session. `on_data` receives output and returns false once nobody
+    /// is listening; `on_exit` gets the exit code after all output was delivered.
+    pub fn spawn(
+        &self,
+        req: SpawnRequest,
+        mut on_data: impl FnMut(&[u8]) -> bool + Send + 'static,
+        on_exit: impl FnOnce(i32) + Send + 'static,
+    ) -> Result<u32, SpawnError> {
+        let dir = resolve_cwd(req.cwd)?;
+        let shell = &self.shell;
+
+        let pair = native_pty_system()
+            .openpty(PtySize { rows: req.rows.max(1), cols: req.cols.max(1), pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| format!("could not open a PTY: {e:#}"))?;
+        // Take both ends before spawning so a failure here cannot orphan a child.
+        let mut reader = pair.master.try_clone_reader().map_err(|e| format!("PTY reader: {e:#}"))?;
+        let mut writer = pair.master.take_writer().map_err(|e| format!("PTY writer: {e:#}"))?;
+
+        let mut cmd = self.command(&req.launch)?;
+        // Launcher state first; `req.env` may still set any of these on purpose.
+        for key in &self.strip_env {
+            cmd.env_remove(key);
+        }
+        // Caller variables before the terminal type, so they cannot override it.
+        for (key, value) in &req.env {
+            cmd.env(key, value);
         }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
@@ -405,7 +428,7 @@ impl Sessions {
                     }
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => {
-                        // EIO is how Linux reports the slave side closing.
+                        // EIO is how Unix reports the slave side closing.
                         #[cfg(unix)]
                         let closed = e.raw_os_error() == Some(libc::EIO);
                         // Windows reports it as a broken pipe.
@@ -458,11 +481,13 @@ impl Sessions {
     }
 
     /// The session process's current directory.
-    /// For a Claude tab under a POSIX login shell that is Claude's directory, since
-    /// the shell `exec`s into it; under fish or csh it is the shell's, which stays in
-    /// the directory the tab started in.
-    /// A directory deleted while in use reads as `<path> (deleted)`; that suffix is
-    /// dropped, so a restore finds the path missing and falls back to `$HOME`.
+    /// On Unix, for a Claude tab under a POSIX login shell that is Claude's directory,
+    /// since the shell `exec`s into it; under fish or csh it is the shell's, which
+    /// stays in the directory the tab started in. On Windows a terminal tab's
+    /// PowerShell keeps it at its location (see `POWERSHELL_FOLLOW_CD`).
+    /// On Linux a directory deleted while in use reads as `<path> (deleted)`; that
+    /// suffix is dropped, so a restore finds the path missing and falls back to the
+    /// home directory.
     pub fn cwd(&self, id: u32) -> Option<String> {
         let pid = self.get(id).ok()?.pid?;
         let path = match proc_info::cwd(pid) {
@@ -477,21 +502,23 @@ impl Sessions {
         path.into_os_string().into_string().map_err(|p| eprintln!("misag: non-UTF-8 directory {p:?}")).ok()
     }
 
-    /// The leader of the session's foreground process group, when that is not the
-    /// session process itself: the program a shell is running in the foreground,
-    /// such as `claude` typed at its prompt.
-    /// An error means it could not be told (no such session, or the PTY query
-    /// failed), which callers must not read as "nothing in the foreground".
+    /// The programs that may run in the session's foreground, most likely first: the
+    /// program a shell is running, such as `claude` typed at its prompt; empty when
+    /// only the shell runs. On Windows, which has no foreground process group, the
+    /// candidates from the shell's process tree (see `proc_tree`).
+    /// An error means it could not be told (no such session, or the query failed),
+    /// which callers must not read as "nothing in the foreground".
     #[cfg(windows)]
-    pub fn foreground(&self, id: u32) -> Result<Option<u32>, String> {
+    pub fn foreground(&self, id: u32) -> Result<Vec<u32>, String> {
         let pid = self.get(id)?.pid.ok_or_else(|| format!("session {id} has no process id"))?;
         let all = crate::win::processes().map_err(|e| format!("session {id}: cannot list processes: {e}"))?;
-        Ok(crate::win::foreground(pid, &all))
+        Ok(crate::proc_tree::foreground_candidates(pid, &all))
     }
 
-    /// The same, from the PTY's foreground process group.
+    /// The same, from the PTY's foreground process group: its leader, if that is not
+    /// the session process itself.
     #[cfg(unix)]
-    pub fn foreground(&self, id: u32) -> Result<Option<u32>, String> {
+    pub fn foreground(&self, id: u32) -> Result<Vec<u32>, String> {
         let s = self.get(id)?;
         let master = lock(&s.master);
         let fd = master.as_raw_fd().ok_or_else(|| format!("session {id} has no PTY descriptor"))?;
@@ -503,10 +530,11 @@ impl Sessions {
             return Err(e);
         }
         let leader = leader as u32;
-        Ok((Some(leader) != s.pid).then_some(leader))
+        Ok((Some(leader) != s.pid).then_some(leader).into_iter().collect())
     }
 
-    /// The name the kernel gives the process, such as `claude`.
+    /// The process's name, such as `claude` (on Windows its program's file name
+    /// without `.exe`).
     pub fn process_name(pid: u32) -> Option<String> {
         proc_info::name(pid)
     }
@@ -526,7 +554,7 @@ impl Sessions {
 
     /// For app exit: like `kill_all`, but waits until every session has exited or
     /// been force-killed, since background threads die with the process. Returns
-    /// at once when every child exits on SIGHUP; waits the grace period at most.
+    /// at once when every child exits on the hang-up; waits the grace period at most.
     pub fn kill_all_and_wait(&self) {
         for handle in self.kill_all() {
             let _ = handle.join();
@@ -629,7 +657,7 @@ mod proc_info {
 }
 
 /// The arguments in a NUL-terminated list such as `/proc/<pid>/cmdline`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 fn nul_terminated(raw: &[u8]) -> Vec<String> {
     let args: Vec<String> = raw.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     args.split_last().map_or(args.clone(), |(_, rest)| rest.to_vec())
@@ -637,14 +665,17 @@ fn nul_terminated(raw: &[u8]) -> Vec<String> {
 
 /// The arguments in a macOS `KERN_PROCARGS2` buffer: the argument count, the
 /// executable's path, NUL padding, then that many NUL-terminated arguments.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 fn procargs2(buf: &[u8]) -> Option<Vec<String>> {
     let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
     let rest = &buf[4..];
     let path_end = rest.iter().position(|&b| b == 0)?;
     let start = path_end + rest[path_end..].iter().position(|&b| b != 0).unwrap_or(rest.len() - path_end);
+    // Only NUL-terminated pieces are arguments; a count larger than what is there
+    // yields what is there.
     let args = rest[start..]
-        .split(|&b| b == 0)
+        .split_inclusive(|&b| b == 0)
+        .filter_map(|a| a.strip_suffix(&[0]))
         .take(usize::try_from(argc).ok()?)
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
@@ -697,10 +728,16 @@ fn resolve_cwd(cwd: Option<String>) -> Result<Option<String>, SpawnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::Receiver;
-    use std::time::Instant;
 
-    const TIMEOUT: Duration = Duration::from_secs(10);
+    #[test]
+    fn powershell_tabs_follow_cd_and_commands_exit() {
+        let shell = powershell_args(&Launch::LoginShell);
+        assert_eq!(shell[..3], ["-NoLogo", "-NoExit", "-Command"]);
+        assert!(shell[3].contains("[Environment]::CurrentDirectory = $l.ProviderPath"));
+        assert!(shell[3].contains("& $global:__misagPrompt"), "the person's own prompt still runs");
+        assert_eq!(powershell_args(&Launch::Command(" ".into())), shell, "a blank command is a terminal");
+        assert_eq!(powershell_args(&Launch::Command("git status".into())), ["-NoLogo", "-Command", "git status"]);
+    }
 
     #[test]
     fn reads_macos_procargs2() {
@@ -715,9 +752,33 @@ mod tests {
 
     #[test]
     fn reads_nul_terminated_arguments() {
-        assert_eq!(nul_terminated(b"sleep\060\0"), vec!["sleep".to_string(), "60".to_string()]);
+        assert_eq!(nul_terminated(b"sleep\x0060\0"), vec!["sleep".to_string(), "60".to_string()]);
         assert!(nul_terminated(b"").is_empty(), "an exiting process reads as empty");
+        assert_eq!(nul_terminated(b"a\0\0b\0"), vec!["a".to_string(), String::new(), "b".to_string()], "an empty argument stays");
     }
+
+    #[test]
+    fn procargs2_trusts_neither_its_count_nor_its_length() {
+        let mut short = 3i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/bin/x\0x\0");
+        assert_eq!(procargs2(&short), Some(vec!["x".to_string()]), "fewer arguments than counted");
+        let mut negative = (-1i32).to_ne_bytes().to_vec();
+        negative.extend_from_slice(b"/bin/x\0x\0");
+        assert_eq!(procargs2(&negative), None);
+        let mut no_nul = 1i32.to_ne_bytes().to_vec();
+        no_nul.extend_from_slice(b"/bin/x");
+        assert_eq!(procargs2(&no_nul), None);
+    }
+}
+
+/// Tests that run shells and Unix process calls.
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::sync::mpsc::Receiver;
+    use std::time::Instant;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
 
     struct Probe {
         id: u32,
@@ -809,11 +870,16 @@ mod tests {
         let s = Sessions::new("/bin/bash", Duration::from_millis(300));
         let p = spawn(&s, "echo idle; sleep 0.5; set -m; sh -c 'echo fg:$$; exec sleep 60'; true");
         p.wait_for("idle");
-        assert_eq!(s.foreground(p.id), Ok(None), "only the shell runs");
+        assert_eq!(s.foreground(p.id), Ok(vec![]), "only the shell runs");
         p.wait_for("fg:");
         let text = p.text();
         let pid: u32 = text.split("fg:").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
-        assert_eq!(s.foreground(p.id), Ok(Some(pid)));
+        assert_eq!(s.foreground(p.id), Ok(vec![pid]));
+        // `fg:` is printed before sh execs sleep.
+        let until = Instant::now() + TIMEOUT;
+        while Sessions::process_name(pid).as_deref() != Some("sleep") && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(Sessions::process_name(pid).as_deref(), Some("sleep"));
         assert_eq!(Sessions::process_args(pid), Some(vec!["sleep".to_string(), "60".to_string()]));
         s.kill(p.id);

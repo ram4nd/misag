@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Runs the real `misag` binary as Claude's hook, the way Claude invokes it: the
 //! hook command through a shell, with the payload on stdin.
 

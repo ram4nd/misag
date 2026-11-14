@@ -1161,6 +1161,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::flows::Graph;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn sid(s: &str) -> SessionId {
@@ -1704,6 +1705,7 @@ pub(crate) mod tests {
         assert!(reason.contains("newer Mischief of Agents"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn leaves_an_unreadable_database_alone() {
         if crate::test_support::running_as_root() {
@@ -1789,8 +1791,10 @@ pub(crate) mod tests {
         assert!(db.load_layout().unwrap_err().contains("invalid tab id"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_non_utf8_path_is_not_used() {
+        #[cfg(unix)]
         use std::os::unix::ffi::OsStrExt;
         let dir = crate::test_support::temp_dir("non-utf8");
         let path = dir.join(std::ffi::OsStr::from_bytes(b"misag-\xff.db"));
@@ -1800,6 +1804,7 @@ pub(crate) mod tests {
         assert!(!path.exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_damaged_database_that_cannot_be_moved_runs_in_memory() {
         if crate::test_support::running_as_root() {

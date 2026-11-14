@@ -8,6 +8,7 @@ pub mod flows;
 pub mod history;
 pub mod runs;
 pub mod layout;
+pub mod proc_tree;
 pub mod session;
 pub mod settings;
 #[cfg(windows)]
@@ -16,13 +17,20 @@ mod win;
 use std::path::PathBuf;
 use tauri::{Manager, RunEvent};
 
-/// `misag --exec`: replaces this process with the program and arguments in
+/// Which binary is running: the app, or its console build (`misag-cli`, Windows),
+/// which terminal tabs also run as `claude.exe` and `misag.exe`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Build {
+    App,
+    Console,
+}
+
+/// `misag --exec`: runs, in place of this process, the program and arguments in
 /// `MISAG_EXEC` (a JSON array), so non-POSIX login shells can launch Claude tabs
 /// without quoting the program or its arguments. `MISAG_EXEC` itself is not passed
-/// on. Returns only on failure, with the exit code to use.
-///
-/// Exit codes follow the shell's: 2 for bad usage, 126 when the program cannot be
-/// run, 127 when it is not found.
+/// on. Returns only on failure (on Windows, with the program's exit code), with the
+/// exit code to use: 2 for bad usage, 126 when the program cannot be run, 127 when it
+/// is not found, as a shell's.
 pub fn run_exec() -> i32 {
     let (flag, var) = (session::EXEC_FLAG, session::EXEC_ENV);
     let raw = match std::env::var(var) {
@@ -68,17 +76,18 @@ fn replace_with(mut command: std::process::Command, program: &str) -> i32 {
 }
 
 /// `misag --claude-launch [args]`, run by the `claude` wrapper in terminal tabs:
-/// replaces this process with the real `claude` (the wrapper took itself off
+/// runs, in place of this process, the real `claude` (the wrapper took itself off
 /// `PATH`), started like a Claude tab with the settings and hook from the database
 /// in `MISAG_DB`. Without a usable database it starts untracked with the cautious
 /// settings; if only the settings cannot be read, it is still tracked. Returns only
-/// on failure, with the exit code a shell uses (127 not found, 126 otherwise).
-pub fn run_launch() -> i32 {
-    launch_claude(std::env::args_os().skip(2).collect())
+/// on failure (on Windows, with Claude's exit code), with the exit code a shell uses
+/// (127 not found, 126 otherwise).
+pub fn run_launch(build: Build) -> i32 {
+    launch_claude(build, std::env::args_os().skip(2).collect())
 }
 
 /// `run_launch` with Claude's arguments `claude_args`.
-fn launch_claude(claude_args: Vec<std::ffi::OsString>) -> i32 {
+fn launch_claude(build: Build, claude_args: Vec<std::ffi::OsString>) -> i32 {
     let db_path = std::env::var_os(claude::DB_ENV).map(PathBuf::from);
     let store = db_path.as_deref().map(db::connect_existing).transpose();
     let settings = store.as_ref().map_err(String::clone).and_then(|conn| match conn {
@@ -89,7 +98,7 @@ fn launch_claude(claude_args: Vec<std::ffi::OsString>) -> i32 {
         eprintln!("misag: cannot read the settings ({e}); starting Claude with permission prompts and auto memory off");
         settings::Settings::cautious()
     });
-    let exe = own_exe();
+    let exe = hook_exe(build);
     let hook = match (exe.path(), &store) {
         (Ok(exe), Ok(Some(_))) => Some(exe),
         (Err(e), Ok(Some(_))) => {
@@ -98,34 +107,67 @@ fn launch_claude(claude_args: Vec<std::ffi::OsString>) -> i32 {
         }
         _ => None,
     };
+    let Some(claude) = real_claude() else {
+        eprintln!("misag: claude is not on PATH (looked for {})", CLAUDE_FILES.join(", "));
+        return 127;
+    };
     let args = claude::launch_args(&settings, hook, claude_args);
-    let mut command = std::process::Command::new(real_claude());
+    let mut command = std::process::Command::new(claude);
     command.args(args);
     replace_with(command, "claude")
 }
 
+/// The files the real `claude` may be: the native install, or the .cmd npm installs
+/// on Windows (which `Command` would not find by its name).
+#[cfg(windows)]
+const CLAUDE_FILES: &[&str] = &["claude.exe", "claude.cmd", "claude.bat"];
+#[cfg(unix)]
+const CLAUDE_FILES: &[&str] = &["claude"];
+
 /// The `claude` to run: on Unix whichever is on PATH (the wrapper took itself off).
 #[cfg(unix)]
-fn real_claude() -> std::ffi::OsString {
-    "claude".into()
+fn real_claude() -> Option<std::ffi::OsString> {
+    Some("claude".into())
 }
 
 /// On Windows the wrapper is this binary, so its directory comes off this process's
-/// PATH here, and the real `claude` is looked up there, as an .exe or the .cmd npm
-/// installs (which `Command` would not find by its name).
+/// PATH here (which Claude inherits), and the real `claude` is looked up there.
 #[cfg(windows)]
-fn real_claude() -> std::ffi::OsString {
+fn real_claude() -> Option<std::ffi::OsString> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let own = std::env::current_exe().ok().and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
-    let dirs: Vec<PathBuf> = std::env::split_paths(&path).filter(|dir| Some(dir) != own.as_ref()).collect();
+    let exe = std::env::current_exe().ok();
+    let own = exe.as_deref().and_then(std::path::Path::parent);
+    let dirs = path_without(std::env::split_paths(&path).collect(), own);
     if let Ok(kept) = std::env::join_paths(&dirs) {
         // SAFETY: single-threaded here, before Claude starts.
         unsafe { std::env::set_var("PATH", kept) };
     }
-    let found = dirs.iter().find_map(|dir| {
-        ["claude.exe", "claude.cmd", "claude.bat"].iter().map(|name| dir.join(name)).find(|file| file.is_file())
-    });
-    found.map_or_else(|| "claude".into(), PathBuf::into_os_string)
+    find_claude(&dirs, exe.as_deref(), |file| file.is_file()).map(PathBuf::into_os_string)
+}
+
+/// Windows compares paths without regard to case.
+#[cfg(any(windows, test))]
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| p.to_string_lossy().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// The PATH directories `dirs` that may hold the real `claude`: absolute ones only (an
+/// empty or relative entry would look in the tab's own folder, where a cloned project
+/// could put a `claude.cmd`), and not `own`, the wrapper's.
+#[cfg(any(windows, test))]
+fn path_without(dirs: Vec<PathBuf>, own: Option<&std::path::Path>) -> Vec<PathBuf> {
+    dirs.into_iter().filter(|dir| dir.is_absolute() && !own.is_some_and(|own| same_path(dir, own))).collect()
+}
+
+/// The first `claude.exe`, `.cmd` or `.bat` in `dirs`, skipping `own_exe` (the
+/// wrapper), so the wrapper can never start itself.
+#[cfg(any(windows, test))]
+fn find_claude(dirs: &[PathBuf], own_exe: Option<&std::path::Path>, is_file: impl Fn(&std::path::Path) -> bool) -> Option<PathBuf> {
+    let names = ["claude.exe", "claude.cmd", "claude.bat"];
+    dirs.iter()
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|file| is_file(file) && !own_exe.is_some_and(|own| same_path(file, own)))
 }
 
 /// `claude [args]` on Windows, run by the wrapper, which is this binary linked as
@@ -136,70 +178,138 @@ fn real_claude() -> std::ffi::OsString {
 pub fn run_as_claude_wrapper() -> i32 {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     if std::env::var_os("CLAUDECODE").is_some() {
-        let mut command = std::process::Command::new(real_claude());
+        let Some(claude) = real_claude() else {
+            eprintln!("misag: claude is not on PATH (looked for {})", CLAUDE_FILES.join(", "));
+            return 127;
+        };
+        let mut command = std::process::Command::new(claude);
         command.args(args);
         return replace_with(command, "claude");
     }
-    launch_claude(args)
+    launch_claude(Build::Console, args)
 }
 
 /// misag's own binary, for Claude's hook, `--claude-launch` and the `--exec` trampoline.
-/// On Windows its console build (`CLI_EXE`) next to it, which terminals wait for and
-/// whose output they show, unlike the app's.
-fn own_exe() -> commands::AppExe {
+/// On Windows the console build (`CLI_EXE`) next to the app, which terminals wait for
+/// and whose output they show, unlike the app's.
+fn own_exe(build: Build) -> commands::AppExe {
     let exe = std::env::current_exe()
         // After an upgrade replaced the binary, run the new one at the same path.
         .map(session::live_path)
         .map_err(|e| format!("cannot locate the misag binary: {e}"));
     #[cfg(windows)]
     let exe = exe.and_then(|exe| {
-        // The console build may also run as a link named `claude.exe` or `misag.exe`.
-        if CONSOLE.load(std::sync::atomic::Ordering::Relaxed) {
+        if build == Build::Console {
             return Ok(exe);
         }
         let cli = exe.with_file_name(CLI_EXE);
         if cli.is_file() { Ok(cli) } else { Err(format!("cannot find {} next to {}", CLI_EXE, exe.display())) }
     });
+    #[cfg(unix)]
+    let _ = build;
     commands::AppExe::new(exe)
+}
+
+/// The binary Claude's hook runs. The wrapper (`claude.exe`) cannot be it, as it
+/// would start Claude again, so on Windows a wrapper uses the `misag.exe` shim, the
+/// same console build under its own name, from the tab's `MISAG_CLI` directory.
+fn hook_exe(build: Build) -> commands::AppExe {
+    #[cfg(windows)]
+    if build == Build::Console && invoked_as_claude() {
+        let shim = std::env::var_os(claude::CLI_ENV).map(|dir| PathBuf::from(dir).join("misag.exe"));
+        return commands::AppExe::new(match shim {
+            Some(shim) if shim.is_file() => Ok(shim),
+            _ => Err(format!("the misag shim is not on this tab's PATH ({} is not set)", claude::CLI_ENV)),
+        });
+    }
+    own_exe(build)
 }
 
 /// The console build of misag that Windows installs next to the app.
 #[cfg(windows)]
 pub const CLI_EXE: &str = "misag-cli.exe";
 
-/// Set by the console build, which is its own `own_exe`.
-static CONSOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// What a command line asks misag to do.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    /// Start the app (no arguments to the app).
+    App,
+    Hook,
+    Launch,
+    Exec,
+    Flow,
+    Help,
+    /// The console build as `claude.exe`: every argument is Claude's.
+    ClaudeWrapper,
+    /// The console build with no arguments, which only commands use.
+    NoCommand,
+    Unknown(String),
+}
+
+/// Reads `first`, the first argument, for `build`; `as_claude` says the binary runs
+/// as `claude.exe`, which settles it before any argument, since every argument then
+/// belongs to Claude (`claude flow ...` is a prompt, not misag's `flow`).
+fn mode(build: Build, first: Option<&std::ffi::OsStr>, as_claude: bool) -> Mode {
+    if build == Build::Console && as_claude {
+        return Mode::ClaudeWrapper;
+    }
+    let Some(first) = first else {
+        return if build == Build::Console { Mode::NoCommand } else { Mode::App };
+    };
+    match first.to_str() {
+        Some(claude::HOOK_FLAG) => Mode::Hook,
+        Some(claude::LAUNCH_FLAG) => Mode::Launch,
+        Some(session::EXEC_FLAG) => Mode::Exec,
+        Some(cli::FLOW_COMMAND) => Mode::Flow,
+        Some("--help" | "-h") => Mode::Help,
+        _ => Mode::Unknown(first.to_string_lossy().into_owned()),
+    }
+}
 
 /// The command-line modes, shared by the app and its console build: the exit code,
-/// or None to start the app (no arguments). `console` says this is the console build.
-pub fn dispatch(console: bool) -> Option<i32> {
-    use std::io::Write;
-    CONSOLE.store(console, std::sync::atomic::Ordering::Relaxed);
+/// or None to start the app.
+pub fn dispatch(build: Build) -> Option<i32> {
+    use std::io::{IsTerminal, Write};
     // `args_os`, so an argument that is not UTF-8 cannot panic before the app starts.
-    let mode = std::env::args_os().nth(1);
-    let code = match mode.as_ref().and_then(|m| m.to_str()) {
-        // Claude Code runs this binary as its SessionStart hook for Claude tabs.
-        Some(claude::HOOK_FLAG) => claude::run_hook(),
+    let first = std::env::args_os().nth(1);
+    #[cfg(windows)]
+    let as_claude = invoked_as_claude();
+    #[cfg(unix)]
+    let as_claude = false;
+    let code = match mode(build, first.as_deref(), as_claude) {
+        Mode::App => return None,
+        // Claude Code runs this binary as its hook.
+        Mode::Hook => claude::run_hook(),
         // The `claude` wrapper in terminal tabs starts Claude through this binary.
-        Some(claude::LAUNCH_FLAG) => run_launch(),
+        Mode::Launch => run_launch(build),
         // Non-POSIX login shells launch Claude tabs through this binary.
-        Some(session::EXEC_FLAG) => run_exec(),
+        Mode::Exec => run_exec(),
         // Flows from the command line, for a person or for Claude.
-        Some(cli::FLOW_COMMAND) => cli::run(std::env::args_os().skip(2).collect()),
-        // On Windows the console build is linked into terminal tabs as `claude.exe`.
+        Mode::Flow => cli::run(std::env::args_os().skip(2).collect()),
         #[cfg(windows)]
-        _ if console && invoked_as_claude() => run_as_claude_wrapper(),
-        None if mode.is_none() => return None,
+        Mode::ClaudeWrapper => run_as_claude_wrapper(),
+        #[cfg(unix)]
+        Mode::ClaudeWrapper => unreachable!("only Windows links the console build as claude"),
         // Not print!, which panics on a closed stdout.
-        Some("--help" | "-h") => {
+        Mode::Help => {
             let _ = std::io::stdout().write_all(cli::APP_HELP.as_bytes());
             0
         }
+        Mode::NoCommand => {
+            // With input waiting, this is likely Claude Code running misag's hook
+            // without its arguments, as one that predates hooks' `args` does.
+            let why = if std::io::stdin().is_terminal() {
+                String::new()
+            } else {
+                format!(" (if Claude Code ran this as a hook, update it: misag's hooks need {})", claude::HOOK_ARGS_SINCE)
+            };
+            let _ = writeln!(std::io::stderr(), "misag: give a command; see misag --help{why}");
+            2
+        }
         // Anything else is a mistake, such as a mistyped `flow`: say so rather than
         // start the app, which a person or Claude might not notice.
-        _ => {
-            let shown = mode.unwrap_or_default();
-            let _ = writeln!(std::io::stderr(), "misag: unknown command {:?}; see misag --help", shown.to_string_lossy());
+        Mode::Unknown(shown) => {
+            let _ = writeln!(std::io::stderr(), "misag: unknown command {shown:?}; see misag --help");
             2
         }
     };
@@ -211,6 +321,45 @@ pub fn dispatch(console: bool) -> Option<i32> {
 fn invoked_as_claude() -> bool {
     let exe = std::env::current_exe().ok();
     exe.as_deref().and_then(std::path::Path::file_stem).is_some_and(|stem| stem.eq_ignore_ascii_case("claude"))
+}
+
+/// The log the app writes its diagnostics to when it has no terminal: started from
+/// a menu, Finder or the Start menu, its stderr goes nowhere (on Windows it has none).
+pub const LOG_FILE: &str = "misag.log";
+/// A log larger than this is started over at the next launch.
+const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Sends stderr to `LOG_FILE` in `dir` unless a terminal shows it.
+fn log_to_file(dir: &std::path::Path) {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let path = dir.join(LOG_FILE);
+    let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES);
+    let file = std::fs::create_dir_all(dir).and_then(|()| {
+        std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(&path)
+    });
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("misag: cannot write the log {}: {e}", path.display());
+            return;
+        }
+    };
+    #[cfg(unix)]
+    let redirected = {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain syscall; `file` is leaked below, so its descriptor stays open.
+        if unsafe { libc::dup2(file.as_raw_fd(), 2) } < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    };
+    #[cfg(windows)]
+    let redirected = win::redirect_stderr(&file);
+    match redirected {
+        // Kept open for the rest of the run.
+        Ok(()) => std::mem::forget(file),
+        Err(e) => eprintln!("misag: cannot log to {}: {e}", path.display()),
+    }
 }
 
 /// The app's database, ready to use, taken over from raterm's in `old_dir` on the
@@ -265,7 +414,7 @@ fn install_wrapper(store: &db::Db, exe: &commands::AppExe) -> commands::Wrapper 
 }
 
 pub fn run() {
-    let exe = own_exe();
+    let exe = own_exe(Build::App);
     let sessions = match exe.path_str() {
         Ok(exe) => session::Sessions::default().with_trampoline(exe.to_owned()),
         Err(e) => {
@@ -292,6 +441,9 @@ pub fn run() {
         .manage(history::Cache::default())
         .setup(|app| {
             let dir = app.path().app_data_dir().map_err(|e| e.to_string());
+            if let Ok(dir) = &dir {
+                log_to_file(&in_build(dir.clone()));
+            }
             let old_dir = dir.as_deref().ok().and_then(raterm_data_dir);
             let store = open_store(dir.map(in_build), old_dir.map(in_build));
             app.manage(install_wrapper(&store, &app.state::<commands::AppExe>()));
@@ -360,6 +512,7 @@ pub(crate) mod test_support {
         dir
     }
 
+    #[cfg(unix)]
     /// Permission tests skip themselves as root, which file permissions do not restrict.
     pub fn running_as_root() -> bool {
         // SAFETY: plain syscall without arguments.
@@ -376,6 +529,45 @@ mod tests {
     use super::*;
     use claude::SessionId;
     use layout::{Layout, Tab, TabId, TabKind};
+    use std::path::Path;
+
+    #[test]
+    fn modes_follow_the_first_argument() {
+        use std::ffi::OsStr;
+        let mode_of = |build, first: Option<&str>| mode(build, first.map(OsStr::new), false);
+        assert_eq!(mode_of(Build::App, None), Mode::App);
+        assert_eq!(mode_of(Build::Console, None), Mode::NoCommand, "the console build only runs commands");
+        assert_eq!(mode_of(Build::App, Some(claude::HOOK_FLAG)), Mode::Hook);
+        assert_eq!(mode_of(Build::Console, Some(claude::LAUNCH_FLAG)), Mode::Launch);
+        assert_eq!(mode_of(Build::App, Some(session::EXEC_FLAG)), Mode::Exec);
+        assert_eq!(mode_of(Build::App, Some("flow")), Mode::Flow);
+        assert_eq!(mode_of(Build::App, Some("-h")), Mode::Help);
+        assert_eq!(mode_of(Build::App, Some("flwo")), Mode::Unknown("flwo".into()));
+    }
+
+    #[test]
+    fn as_claude_every_argument_is_claudes() {
+        use std::ffi::OsStr;
+        for first in [None, Some("flow"), Some(claude::HOOK_FLAG), Some("--help")] {
+            assert_eq!(mode(Build::Console, first.map(OsStr::new), true), Mode::ClaudeWrapper, "{first:?}");
+        }
+        assert_eq!(mode(Build::App, Some(OsStr::new("flow")), true), Mode::Flow, "only the console build wraps claude");
+    }
+
+    #[test]
+    fn the_wrapper_finds_claude_but_never_itself() {
+        let dirs = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let own = Path::new("/data/bin");
+        // Relative and empty entries (`;;`) would look in the tab's own folder.
+        let kept = path_without(dirs(&["/data/bin/", "", "rel", "/usr/bin", "/DATA/BIN", "/home/u/.local/bin"]), Some(own));
+        assert_eq!(kept, dirs(&["/usr/bin", "/home/u/.local/bin"]));
+        let present = ["/usr/bin/claude.cmd", "/home/u/.local/bin/claude.exe"];
+        let is_file = |p: &Path| present.contains(&p.to_str().unwrap());
+        assert_eq!(find_claude(&kept, None, is_file), Some(PathBuf::from("/usr/bin/claude.cmd")));
+        let own_exe = Path::new("/USR/BIN/Claude.cmd");
+        assert_eq!(find_claude(&kept, Some(own_exe), is_file), Some(PathBuf::from("/home/u/.local/bin/claude.exe")));
+        assert_eq!(find_claude(&kept, None, |_| false), None, "not found: the caller exits 127");
+    }
 
     /// The values the page reads, one of each shape, as src/ipc.fixtures.json holds
     /// them; src/ipc.test.ts checks the TypeScript mirrors against that file, so a

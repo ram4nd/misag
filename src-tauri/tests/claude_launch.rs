@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Runs the real `misag` binary in `--claude-launch` mode, as the `claude` wrapper
 //! in terminal tabs does, with a stand-in `claude` that prints its arguments.
 

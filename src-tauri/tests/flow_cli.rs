@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Runs the real `misag` binary's `flow` command, as a person or Claude would in a
 //! terminal, against a database of its own.
 

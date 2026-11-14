@@ -62,10 +62,12 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(unix)]
     fn names(listing: &Listing) -> Vec<(&str, bool)> {
         listing.entries.iter().map(|e| (e.name.as_str(), e.dir)).collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn lists_folders_first_without_hidden_entries() {
         let dir = crate::test_support::temp_dir("files-list");
@@ -99,7 +101,7 @@ mod tests {
 
     #[test]
     fn expands_the_home_directory_and_reports_errors() {
-        let home = std::env::var("HOME").unwrap();
+        let home = crate::session::home_dir().unwrap();
         assert_eq!(list("~").unwrap().dir, home);
         let err = list("/no/such/dir").unwrap_err();
         assert!(err.contains("/no/such/dir"), "{err}");

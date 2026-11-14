@@ -48,6 +48,10 @@ describe("on Windows", () => {
     expect(shellQuote("C:\\p\\src\\main.ts", true)).toBe("C:\\p\\src\\main.ts");
     expect(shellQuote("C:\\p\\my notes.txt", true)).toBe("'C:\\p\\my notes.txt'");
     expect(shellQuote("C:\\p\\it's", true)).toBe("'C:\\p\\it''s'");
+    for (const quote of ["\u2018", "\u2019", "\u201a", "\u201b"]) {
+      // PowerShell ends a single-quoted string at any of these too, so each is doubled.
+      expect(shellQuote(`C:\\a${quote}; calc; ${quote}b.txt`, true)).toBe(`'C:\\a${quote}${quote}; calc; ${quote}${quote}b.txt'`);
+    }
     for (const risky of ["$HOME", "`id`", "a;b", "@x", "a,b", "(x)", "{x}"]) {
       expect(shellQuote(risky, true), risky).toBe(`'${risky}'`);
     }
@@ -71,5 +75,9 @@ describe("on Windows", () => {
     expect(folderLabel("C:\\Users\\ra\\", "C:\\Users\\ra", true)).toBe("~");
     expect(folderLabel("C:\\", null, true)).toBe("C:\\");
     expect(folderLabel("C:/Users/ra/x", null, true)).toBe("x");
+    expect(folderLabel("C:", null, true)).toBe("C:\\");
+    // Windows ignores case; Linux does not.
+    expect(folderLabel("c:\\users\\RA", "C:\\Users\\ra", true)).toBe("~");
+    expect(folderLabel("/home/RA", "/home/ra", false)).toBe("RA");
   });
 });

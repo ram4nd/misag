@@ -3,10 +3,12 @@ export const WINDOWS = typeof navigator !== "undefined" && /Windows/.test(naviga
 
 /**
  * Shell-quotes `s` unless it is plain enough to type as is: for a POSIX shell, or on
- * Windows for PowerShell, whose single quotes take everything but `'` (written `''`).
+ * Windows for PowerShell, whose single quotes take everything but a single quote,
+ * which is written twice. PowerShell also reads the typographic quotes ‘ ’ ‚ ‛ as
+ * single quotes, and Windows file names may hold them.
  */
 export function shellQuote(s: string, windows = WINDOWS): string {
-  if (windows) return /^[\w%+=:./\\-]+$/.test(s) ? s : `'${s.replace(/'/g, "''")}'`;
+  if (windows) return /^[\w%+=:./\\-]+$/.test(s) ? s : `'${s.replace(/['\u2018\u2019\u201a\u201b]/g, "$&$&")}'`;
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
 }
 
@@ -42,7 +44,9 @@ export function folderLabel(path: string, home: string | null, windows = WINDOWS
   const trimmed = path.replace(separators, "");
   if (!trimmed) return "/";
   if (windows && /^[A-Za-z]:$/.test(trimmed)) return `${trimmed}\\`;
-  if (home !== null && trimmed === home.replace(separators, "")) return "~";
+  // Windows paths ignore case.
+  const same = (a: string, b: string) => (windows ? a.toLowerCase() === b.toLowerCase() : a === b);
+  if (home !== null && same(trimmed, home.replace(separators, ""))) return "~";
   const last = windows ? Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\")) : trimmed.lastIndexOf("/");
   return trimmed.slice(last + 1);
 }

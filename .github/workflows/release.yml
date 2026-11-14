@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag such as v0.1.0 to build every platform into one draft GitHub Release,
-# then publish the draft on GitHub once all jobs have finished.
+# Push a tag such as v0.1.0 to build every platform into one draft GitHub Release.
+# Publishing it is left to a person: open the draft once every job has passed (a
+# failed job leaves its platform's installer out) and press Publish.
 # Run it by hand (Actions > Release > Run workflow) to build every platform without
 # a release: the packages are kept as the run's artifacts instead.
 on:
@@ -50,24 +51,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
 
+      - name: Check that the tag matches the app's version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for file in package.json src-tauri/tauri.conf.json; do
+            have=$(node -p "require('./$file').version")
+            [ "$have" = "$want" ] || { echo "::error::$file has version $have, but the tag is $GITHUB_REF_NAME"; exit 1; }
+          done
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          [ "$have" = "$want" ] || { echo "::error::src-tauri/Cargo.toml has version $have, but the tag is $GITHUB_REF_NAME"; exit 1; }
+
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm test
 
+      # The Rust tests need the built page, which the app embeds.
+      - run: pnpm build
+
       # Windows terminals only wait for, and show the output of, console programs, so
-      # the app ships its console build `misag-cli.exe` beside it (see
-      # src-tauri/tauri.windows.conf.json). The build script wants the file present
-      # before it can build it, so a placeholder stands in first.
+      # the app ships its console build misag-cli.exe beside it.
       - name: Build the console misag for Windows
         if: runner.os == 'Windows'
         shell: bash
-        run: |
-          pnpm build
-          cd src-tauri
-          mkdir -p binaries
-          touch binaries/misag-cli-x86_64-pc-windows-msvc.exe
-          cargo build --release --bin misag-cli
-          cp target/release/misag-cli.exe binaries/misag-cli-x86_64-pc-windows-msvc.exe
+        run: scripts/build-windows-cli.sh
+
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - uses: tauri-apps/tauri-action@v1
         env:

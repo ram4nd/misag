@@ -59,6 +59,9 @@ pub const STOP_CAP: u32 = 51;
 const MAX_CONTEXT: usize = 9_000;
 /// Command-line flag that runs the binary as the hook.
 pub const HOOK_FLAG: &str = "--claude-hook";
+/// The Claude Code that first runs a hook's `args` (its exec form), which misag's
+/// hooks use on Windows.
+pub const HOOK_ARGS_SINCE: &str = "Claude Code from mid-May 2026 (hooks with `args`)";
 /// Command-line flag the wrapper runs the binary with to start the real `claude`.
 pub const LAUNCH_FLAG: &str = "--claude-launch";
 /// Hook failures are appended here, next to the database, since Claude does not
@@ -180,15 +183,14 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The hook command line. Claude runs hook commands through a POSIX shell, so the
-/// path is single-quoted.
+/// The hook command line for a POSIX shell, which Claude runs hook commands through
+/// everywhere but Windows (see `hook_entry`), so the path is single-quoted.
 pub fn hook_command(exe: &Path) -> String {
     format!("{} {HOOK_FLAG}", shell_quote(&exe.to_string_lossy()))
 }
 
 /// misag's hook as Claude's settings give it: a command line for the shell, or with
-/// `direct` the program and its arguments, run without a shell (Claude Code 2.1.x
-/// from May 2026 on).
+/// `direct` the program and its arguments, run without a shell (`HOOK_ARGS_SINCE`).
 fn hook_entry(exe: &Path, direct: bool) -> Value {
     if direct {
         serde_json::json!({ "type": "command", "command": exe.to_string_lossy(), "args": [HOOK_FLAG] })
@@ -226,7 +228,7 @@ pub fn cli_dir(db: &Path) -> Option<PathBuf> {
 /// The `misag` shim: runs `exe`, the misag that runs the tab, so `misag flow` in a
 /// tab (by the person or by Claude) works on that app's database whichever misag,
 /// if any, is installed on PATH.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 fn cli_script(exe: &Path) -> String {
     let exe = shell_quote(&exe.to_string_lossy());
     format!(
@@ -262,7 +264,7 @@ fn install_script(dir: &Path, what: &str, name: &str, text: &str) -> Result<(), 
 /// Claude session (`CLAUDECODE`, which
 /// terminal tabs never inherit) it runs `claude` unchanged, so a `claude` that
 /// Claude itself runs cannot replace the session recorded for the tab.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(unix)]
 fn wrapper_script(dir: &str, exe: &Path) -> String {
     let (dir, exe) = (shell_quote(dir), shell_quote(&exe.to_string_lossy()));
     format!(
@@ -312,24 +314,32 @@ pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
 /// cannot be replaced, so it is moved aside first and removed at a later start.
 #[cfg(windows)]
 fn install_link(dir: &Path, what: &str, name: &str, exe: &Path) -> Result<(), String> {
-    let failed = |e: std::io::Error| format!("cannot write {what} in {}: {e}", dir.display());
-    std::fs::create_dir_all(dir).map_err(failed)?;
+    let failed = |step: &str, e: std::io::Error| format!("cannot write {what} in {} ({step}): {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(|e| failed("creating the folder", e))?;
     let target = dir.join(name);
-    let aside = dir.join(format!(".{name}.old"));
+    let stale = format!(".{name}.old");
     if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let stale = entry.file_name().to_string_lossy().starts_with(&format!(".{name}.old"));
-            if stale {
-                // Still running in some tab: left for next time.
-                let _ = std::fs::remove_file(entry.path());
+        for entry in entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(&stale)) {
+            // One a tab still runs cannot be removed yet: left for a later start.
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                if e.kind() != std::io::ErrorKind::PermissionDenied {
+                    eprintln!("misag: cannot remove the old {what} {}: {e}", entry.path().display());
+                }
             }
         }
     }
     if target.exists() && std::fs::remove_file(&target).is_err() {
-        let aside = (0..).map(|n| aside.with_extension(format!("old{n}"))).find(|p| !p.exists()).unwrap_or(aside);
-        std::fs::rename(&target, &aside).map_err(failed)?;
+        let aside = (0..u32::MAX).map(|n| dir.join(format!("{stale}{n}"))).find(|p| !p.exists());
+        let aside = aside.ok_or_else(|| failed("moving the old one aside", std::io::Error::other("no free name")))?;
+        std::fs::rename(&target, &aside).map_err(|e| failed("moving the old one aside", e))?;
     }
-    std::fs::hard_link(exe, &target).or_else(|_| std::fs::copy(exe, &target).map(|_| ())).map_err(failed)
+    match std::fs::hard_link(exe, &target) {
+        Ok(()) => Ok(()),
+        // Across drives, or where a link is not allowed, a copy does as well.
+        Err(link) => std::fs::copy(exe, &target)
+            .map(|_| ())
+            .map_err(|e| failed("linking or copying", std::io::Error::other(format!("link: {link}; copy: {e}")))),
+    }
 }
 
 /// Writes the `misag` shim (see `cli_script`) into `cli_dir(db)`, replacing any
@@ -660,6 +670,7 @@ mod tests {
     use crate::layout::{Layout, Tab, TabKind};
     use std::fs;
     use std::io::Write;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -740,6 +751,7 @@ mod tests {
         assert_eq!(serde_json::from_str::<serde_json::Value>(&args[3]).unwrap(), serde_json::json!({ "autoMemoryEnabled": false }));
     }
 
+    #[cfg(unix)]
     /// Writes an executable stand-in at `path` that prints `name`, its arguments
     /// and `PATH`, one per line.
     fn stand_in(path: &Path, name: &str) {
@@ -748,6 +760,7 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(unix)]
     /// Runs the installed wrapper with stand-ins for misag and the real `claude`.
     fn run_wrapper(base: &Path, extra_env: &[(&str, &str)]) -> Vec<String> {
         let exe = base.join("my apps/misag");
@@ -767,6 +780,7 @@ mod tests {
         String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_wrapper_hands_claude_to_misag() {
         let base = crate::test_support::temp_dir("wrapper");
@@ -778,6 +792,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_misag_shim_runs_this_misag_and_stays_on_claude_s_path() {
         let base = crate::test_support::temp_dir("wrapper-cli");
@@ -812,6 +827,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_wrapper_whose_misag_is_gone_still_runs_claude() {
         let base = crate::test_support::temp_dir("wrapper-stale");
@@ -831,6 +847,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_install_leaves_no_partial_wrapper() {
         if crate::test_support::running_as_root() {
@@ -847,6 +864,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_shim_that_cannot_be_written_says_so_and_leaves_the_wrapper_alone() {
         if crate::test_support::running_as_root() {
@@ -862,6 +880,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn inside_a_claude_session_the_wrapper_adds_no_hook() {
         let base = crate::test_support::temp_dir("wrapper-nested");
@@ -910,6 +929,7 @@ mod tests {
         fs::remove_dir_all(&base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_transcript_that_cannot_be_checked_is_an_error_not_absent() {
         if crate::test_support::running_as_root() {

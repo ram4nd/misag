@@ -473,11 +473,13 @@ mod tests {
         assert_eq!(titles(&Cache::default().list(&projects, 100, &[]).unwrap().sessions), ["after"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unreadable_transcripts_are_counted_and_the_others_listed() {
         if crate::test_support::running_as_root() {
             return;
         }
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let projects = crate::test_support::temp_dir("history-unreadable").join("projects");
         transcript(&projects, "/w", A, &[user("/w", r#""fine""#)], 10);
@@ -580,11 +582,13 @@ mod tests {
         assert_eq!(page.gone_pins, []);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_project_folder_is_counted_and_the_others_listed() {
         if crate::test_support::running_as_root() {
             return;
         }
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let projects = crate::test_support::temp_dir("history-locked-folder").join("projects");
         transcript(&projects, "/w", A, &[user("/w", r#""fine""#)], 0);
@@ -599,11 +603,13 @@ mod tests {
         assert_eq!(page.gone_pins, []);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failed_read_is_tried_again_after_a_while() {
         if crate::test_support::running_as_root() {
             return;
         }
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let projects = crate::test_support::temp_dir("history-retry").join("projects");
         transcript(&projects, "/w", A, &[user("/w", r#""later""#)], 0);
@@ -680,6 +686,7 @@ mod tests {
         assert_eq!(page.gone_pins, [gone]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn pins_are_not_reported_gone_when_a_folder_could_not_be_read() {
         let projects = crate::test_support::temp_dir("history-pins-incomplete").join("projects");

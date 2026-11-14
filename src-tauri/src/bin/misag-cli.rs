@@ -3,9 +3,6 @@
 //! Linked into terminal tabs as `misag.exe` and as the `claude.exe` wrapper.
 
 fn main() {
-    let code = misag_lib::dispatch(true).unwrap_or_else(|| {
-        eprintln!("misag: give a command; see misag --help");
-        2
-    });
-    std::process::exit(code)
+    // Without arguments it says so itself (see `dispatch`).
+    std::process::exit(misag_lib::dispatch(misag_lib::Build::Console).unwrap_or(2))
 }

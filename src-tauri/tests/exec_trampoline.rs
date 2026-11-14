@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Claude tabs under a non-POSIX login shell (fish, csh, ...) go through
 //! `misag --exec`. A shell named `fish` that is really `sh` stands in for one
 //! here, since it is enough to route the launch through the trampoline.
