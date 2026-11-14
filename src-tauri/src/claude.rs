@@ -186,6 +186,17 @@ pub fn hook_command(exe: &Path) -> String {
     format!("{} {HOOK_FLAG}", shell_quote(&exe.to_string_lossy()))
 }
 
+/// misag's hook as Claude's settings give it: a command line for the shell, or with
+/// `direct` the program and its arguments, run without a shell (Claude Code 2.1.x
+/// from May 2026 on).
+fn hook_entry(exe: &Path, direct: bool) -> Value {
+    if direct {
+        serde_json::json!({ "type": "command", "command": exe.to_string_lossy(), "args": [HOOK_FLAG] })
+    } else {
+        serde_json::json!({ "type": "command", "command": hook_command(exe) })
+    }
+}
+
 /// The `--settings` JSON: `keys` (from misag's own settings) plus, with `hook_exe`,
 /// misag's hook for SessionStart (to record the tab's session), Stop (to record
 /// background tasks and move the tab's flow run on) and SessionEnd (to forget the
@@ -194,8 +205,9 @@ pub fn hook_command(exe: &Path) -> String {
 fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
     if let Some(exe) = hook_exe {
         debug_assert!(!keys.contains_key("hooks"), "a setting would replace misag's hook");
-        let command = hook_command(exe);
-        let hook = serde_json::json!([{ "hooks": [{ "type": "command", "command": command }] }]);
+        // Windows may run hook commands through Git Bash or PowerShell, which quote
+        // differently, so there the hook runs without a shell.
+        let hook = serde_json::json!([{ "hooks": [hook_entry(exe, cfg!(windows))] }]);
         keys.insert("hooks".into(), serde_json::json!({ "SessionStart": hook, "Stop": hook, "SessionEnd": hook }));
     }
     (!keys.is_empty()).then(|| Value::Object(keys).to_string())
@@ -710,6 +722,15 @@ mod tests {
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         assert_eq!(settings["autoMemoryEnabled"], false);
         assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"], "'/opt/my apps/misag' --claude-hook");
+    }
+
+    #[test]
+    fn hooks_run_through_a_shell_or_directly() {
+        let shell = hook_entry(Path::new("/opt/my apps/misag"), false);
+        assert_eq!(shell, serde_json::json!({ "type": "command", "command": "'/opt/my apps/misag' --claude-hook" }));
+        let exe = r"C:\Users\Ra Mänd\AppData\Roaming\io.github.ram4nd.misag\bin\claude.exe";
+        let direct = hook_entry(Path::new(exe), true);
+        assert_eq!(direct, serde_json::json!({ "type": "command", "command": exe, "args": ["--claude-hook"] }));
     }
 
     #[test]
