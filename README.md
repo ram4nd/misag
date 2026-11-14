@@ -23,7 +23,7 @@ Built with Tauri 2, a Rust PTY backend (`portable-pty`), wterm and SQLite.
 
 ## Install
 
-Each GitHub Release has a Linux `.deb` and AppImage, an Apple Silicon macOS `.dmg` and a Windows `.msi`. The macOS build is not notarized yet, so after copying it to Applications run `xattr -dr com.apple.quarantine "/Applications/Mischief of Agents.app"` once. On Windows, tabs run PowerShell (PowerShell 7 when installed).
+Each GitHub Release has a Linux `.deb` and AppImage, an Apple Silicon macOS `.dmg` and a Windows `.msi`. The macOS build is signed and notarized by Apple. On Windows, tabs run PowerShell (PowerShell 7 when installed).
 
 To build it from source instead (on Linux) you need:
 
