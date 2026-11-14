@@ -276,6 +276,9 @@ pub fn launch_for(plan: &LaunchPlan) -> (Launch, Env) {
     }
 }
 
+/// What separates directories in PATH.
+pub const PATH_SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
+
 /// The PATH for a tab: misag's own `path` without `inherited` (the wrapper and
 /// shim directories of a misag, or a raterm, this one was started from, whose hook
 /// would report to that app's database) and with `first` first, in order. None when
@@ -288,9 +291,9 @@ pub fn tab_path(path: Option<&OsStr>, inherited: &[&OsStr], first: &[&Path]) -> 
         let dir = Path::new(dir);
         inherited.iter().any(|d| Path::new(d) == dir) || first.iter().any(|f| Path::new(f) == dir)
     };
-    let kept = path.split(':').filter(|dir| !path.is_empty() && !skip(dir));
+    let kept = path.split(PATH_SEPARATOR).filter(|dir| !path.is_empty() && !skip(dir));
     let joined: Vec<&str> = first.iter().copied().chain(kept).collect();
-    let joined = joined.join(":");
+    let joined = joined.join(&PATH_SEPARATOR.to_string());
     (joined != path).then_some(joined)
 }
 
@@ -327,7 +330,7 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, dirs: &TabDirs) -> Res
     let inherited: Vec<&OsStr> = dirs.inherited.iter().map(|d| d.as_os_str()).collect();
     if let Some(path) = tab_path(dirs.path.as_deref(), &inherited, &first) {
         // Only claimed once they are really on PATH, so a misag started here knows what to drop.
-        let on_path = |dir: Option<&Path>| dir.and_then(Path::to_str).filter(|d| path.split(':').any(|p| p == *d)).map(str::to_owned);
+        let on_path = |dir: Option<&Path>| dir.and_then(Path::to_str).filter(|d| path.split(PATH_SEPARATOR).any(|p| p == *d)).map(str::to_owned);
         if let Some(dir) = on_path(wrapper) {
             env.push((claude::WRAPPER_ENV.to_string(), dir));
         }
@@ -590,6 +593,11 @@ pub fn clipboard_text(app: tauri::AppHandle) -> Result<Option<String>, CommandEr
         let _ = app;
         Ok(pasteboard_text()?)
     }
+    #[cfg(windows)]
+    {
+        let _ = app;
+        Ok(crate::win::clipboard_text()?)
+    }
 }
 
 /// The general pasteboard's text, through `pbpaste`, which every macOS has.
@@ -768,7 +776,7 @@ pub fn claude_history(
     limit: usize,
 ) -> Result<crate::history::Page, CommandError> {
     let Some(projects) = claude::projects_dir() else {
-        return Err("Claude's config folder is unknown: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string().into());
+        return Err("Claude's config folder is unknown: neither CLAUDE_CONFIG_DIR nor your home folder is set".to_string().into());
     };
     let page = cache.list(&projects, limit, &db.pinned_sessions()?)?;
     for id in &page.gone_pins {

@@ -1,4 +1,5 @@
 import { CLAUDE_ICON, icon } from "./icons";
+import { folderLabel, WINDOWS } from "./paths";
 
 /** Mirrors `files::Entry` in src-tauri/src/files.rs. */
 export interface Entry {
@@ -65,8 +66,8 @@ export function createTree(el: HTMLUListElement, opts: TreeOptions): Tree {
       ul.replaceChildren(note(opts.errorText(err), depth, true));
       return undefined;
     }
-    const base = listing.dir.replace(/\/+$/, "");
-    const items = listing.entries.map((e) => item(`${base}/${e.name}`, e, depth));
+    const base = listing.dir.replace(/[\\/]+$/, "");
+    const items = listing.entries.map((e) => item(`${base}${WINDOWS ? "\\" : "/"}${e.name}`, e, depth));
     if (!items.length) items.push(note(listing.skipped ? `No visible entries (${listing.skipped} hidden)` : "Empty", depth));
     if (listing.truncated) items.push(note("More entries not shown", depth));
     ul.replaceChildren(...items);
@@ -132,7 +133,7 @@ export function createTree(el: HTMLUListElement, opts: TreeOptions): Tree {
     const head = document.createElement("li");
     const label = document.createElement("div");
     label.className = "row root";
-    label.textContent = dir.replace(/\/+$/, "").split("/").pop() || dir;
+    label.textContent = folderLabel(dir, null);
     label.title = dir;
     const children = document.createElement("ul");
     head.append(withClaudeButton(label, dir));

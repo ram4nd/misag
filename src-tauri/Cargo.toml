@@ -2,6 +2,8 @@
 name = "misag"
 version = "0.1.1"
 edition = "2024"
+# The app; `misag-cli` is the console build of the same commands for Windows terminals.
+default-run = "misag"
 license = "GPL-3.0-only"
 
 [lib]
@@ -24,6 +26,21 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 libc = "0.2"
 tauri-plugin-dialog = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Wdk_System_Threading",
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Console",
+  "Win32_System_DataExchange",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # The GTK that Tauri runs on, to read the primary selection (see commands::primary_selection).

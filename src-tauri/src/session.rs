@@ -44,6 +44,9 @@ struct Session {
     pid: Option<u32>,
     /// Set once the child has been reaped, so SIGKILL never hits a reused pid.
     exited: Arc<ExitFlag>,
+    /// The tab's processes on Windows, which has no process groups to signal.
+    #[cfg(windows)]
+    job: Option<Arc<crate::win::Job>>,
 }
 
 /// Set by the thread that reaps a session's child; others can wait for it.
@@ -74,23 +77,37 @@ impl Session {
         if let Err(e) = lock(&self.killer).kill() {
             eprintln!("misag: SIGHUP to pid {:?} failed: {e}", self.pid);
         }
-        let pid = self.pid?;
-        // The foreground job may sit in its own process group under job control.
-        let foreground = lock(&self.master).process_group_leader();
         let exited = self.exited.clone();
-        Some(std::thread::spawn(move || {
-            if exited.wait(grace) {
-                return;
-            }
-            // SAFETY: plain syscalls. The child is not reaped yet (`exited` is false),
-            // so its pid, and therefore its process group, still exist.
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                if let Some(fg) = foreground.filter(|&fg| fg > 0 && fg != pid as libc::pid_t) {
-                    libc::kill(-fg, libc::SIGKILL);
+        #[cfg(unix)]
+        {
+            let pid = self.pid?;
+            // The foreground job may sit in its own process group under job control.
+            let foreground = lock(&self.master).process_group_leader();
+            Some(std::thread::spawn(move || {
+                if exited.wait(grace) {
+                    return;
                 }
-            }
-        }))
+                // SAFETY: plain syscalls. The child is not reaped yet (`exited` is false),
+                // so its pid, and therefore its process group, still exist.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    if let Some(fg) = foreground.filter(|&fg| fg > 0 && fg != pid as libc::pid_t) {
+                        libc::kill(-fg, libc::SIGKILL);
+                    }
+                }
+            }))
+        }
+        // The shell is gone already (Windows has no hang-up signal); what it
+        // started gets the grace period to exit with the console closed.
+        #[cfg(windows)]
+        {
+            let job = self.job.clone()?;
+            Some(std::thread::spawn(move || {
+                if !exited.wait(grace) {
+                    job.terminate();
+                }
+            }))
+        }
     }
 }
 
@@ -119,8 +136,10 @@ impl From<String> for SpawnError {
 
 /// Shells (matched by file name) whose `-c` takes `"$0" "$@"` the POSIX way. Any
 /// other shell is treated as non-POSIX and goes through the trampoline.
+#[cfg_attr(windows, allow(dead_code))]
 const POSIX_SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash"];
 
+#[cfg_attr(windows, allow(dead_code))]
 fn is_posix_shell(shell: &str) -> bool {
     let name = Path::new(shell).file_name().and_then(|n| n.to_str()).unwrap_or(shell);
     POSIX_SHELLS.contains(&name)
@@ -182,6 +201,7 @@ pub const EXEC_FLAG: &str = "--exec";
 
 /// Whether `path` can be single-quoted the same way in every common shell (POSIX
 /// shells, fish and csh): it contains none of `'`, `\`, `!` or a newline.
+#[cfg_attr(windows, allow(dead_code))]
 fn quotable_everywhere(path: &str) -> bool {
     !path.contains(['\'', '\\', '!', '\n'])
 }
@@ -199,12 +219,31 @@ pub struct Sessions {
 
 impl Default for Sessions {
     fn default() -> Self {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| {
-            eprintln!("misag: $SHELL is not set, falling back to /bin/sh");
-            "/bin/sh".into()
-        });
-        Self::new(shell, KILL_GRACE)
+        Self::new(default_shell(), KILL_GRACE)
     }
+}
+
+/// The user's shell: `$SHELL`, else `/bin/sh`.
+#[cfg(unix)]
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| {
+        eprintln!("misag: $SHELL is not set, falling back to /bin/sh");
+        "/bin/sh".into()
+    })
+}
+
+/// PowerShell 7 (`pwsh`) when installed, else the Windows PowerShell every Windows has.
+#[cfg(windows)]
+fn default_shell() -> String {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let pwsh = std::env::split_paths(&path).map(|dir| dir.join("pwsh.exe")).find(|exe| exe.is_file());
+    pwsh.map_or_else(|| "powershell.exe".into(), |exe| exe.to_string_lossy().into_owned())
+}
+
+/// The user's home directory: `$HOME`, or on Windows `%USERPROFILE%`.
+pub fn home_dir() -> Option<String> {
+    let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
+    var("HOME").or_else(|| if cfg!(windows) { var("USERPROFILE") } else { None })
 }
 
 impl Sessions {
@@ -252,6 +291,31 @@ impl Sessions {
         for (key, value) in &req.env {
             cmd.env(key, value);
         }
+        #[cfg(windows)]
+        let mut cmd = match &req.launch {
+            // Windows has no login shells: every PowerShell reads the profile and
+            // inherits the user's environment. A program needs no shell at all.
+            Launch::Program { program, args } => {
+                let mut program_cmd = CommandBuilder::new(program);
+                program_cmd.args(args);
+                for key in &self.strip_env {
+                    program_cmd.env_remove(key);
+                }
+                for (key, value) in &req.env {
+                    program_cmd.env(key, value);
+                }
+                program_cmd
+            }
+            Launch::Command(c) if !c.trim().is_empty() => {
+                cmd.args(["-NoLogo", "-Command", c]);
+                cmd
+            }
+            _ => {
+                cmd.arg("-NoLogo");
+                cmd
+            }
+        };
+        #[cfg(unix)]
         match &req.launch {
             Launch::LoginShell => cmd.arg("-l"),
             Launch::Command(c) if c.trim().is_empty() => cmd.arg("-l"),
@@ -291,6 +355,13 @@ impl Sessions {
             .spawn_command(cmd)
             .map_err(|e| format!("could not start {shell} in {dir:?}: {e:#}"))?;
         drop(pair.slave);
+        #[cfg(windows)]
+        let job = child.process_id().and_then(|pid| {
+            crate::win::Job::for_process(pid)
+                .map_err(|e| eprintln!("misag: cannot group the processes of pid {pid}, so closing its tab may leave some running: {e}"))
+                .ok()
+                .map(Arc::new)
+        });
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let exited = Arc::new(ExitFlag::default());
@@ -303,6 +374,8 @@ impl Sessions {
                 killer: Mutex::new(child.clone_killer()),
                 pid: child.process_id(),
                 exited: exited.clone(),
+                #[cfg(windows)]
+                job,
             }),
         );
 
@@ -333,7 +406,12 @@ impl Sessions {
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(e) => {
                         // EIO is how Linux reports the slave side closing.
-                        if e.raw_os_error() != Some(libc::EIO) {
+                        #[cfg(unix)]
+                        let closed = e.raw_os_error() == Some(libc::EIO);
+                        // Windows reports it as a broken pipe.
+                        #[cfg(windows)]
+                        let closed = e.kind() == ErrorKind::BrokenPipe;
+                        if !closed {
                             eprintln!("misag: session {id} read failed: {e}");
                         }
                         break;
@@ -404,6 +482,15 @@ impl Sessions {
     /// such as `claude` typed at its prompt.
     /// An error means it could not be told (no such session, or the PTY query
     /// failed), which callers must not read as "nothing in the foreground".
+    #[cfg(windows)]
+    pub fn foreground(&self, id: u32) -> Result<Option<u32>, String> {
+        let pid = self.get(id)?.pid.ok_or_else(|| format!("session {id} has no process id"))?;
+        let all = crate::win::processes().map_err(|e| format!("session {id}: cannot list processes: {e}"))?;
+        Ok(crate::win::foreground(pid, &all))
+    }
+
+    /// The same, from the PTY's foreground process group.
+    #[cfg(unix)]
     pub fn foreground(&self, id: u32) -> Result<Option<u32>, String> {
         let s = self.get(id)?;
         let master = lock(&s.master);
@@ -476,6 +563,15 @@ mod proc_info {
         let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
         // Each argument ends in a NUL; a process that is exiting reads as empty.
         Some(super::nul_terminated(&raw))
+    }
+}
+
+#[cfg(windows)]
+mod proc_info {
+    pub use crate::win::{args, cwd};
+
+    pub fn name(pid: u32) -> Option<String> {
+        crate::win::process_name(pid)
     }
 }
 
@@ -577,15 +673,15 @@ pub fn cwd_or_home(cwd: Option<String>) -> Result<(Option<String>, bool), SpawnE
 /// `dir` with a leading `~` (alone or before `/`) replaced by `$HOME`; unchanged if
 /// `$HOME` is unset, and `~user` is left alone.
 pub fn expand_tilde(dir: &str) -> String {
-    match (dir.strip_prefix('~'), std::env::var("HOME")) {
-        (Some(rest), Ok(h)) if rest.is_empty() || rest.starts_with('/') => format!("{h}{rest}"),
+    match (dir.strip_prefix('~'), home_dir().ok_or(())) {
+        (Some(rest), Ok(h)) if rest.is_empty() || rest.starts_with(std::path::is_separator) => format!("{h}{rest}"),
         _ => dir.to_owned(),
     }
 }
 
 /// Resolves the requested working directory, expanding a leading `~`.
 fn resolve_cwd(cwd: Option<String>) -> Result<Option<String>, SpawnError> {
-    let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) else { return Ok(std::env::var("HOME").ok()) };
+    let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) else { return Ok(home_dir()) };
     let dir = expand_tilde(&dir);
     // Only "not found" means missing: a permission error or a dead mount must not
     // look like a vanished directory, or a restore would replace it with $HOME.

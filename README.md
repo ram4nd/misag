@@ -23,11 +23,10 @@ Built with Tauri 2, a Rust PTY backend (`portable-pty`), wterm and SQLite.
 
 ## Install
 
-Linux `.deb` and AppImage and Apple Silicon macOS `.dmg` builds are attached to each GitHub Release. The macOS build is not notarized yet, so after copying it to Applications run `xattr -dr com.apple.quarantine "/Applications/Mischief of Agents.app"` once. To build it from source instead:
+Each GitHub Release has a Linux `.deb` and AppImage, an Apple Silicon macOS `.dmg` and a Windows `.msi`. The macOS build is not notarized yet, so after copying it to Applications run `xattr -dr com.apple.quarantine "/Applications/Mischief of Agents.app"` once. On Windows, tabs run PowerShell (PowerShell 7 when installed).
 
-You need:
+To build it from source instead (on Linux) you need:
 
-- Linux
 - Rust (stable), Node.js and pnpm
 - Tauri's system libraries: `webkit2gtk-4.1`, `gtk3`, `libayatana-appindicator` (or `libappindicator-gtk3`) and `librsvg`. See https://tauri.app/start/prerequisites/
 - [Claude Code](https://claude.com/claude-code) on your login shell's `PATH`, for Claude tabs and flows

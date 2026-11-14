@@ -1026,6 +1026,13 @@ fn release_open_sessions(conn: &Connection) -> Result<usize, String> {
 }
 
 /// Whether process `pid` exists (one owned by another user counts).
+#[cfg(windows)]
+fn alive(pid: i64) -> bool {
+    u32::try_from(pid).is_ok_and(|pid| pid > 0 && crate::win::alive(pid))
+}
+
+/// Whether process `pid` exists (one owned by another user counts).
+#[cfg(unix)]
 fn alive(pid: i64) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
     if pid <= 0 {

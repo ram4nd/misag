@@ -42,3 +42,34 @@ describe("folderLabel", () => {
     expect(folderLabel("/", "/home/me")).toBe("/");
   });
 });
+
+describe("on Windows", () => {
+  test("quotes for PowerShell", () => {
+    expect(shellQuote("C:\\p\\src\\main.ts", true)).toBe("C:\\p\\src\\main.ts");
+    expect(shellQuote("C:\\p\\my notes.txt", true)).toBe("'C:\\p\\my notes.txt'");
+    expect(shellQuote("C:\\p\\it's", true)).toBe("'C:\\p\\it''s'");
+    for (const risky of ["$HOME", "`id`", "a;b", "@x", "a,b", "(x)", "{x}"]) {
+      expect(shellQuote(risky, true), risky).toBe(`'${risky}'`);
+    }
+  });
+
+  test("types backslashes but not control characters", () => {
+    expect(untypeable("C:\\p\\x.txt", true)).toBeNull();
+    expect(untypeable("C:\\p\\a\nb", true)).toContain("control characters");
+  });
+
+  test("takes drive paths as local and network paths and links as not", () => {
+    expect(notLocal("C:\\p\\x.txt", true)).toBeNull();
+    expect(notLocal("d:/p/x.txt", true)).toBeNull();
+    for (const remote of ["\\\\server\\share\\x", "https://example.com/x", "/p/x", "p\\x"]) {
+      expect(notLocal(remote, true), remote).toContain("not a local file");
+    }
+  });
+
+  test("labels folders split by either slash", () => {
+    expect(folderLabel("C:\\Users\\ra\\src\\misag", "C:\\Users\\ra", true)).toBe("misag");
+    expect(folderLabel("C:\\Users\\ra\\", "C:\\Users\\ra", true)).toBe("~");
+    expect(folderLabel("C:\\", null, true)).toBe("C:\\");
+    expect(folderLabel("C:/Users/ra/x", null, true)).toBe("x");
+  });
+});

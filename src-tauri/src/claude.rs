@@ -119,7 +119,7 @@ impl fmt::Display for SessionId {
 /// Claude's projects directory: `$CLAUDE_CONFIG_DIR/projects`, defaulting to
 /// `~/.claude/projects`.
 pub fn projects_dir() -> Option<PathBuf> {
-    projects_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"), std::env::var_os("HOME"))
+    projects_dir_from(std::env::var_os("CLAUDE_CONFIG_DIR"), crate::session::home_dir().map(OsString::from))
 }
 
 fn projects_dir_from(config_dir: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
@@ -214,6 +214,7 @@ pub fn cli_dir(db: &Path) -> Option<PathBuf> {
 /// The `misag` shim: runs `exe`, the misag that runs the tab, so `misag flow` in a
 /// tab (by the person or by Claude) works on that app's database whichever misag,
 /// if any, is installed on PATH.
+#[cfg_attr(windows, allow(dead_code))]
 fn cli_script(exe: &Path) -> String {
     let exe = shell_quote(&exe.to_string_lossy());
     format!(
@@ -227,6 +228,7 @@ exec {exe} "$@"
 
 /// Writes `text` as the executable `name` in `dir`, renamed into place, so a tab
 /// running it meanwhile never runs half a script. `what` names it in errors.
+#[cfg(unix)]
 fn install_script(dir: &Path, what: &str, name: &str, text: &str) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let failed = |e: std::io::Error| format!("cannot write {what} in {}: {e}", dir.display());
@@ -248,6 +250,7 @@ fn install_script(dir: &Path, what: &str, name: &str, text: &str) -> Result<(), 
 /// Claude session (`CLAUDECODE`, which
 /// terminal tabs never inherit) it runs `claude` unchanged, so a `claude` that
 /// Claude itself runs cannot replace the session recorded for the tab.
+#[cfg_attr(windows, allow(dead_code))]
 fn wrapper_script(dir: &str, exe: &Path) -> String {
     let (dir, exe) = (shell_quote(dir), shell_quote(&exe.to_string_lossy()));
     format!(
@@ -281,8 +284,40 @@ exec {exe} {LAUNCH_FLAG} "$@"
 pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
     let dir = wrapper_dir(db).ok_or_else(|| format!("{} has no directory", db.display()))?;
     let text = dir.to_str().ok_or_else(|| format!("{} is not valid UTF-8", dir.display()))?;
+    #[cfg(unix)]
     install_script(&dir, "the claude wrapper", "claude", &wrapper_script(text, exe))?;
+    // Windows runs no shell scripts by name, so the wrapper is misag's console build
+    // itself, which acts as the wrapper when named `claude.exe`.
+    #[cfg(windows)]
+    {
+        let _ = text;
+        install_link(&dir, "the claude wrapper", "claude.exe", exe)?;
+    }
     Ok(dir)
+}
+
+/// Puts `exe` in `dir` as `name`: a hard link, else a copy. One a tab still runs
+/// cannot be replaced, so it is moved aside first and removed at a later start.
+#[cfg(windows)]
+fn install_link(dir: &Path, what: &str, name: &str, exe: &Path) -> Result<(), String> {
+    let failed = |e: std::io::Error| format!("cannot write {what} in {}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(failed)?;
+    let target = dir.join(name);
+    let aside = dir.join(format!(".{name}.old"));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let stale = entry.file_name().to_string_lossy().starts_with(&format!(".{name}.old"));
+            if stale {
+                // Still running in some tab: left for next time.
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    if target.exists() && std::fs::remove_file(&target).is_err() {
+        let aside = (0..).map(|n| aside.with_extension(format!("old{n}"))).find(|p| !p.exists()).unwrap_or(aside);
+        std::fs::rename(&target, &aside).map_err(failed)?;
+    }
+    std::fs::hard_link(exe, &target).or_else(|_| std::fs::copy(exe, &target).map(|_| ())).map_err(failed)
 }
 
 /// Writes the `misag` shim (see `cli_script`) into `cli_dir(db)`, replacing any
@@ -290,7 +325,10 @@ pub fn install_wrapper(db: &Path, exe: &Path) -> Result<PathBuf, String> {
 /// from the wrapper, so neither failing keeps the other from tabs.
 pub fn install_cli(db: &Path, exe: &Path) -> Result<PathBuf, String> {
     let dir = cli_dir(db).ok_or_else(|| format!("{} has no directory", db.display()))?;
+    #[cfg(unix)]
     install_script(&dir, "the misag shim", "misag", &cli_script(exe))?;
+    #[cfg(windows)]
+    install_link(&dir, "the misag shim", "misag.exe", exe)?;
     Ok(dir)
 }
 
