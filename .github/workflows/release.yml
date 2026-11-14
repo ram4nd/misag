@@ -21,11 +21,14 @@ jobs:
         include:
           - platform: ubuntu-22.04
             args: '--bundles deb,appimage'
+            os: Linux_x64
           # Apple Silicon (M-series) Macs.
           - platform: macos-latest
             args: '--bundles app,dmg'
+            os: macOS_Apple-Silicon
           - platform: windows-latest
             args: '--bundles msi'
+            os: Windows_x64
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -82,5 +85,7 @@ jobs:
           releaseBody: Download the installer for your platform from the assets below.
           releaseDraft: true
           prerelease: false
+          # Names say which computer each installer is for, such as an M-series Mac.
+          releaseAssetNamePattern: Mischief-of-Agents_[version]_${{ matrix.os }}[ext]
           uploadWorkflowArtifacts: ${{ github.ref_type != 'tag' }}
           args: ${{ matrix.args }}
