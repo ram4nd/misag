@@ -332,9 +332,15 @@ async function spawn(opts: SpawnOptions) {
       if (data === "\r") restart(s);
       return;
     }
+    if (heldBack(s)) return;
+    runs.typed(s, data);
     write(s, encoder.encode(data));
   };
-  term.onBinary = (data) => write(s, data);
+  term.onBinary = (data) => {
+    if (heldBack(s)) return;
+    runs.typed(s, data);
+    write(s, data);
+  };
   // WebKitGTK 2.54 crashes the app (in its callback for the primary selection's
   // targets) pasting a middle click itself, so the terminal does it instead.
   for (const type of ["mousedown", "auxclick"] as const) {
@@ -533,6 +539,16 @@ function write(s: Session, data: Uint8Array) {
   invoke("pty_write", { id: s.id, data: Array.from(data) }).catch((err) =>
     console.error("misag: write failed", err),
   );
+}
+
+/**
+ * Whether the person's typing into `s` is held back because a flow is typing its
+ * prompt there; says so, so the keys do not seem lost.
+ */
+function heldBack(s: Session): boolean {
+  if (!runs.locked(s)) return false;
+  setNotice("flow-typing", `A flow is sending its prompt to ${tabLabel(s)}; typing there is paused until it has.`);
+  return true;
 }
 
 function markExited(s: Session, message: string, error = false) {
@@ -1392,11 +1408,13 @@ function refusePath(paths: string[], path: string, why: string) {
 function insertPaths(paths: string[]) {
   const s = active;
   if (!s || s.exited || s.id === null) return refusePaths(paths, "no tab is running");
+  if (heldBack(s)) return;
   for (const path of paths) {
     const why = untypeable(path);
     if (why) return refusePath(paths, path, why);
   }
   const text = paths.map((p) => `${shellQuote(p)} `).join("");
+  runs.typed(s, text);
   const bracketed = s.term.bridge?.bracketedPaste() ?? false;
   invoke("pty_write", { id: s.id, data: Array.from(encoder.encode(bracketed ? `\x1b[200~${text}\x1b[201~` : text)) })
     .then(() => {
@@ -1651,6 +1669,9 @@ const runs = createRunController<Session>({
     for (const [id, { editor }] of editorPages) yield [Number(id.slice("flow:".length)), editor];
   },
   markWaiting: (isWaiting) => sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", isWaiting(s))),
+  lockChanged: (_s, locked) => {
+    if (!locked) setNotice("flow-typing", null);
+  },
 });
 
 /**

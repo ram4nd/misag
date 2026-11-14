@@ -21,9 +21,12 @@ const PASTE_SUBMIT_MS = 150;
  * person (`runs::CLEAR_TIMEOUT_SECS`), for when this page is not there to stop it.
  */
 const CLEAR_POLL_MS = 250;
+/** How long Claude gets to clear its input (Ctrl+C) before a flow's prompt is pasted. */
+const CLEAR_INPUT_MS = 100;
 const CLEAR_TIMEOUT_MS = 30_000;
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 /** A tab, as flow runs need it. */
 export interface RunTab {
@@ -59,6 +62,8 @@ export interface RunControllerOptions<T extends RunTab> {
   editors(): Iterable<[number, RunEditor]>;
   /** Marks in the tab bar the tabs whose run waits for the person. */
   markWaiting(isWaiting: (tab: T) => boolean): void;
+  /** The tab's keyboard was locked (a flow is typing there) or unlocked again. */
+  lockChanged?(tab: T, locked: boolean): void;
 }
 
 export interface RunController<T extends RunTab> {
@@ -79,6 +84,10 @@ export interface RunController<T extends RunTab> {
   waiting(tab: T): boolean;
   /** The saved tabs are back, so a run whose tab is not open has lost it. */
   restored(): void;
+  /** Notes what the person typed into the tab, so a flow knows whether to clear Claude's input first. */
+  typed(tab: T, data: string | Uint8Array): void;
+  /** Whether the person's typing into the tab is held back while a flow types there. */
+  locked(tab: T): boolean;
 }
 
 /** Starts, moves on, stops and shows the flow runs of the app's tabs. */
@@ -94,6 +103,31 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   let tabsRestored = false;
   /** The error poll shows, so a later good poll clears only its own. */
   let runsError: string | null = null;
+  /** Tabs whose Claude input may hold text the person typed and has not sent. */
+  const dirtyTabs = new Set<string>();
+  /** How many flow starts and prompts are typing into each tab right now. */
+  const lockCounts = new Map<string, number>();
+
+  /**
+   * Holds back the person's typing in `tab` while `work` runs, so it cannot mix
+   * with what a flow types there; nested locks count, the last one releases.
+   */
+  async function withLock<R>(tab: T, work: () => Promise<R>): Promise<R> {
+    const count = lockCounts.get(tab.tabId) ?? 0;
+    lockCounts.set(tab.tabId, count + 1);
+    if (count === 0) opts.lockChanged?.(tab, true);
+    try {
+      return await work();
+    } finally {
+      const left = (lockCounts.get(tab.tabId) ?? 1) - 1;
+      if (left > 0) {
+        lockCounts.set(tab.tabId, left);
+      } else {
+        lockCounts.delete(tab.tabId);
+        opts.lockChanged?.(tab, false);
+      }
+    }
+  }
 
   /**
    * Shows the active tab's runs, their flows marked in the toolbox and their steps in
@@ -115,17 +149,26 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
    * have been suspended or quit meanwhile, and the shell must not run a flow's text.
    * Resolves to whether it was sent; false if Claude had left, when it was not.
    */
-  async function typePrompt(tab: T, text: string): Promise<boolean> {
-    const left = () => {
-      console.warn(`misag: Claude left ${opts.label(tab)} before its flow prompt was sent; it was not sent`);
-      return false;
-    };
-    if (!(await opts.live(tab))) return left();
-    opts.write(tab, encoder.encode(`\x1b[200~${text}\x1b[201~`));
-    await new Promise((resolve) => setTimeout(resolve, PASTE_SUBMIT_MS));
-    if (!(await opts.live(tab))) return left();
-    opts.write(tab, encoder.encode("\r"));
-    return true;
+  function typePrompt(tab: T, text: string): Promise<boolean> {
+    return withLock(tab, async () => {
+      const left = () => {
+        console.warn(`misag: Claude left ${opts.label(tab)} before its flow prompt was sent; it was not sent`);
+        return false;
+      };
+      if (!(await opts.live(tab))) return left();
+      // Text the person left in Claude's input would be sent along with the prompt.
+      // Ctrl+C clears it; on an empty input one press only shows a hint, so it is
+      // sent only when the person typed since their last Enter.
+      if (dirtyTabs.delete(tab.tabId)) {
+        opts.write(tab, encoder.encode("\x03"));
+        await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
+      }
+      opts.write(tab, encoder.encode(`\x1b[200~${text}\x1b[201~`));
+      await new Promise((resolve) => setTimeout(resolve, PASTE_SUBMIT_MS));
+      if (!(await opts.live(tab))) return left();
+      opts.write(tab, encoder.encode("\r"));
+      return true;
+    });
   }
 
   /** Why a prompt typed into `tab` was not sent, for the person. */
@@ -159,7 +202,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     if (!tab || startingTabs.has(tab.tabId)) return;
     startingTabs.add(tab.tabId);
     try {
-      if (await confirmed(flow)) await startIn(tab, flow);
+      // Locked from /clear to the first prompt, so nothing typed lands in between.
+      if (await confirmed(flow)) await withLock(tab, () => startIn(tab, flow));
     } finally {
       startingTabs.delete(tab.tabId);
     }
@@ -245,7 +289,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       error = `Claude is not running in ${tab ? opts.label(tab) : "the run's tab"}; start it there first, or stop the run.`;
     } else {
       try {
-        const prompt = await go();
+        const prompt = await withLock(tab, go);
         if (prompt !== null && !(await typePrompt(tab, prompt))) error = `${notSent(tab)}; start Claude there and go on again.`;
       } catch (err) {
         console.error("misag: could not continue the run", err);
@@ -303,5 +347,13 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       tabsRestored = true;
       show();
     },
+    typed(tab, data) {
+      const text = typeof data === "string" ? data : decoder.decode(data);
+      // An Enter that is not inside a paste sends the input; Ctrl+C clears it.
+      const sent = (text.endsWith("\r") && !text.includes("\x1b[200~")) || text === "\x03";
+      if (sent) dirtyTabs.delete(tab.tabId);
+      else if (text) dirtyTabs.add(tab.tabId);
+    },
+    locked: (tab) => lockCounts.has(tab.tabId),
   };
 }
