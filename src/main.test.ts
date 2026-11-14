@@ -1200,6 +1200,35 @@ describe("input", () => {
     });
   });
 
+  describe("copy on select", () => {
+    /** Lets go of the left button over the first terminal, after a selection or not. */
+    async function release() {
+      terms()[0].element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
+      for (let i = 0; i < 6; i++) await flush();
+    }
+
+    test("selecting text copies it, and the selection stays", async () => {
+      await boot();
+      await clickClaude();
+      const copy = vi.fn(() => true);
+      document.execCommand = copy;
+      const removed = vi.spyOn(getSelection()!, "removeAllRanges");
+      terms()[0].selected = "some output";
+      await release();
+      expect(copy).toHaveBeenCalledWith("copy");
+      expect(removed).not.toHaveBeenCalled();
+    });
+
+    test("a click without a selection copies nothing", async () => {
+      await boot();
+      await clickClaude();
+      const copy = vi.fn(() => true);
+      document.execCommand = copy;
+      await release();
+      expect(copy).not.toHaveBeenCalled();
+    });
+  });
+
   describe("right-click paste", () => {
     const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
     /** Right-clicks the first terminal; returns whether WebKit's menu was kept off. */

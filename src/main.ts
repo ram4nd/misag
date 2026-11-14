@@ -359,12 +359,18 @@ async function spawn(opts: SpawnOptions) {
   });
   // wterm focuses only on a click, which WebKit does not fire when Claude redrew the
   // pressed row between press and release. So letting go of the left button anywhere on
-  // the shown pane focuses it, unless that selected text.
+  // the shown pane focuses it, unless that selected text, which is copied instead (as
+  // most terminals do) and stays selected.
   term.element.addEventListener("mouseup", (e) => {
     if (e.button !== 0) return;
     // After wterm's own click handling, which may have selected a word.
     setTimeout(() => {
-      if (active === s && shownPage === null && (getSelection()?.isCollapsed ?? true) && !term.getSelectionText?.()) term.focus();
+      if (term.getSelectionText?.()) {
+        // wterm puts its selection on the clipboard as the copy happens.
+        document.execCommand("copy");
+        return;
+      }
+      if (active === s && shownPage === null && (getSelection()?.isCollapsed ?? true)) term.focus();
     });
   });
   // WebKit's menu over the terminal has no Paste, so a right click copies the selected
