@@ -379,7 +379,7 @@ impl Sessions {
         }
     }
 
-    /// The session process's current directory (read from `/proc`, so Linux only).
+    /// The session process's current directory.
     /// For a Claude tab under a POSIX login shell that is Claude's directory, since
     /// the shell `exec`s into it; under fish or csh it is the shell's, which stays in
     /// the directory the tab started in.
@@ -387,17 +387,15 @@ impl Sessions {
     /// dropped, so a restore finds the path missing and falls back to `$HOME`.
     pub fn cwd(&self, id: u32) -> Option<String> {
         let pid = self.get(id).ok()?.pid?;
-        let link = format!("/proc/{pid}/cwd");
-        let path = match std::fs::read_link(&link) {
+        let path = match proc_info::cwd(pid) {
             Ok(path) => path,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("misag: cannot read {link}: {e}");
+                    eprintln!("misag: cannot read the directory of process {pid}: {e}");
                 }
                 return None;
             }
         };
-        let path = live_path(path);
         path.into_os_string().into_string().map_err(|p| eprintln!("misag: non-UTF-8 directory {p:?}")).ok()
     }
 
@@ -421,18 +419,15 @@ impl Sessions {
         Ok((Some(leader) != s.pid).then_some(leader))
     }
 
-    /// The name the kernel gives the process (`/proc/<pid>/comm`), such as `claude`.
+    /// The name the kernel gives the process, such as `claude`.
     pub fn process_name(pid: u32) -> Option<String> {
-        std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|name| name.trim_end().to_owned())
+        proc_info::name(pid)
     }
 
     /// The command line process `pid` was started with, if it can be read.
     pub fn process_args(pid: u32) -> Option<Vec<String>> {
-        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        // Each argument ends in a NUL; a process that is exiting reads as empty.
-        let args: Vec<String> = raw.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-        let args = args.split_last().map_or(&args[..], |(_, rest)| rest);
-        (!args.is_empty()).then(|| args.to_vec())
+        let args = proc_info::args(pid)?;
+        (!args.is_empty()).then_some(args)
     }
 
     /// Hangs up every session, force-killing survivors after the grace period in
@@ -461,6 +456,103 @@ impl Sessions {
 /// only in debug builds; release builds abort on panic).
 pub(crate) fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What the kernel says about a process, through `/proc` on Linux and libproc and
+/// sysctl on macOS.
+#[cfg(target_os = "linux")]
+mod proc_info {
+    use std::path::PathBuf;
+
+    pub fn cwd(pid: u32) -> std::io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).map(super::live_path)
+    }
+
+    pub fn name(pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|name| name.trim_end().to_owned())
+    }
+
+    pub fn args(pid: u32) -> Option<Vec<String>> {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        // Each argument ends in a NUL; a process that is exiting reads as empty.
+        Some(super::nul_terminated(&raw))
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod proc_info {
+    use std::ffi::{c_char, c_int, c_void, CStr};
+    use std::io::{Error, ErrorKind};
+    use std::path::PathBuf;
+
+    fn pid_arg(pid: u32) -> std::io::Result<c_int> {
+        c_int::try_from(pid).map_err(|_| Error::new(ErrorKind::NotFound, "no such process"))
+    }
+
+    pub fn cwd(pid: u32) -> std::io::Result<PathBuf> {
+        let pid = pid_arg(pid)?;
+        // SAFETY: a plain-data struct the kernel fills, of the size it is told.
+        let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as c_int;
+        let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, (&raw mut info).cast::<c_void>(), size) };
+        if n != size {
+            let e = Error::last_os_error();
+            // ESRCH: gone; EPERM: someone else's, which a tab's process never is.
+            return Err(if e.raw_os_error() == Some(libc::ESRCH) || n == 0 { Error::new(ErrorKind::NotFound, e) } else { e });
+        }
+        // SAFETY: vip_path is a NUL-terminated MAXPATHLEN buffer, split in rows only for old compilers.
+        let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast::<c_char>()) };
+        use std::os::unix::ffi::OsStrExt;
+        Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+    }
+
+    pub fn name(pid: u32) -> Option<String> {
+        let pid = pid_arg(pid).ok()?;
+        let mut buf = [0u8; 2 * libc::MAXCOMLEN + 1];
+        // SAFETY: the kernel writes at most the given size into buf.
+        let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32) };
+        (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
+
+    pub fn args(pid: u32) -> Option<Vec<String>> {
+        let pid = pid_arg(pid).ok()?;
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        let mut size: libc::size_t = 0;
+        // SAFETY: a null buffer asks only for the size.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        // SAFETY: the kernel writes at most `size` bytes and updates it.
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast::<c_void>(), &mut size, std::ptr::null_mut(), 0) } != 0 {
+            return None;
+        }
+        buf.truncate(size);
+        super::procargs2(&buf)
+    }
+}
+
+/// The arguments in a NUL-terminated list such as `/proc/<pid>/cmdline`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nul_terminated(raw: &[u8]) -> Vec<String> {
+    let args: Vec<String> = raw.split(|&b| b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    args.split_last().map_or(args.clone(), |(_, rest)| rest.to_vec())
+}
+
+/// The arguments in a macOS `KERN_PROCARGS2` buffer: the argument count, the
+/// executable's path, NUL padding, then that many NUL-terminated arguments.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn procargs2(buf: &[u8]) -> Option<Vec<String>> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let rest = &buf[4..];
+    let path_end = rest.iter().position(|&b| b == 0)?;
+    let start = path_end + rest[path_end..].iter().position(|&b| b != 0).unwrap_or(rest.len() - path_end);
+    let args = rest[start..]
+        .split(|&b| b == 0)
+        .take(usize::try_from(argc).ok()?)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    Some(args)
 }
 
 /// A `/proc` link target without the ` (deleted)` Linux appends when the target was
@@ -513,6 +605,23 @@ mod tests {
     use std::time::Instant;
 
     const TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn reads_macos_procargs2() {
+        let mut buf = 2i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/local/bin/claude\0\0\0\0claude\0--resume\0SHELL=/bin/zsh\0");
+        assert_eq!(procargs2(&buf), Some(vec!["claude".to_string(), "--resume".to_string()]), "environment after argc is left out");
+        assert_eq!(procargs2(&[1, 0]), None, "truncated");
+        let mut empty = 0i32.to_ne_bytes().to_vec();
+        empty.extend_from_slice(b"/bin/sh\0\0");
+        assert_eq!(procargs2(&empty), Some(vec![]));
+    }
+
+    #[test]
+    fn reads_nul_terminated_arguments() {
+        assert_eq!(nul_terminated(b"sleep\060\0"), vec!["sleep".to_string(), "60".to_string()]);
+        assert!(nul_terminated(b"").is_empty(), "an exiting process reads as empty");
+    }
 
     struct Probe {
         id: u32,

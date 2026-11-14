@@ -23,7 +23,7 @@ Built with Tauri 2, a Rust PTY backend (`portable-pty`), wterm and SQLite.
 
 ## Install
 
-Linux `.deb` and AppImage builds are attached to each GitHub Release. To build it from source instead:
+Linux `.deb` and AppImage and Apple Silicon macOS `.dmg` builds are attached to each GitHub Release. The macOS build is not notarized yet, so after copying it to Applications run `xattr -dr com.apple.quarantine "/Applications/Mischief of Agents.app"` once. To build it from source instead:
 
 You need:
 

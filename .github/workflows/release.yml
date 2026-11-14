@@ -16,7 +16,10 @@ jobs:
       matrix:
         include:
           - platform: ubuntu-22.04
-            args: ''
+            args: '--bundles deb,appimage'
+          # Apple Silicon (M-series) Macs.
+          - platform: macos-latest
+            args: '--bundles app,dmg'
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4

@@ -568,7 +568,14 @@ pub fn flow_load(db: State<'_, Db>, id: i64) -> Result<FlowDetail, CommandError>
 /// thread, where GTK's clipboard lives.
 #[tauri::command(async)]
 pub fn primary_selection(app: tauri::AppHandle) -> Result<Option<String>, CommandError> {
-    Ok(gtk_text(&app, Selection::Primary)?)
+    #[cfg(target_os = "linux")]
+    return Ok(gtk_text(&app, Selection::Primary)?);
+    // Only X11 and Wayland desktops have one.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        Ok(None)
+    }
 }
 
 /// The clipboard's text, for a right-click paste in a terminal; None if there is none.
@@ -576,10 +583,28 @@ pub fn primary_selection(app: tauri::AppHandle) -> Result<Option<String>, Comman
 /// page the webview's clipboard permission.
 #[tauri::command(async)]
 pub fn clipboard_text(app: tauri::AppHandle) -> Result<Option<String>, CommandError> {
-    Ok(gtk_text(&app, Selection::Clipboard)?)
+    #[cfg(target_os = "linux")]
+    return Ok(gtk_text(&app, Selection::Clipboard)?);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app;
+        Ok(pasteboard_text()?)
+    }
+}
+
+/// The general pasteboard's text, through `pbpaste`, which every macOS has.
+#[cfg(target_os = "macos")]
+fn pasteboard_text() -> Result<Option<String>, String> {
+    let out = std::process::Command::new("/usr/bin/pbpaste").output().map_err(|e| format!("cannot run pbpaste: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("pbpaste failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    Ok((!text.is_empty()).then_some(text))
 }
 
 /// Where `gtk_text` reads text from.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum Selection {
     /// What is selected anywhere on the desktop.
@@ -588,6 +613,7 @@ enum Selection {
     Clipboard,
 }
 
+#[cfg(target_os = "linux")]
 impl Selection {
     fn name(self) -> &'static str {
         match self {
@@ -598,6 +624,7 @@ impl Selection {
 }
 
 /// The text of `selection`, read through GTK on the main thread.
+#[cfg(target_os = "linux")]
 fn gtk_text(app: &tauri::AppHandle, selection: Selection) -> Result<Option<String>, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     app.run_on_main_thread(move || {
