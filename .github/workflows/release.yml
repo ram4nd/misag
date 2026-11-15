@@ -1,8 +1,8 @@
 name: Release
 
-# Push a tag such as v0.1.0 to build every platform into one draft GitHub Release.
-# Publishing it is left to a person: open the draft once every job has passed (a
-# failed job leaves its platform's installer out) and press Publish.
+# Push an annotated tag such as v0.1.0 to build every platform into one published
+# GitHub Release, whose text is the tag's message (git tag -a v0.1.0 -m "..."). A
+# failed job leaves its platform's installer out of the release.
 # Run it by hand (Actions > Release > Run workflow) to build every platform without
 # a release: the packages are kept as the run's artifacts instead.
 on:
@@ -100,6 +100,19 @@ jobs:
             echo "$name=${!name}" >> "$GITHUB_ENV"
           done
 
+      # actions/checkout can leave an annotated tag as a lightweight one, so fetch it
+      # again to read its message.
+      - name: Release text from the tag's message
+        id: notes
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          git fetch --force --depth=1 origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          # A lightweight tag's contents would be its commit's message instead.
+          body=$(git tag -l --format='%(if:equals=tag)%(objecttype)%(then)%(contents)%(end)' "$GITHUB_REF_NAME")
+          [ -n "$body" ] || body='Download the installer for your platform from the assets below.'
+          { echo 'body<<MISAG_EOF'; echo "$body"; echo 'MISAG_EOF'; } >> "$GITHUB_OUTPUT"
+
       # Pinned to v1's commit, since this step gets the signing credentials.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         id: tauri
@@ -108,8 +121,8 @@ jobs:
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('Mischief of Agents {0}', github.ref_name) || '' }}
-          releaseBody: Download the installer for your platform from the assets below.
-          releaseDraft: true
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
           prerelease: false
           # Names say which computer each installer is for, such as an M-series Mac.
           releaseAssetNamePattern: Mischief-of-Agents_[version]_${{ matrix.os }}[ext]
