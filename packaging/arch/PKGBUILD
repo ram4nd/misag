@@ -9,7 +9,8 @@ arch=('x86_64')
 url="https://github.com/ram4nd/mischief-of-agents"
 license=('GPL-3.0-only')
 depends=('webkit2gtk-4.1' 'gtk3')
-optdepends=('claude-code: Claude tabs and flows')
+optdepends=('claude-code: Claude tabs and flows'
+            'gst-plugins-good: the finish sound (the webview plays audio through GStreamer)')
 provides=('misag')
 conflicts=('misag')
 options=('!strip' '!debug')

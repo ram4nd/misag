@@ -34,6 +34,7 @@
     },
     "linux": {
       "deb": {
+        "recommends": ["gstreamer1.0-plugins-good"],
         "files": {
           "/usr/share/doc/mischief-of-agents/copyright": "../LICENSE"
         }
