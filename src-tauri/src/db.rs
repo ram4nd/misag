@@ -10,7 +10,7 @@ use crate::claude::SessionId;
 use crate::flows::{self, Graph};
 use crate::runs;
 use crate::layout::{Layout, Tab, TabId, TabKind};
-use crate::settings::Settings;
+use crate::settings::{FinishSound, Settings};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -165,6 +165,10 @@ const MIGRATIONS: &[&str] = &[r#"
     -- by the Stop hook, cleared by SessionStart, SessionEnd and startup pruning
     -- (see claude::stopped).
     ALTER TABLE claude_sessions ADD COLUMN background_at INTEGER;
+"#, r#"
+    -- The sound played when Claude in a tab finishes its turn (see settings::FinishSound).
+    ALTER TABLE settings ADD COLUMN finish_sound TEXT NOT NULL DEFAULT 'off'
+        CHECK (finish_sound IN ('off', 'chime', 'bell', 'pop'));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -550,8 +554,8 @@ impl Db {
         let changed = self
             .conn()
             .execute(
-                "UPDATE settings SET skip_permissions = ?1, workspace = ?2, disable_auto_memory = ?3, font_size = ?4 WHERE id = 1",
-                params![settings.skip_permissions, settings.workspace, settings.disable_auto_memory, settings.font_size],
+                "UPDATE settings SET skip_permissions = ?1, workspace = ?2, disable_auto_memory = ?3, font_size = ?4, finish_sound = ?5 WHERE id = 1",
+                params![settings.skip_permissions, settings.workspace, settings.disable_auto_memory, settings.font_size, settings.finish_sound],
             )
             .map_err(sql)?;
         if changed != 1 {
@@ -1108,8 +1112,13 @@ pub struct SessionReport<'a> {
 
 /// The settings stored in `conn`; see `Db::load_settings`.
 pub fn load_settings(conn: &Connection) -> Result<Settings, String> {
-    conn.query_row("SELECT skip_permissions, workspace, disable_auto_memory, font_size FROM settings WHERE id = 1", [], |r| {
-        Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)?, font_size: r.get(3)? })
+    conn.query_row("SELECT skip_permissions, workspace, disable_auto_memory, font_size, finish_sound FROM settings WHERE id = 1", [], |r| {
+        // Only a sound: one this version cannot read is Off, rather than losing the other settings.
+        let finish_sound = r.get(4).unwrap_or_else(|e| {
+            eprintln!("misag: the stored finish sound cannot be read ({e}); using none");
+            FinishSound::Off
+        });
+        Ok(Settings { skip_permissions: r.get(0)?, workspace: r.get(1)?, disable_auto_memory: r.get(2)?, font_size: r.get(3)?, finish_sound })
     })
     .map_err(sql)
 }
@@ -1392,7 +1401,7 @@ pub(crate) mod tests {
         let path = temp_db("settings");
         let db = Db::open(path.clone()).unwrap();
         assert_eq!(db.load_settings().unwrap(), Settings::default());
-        let all = Settings { skip_permissions: true, workspace: Some("~".into()), disable_auto_memory: true, font_size: 18 };
+        let all = Settings { skip_permissions: true, workspace: Some("~".into()), disable_auto_memory: true, font_size: 18, finish_sound: FinishSound::Bell };
         let saved = db.save_settings(all.clone()).unwrap();
         assert_eq!(saved, all, "returned as stored");
         drop(db);
@@ -1439,6 +1448,7 @@ pub(crate) mod tests {
         assert!(conn.execute("UPDATE settings SET disable_auto_memory = 2", []).is_err());
         assert!(conn.execute("UPDATE settings SET font_size = 7", []).is_err());
         assert!(conn.execute("UPDATE settings SET font_size = 33", []).is_err());
+        assert!(conn.execute("UPDATE settings SET finish_sound = 'siren'", []).is_err());
         assert!(conn.execute("INSERT INTO settings (id) VALUES (2)", []).is_err(), "one row only");
         assert_eq!(db.load_settings().unwrap(), Settings::default());
     }
@@ -2127,6 +2137,44 @@ pub(crate) mod tests {
         let db = Db::open(path).unwrap();
         assert_eq!(db.load_settings().unwrap(), Settings { skip_permissions: true, ..Settings::default() });
         assert_eq!(db.save_settings(Settings { font_size: 20, ..Settings::default() }).unwrap().font_size, 20);
+    }
+
+    #[test]
+    fn every_finish_sound_round_trips() {
+        let db = Db::open(temp_db("finish-sounds")).unwrap();
+        for sound in [FinishSound::Chime, FinishSound::Bell, FinishSound::Pop, FinishSound::Off] {
+            let saved = db.save_settings(Settings { finish_sound: sound, ..Settings::default() }).unwrap();
+            assert_eq!(saved.finish_sound, sound);
+        }
+    }
+
+    #[test]
+    fn an_unknown_stored_finish_sound_reads_as_off_and_keeps_the_other_settings() {
+        let path = temp_db("finish-sound-unknown");
+        let db = Db::open(path.clone()).unwrap();
+        db.save_settings(Settings { skip_permissions: true, ..Settings::default() }).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        conn.pragma_update(None, "ignore_check_constraints", true).unwrap();
+        conn.execute("UPDATE settings SET finish_sound = 'siren'", []).unwrap();
+        let loaded = db.load_settings().unwrap();
+        assert_eq!(loaded, Settings { skip_permissions: true, ..Settings::default() });
+        // So the Settings tab can still save, which replaces it.
+        assert_eq!(db.save_settings(Settings { finish_sound: FinishSound::Pop, ..loaded }).unwrap().finish_sound, FinishSound::Pop);
+    }
+
+    #[test]
+    fn upgrading_keeps_the_settings_and_adds_the_finish_sound() {
+        let path = temp_db("upgrade-finish-sound");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.iter().position(|m| m.contains("ADD COLUMN finish_sound")).unwrap();
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        conn.execute("UPDATE settings SET font_size = 20", []).unwrap();
+        drop(conn);
+        let db = Db::open(path).unwrap();
+        assert_eq!(db.load_settings().unwrap(), Settings { font_size: 20, ..Settings::default() });
+        let saved = db.save_settings(Settings { finish_sound: FinishSound::Pop, ..Settings::default() }).unwrap();
+        assert_eq!(saved.finish_sound, FinishSound::Pop);
     }
 
     #[test]

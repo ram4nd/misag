@@ -13,6 +13,7 @@ import { createFlows, type Flow } from "./flows";
 import { createFlowEditor, type FlowEditor } from "./flowEditor";
 import { createRunController } from "./runController";
 import { createHistory, type Page as HistoryPage, type Past } from "./history";
+import { isFinishSound, playSound, primeAudio, type FinishSound } from "./sounds";
 import { DRAG_THRESHOLD, forget, remember, remembered, setupToolboxes, slide } from "./toolbox";
 
 /**
@@ -55,6 +56,12 @@ interface Session {
   background: number | null;
   /** When (ms) the latest turn of the tab's Claude began, or this Claude started: a turn ending after the report above makes it stale. */
   turnStarted: number;
+  /** Whether the tab showed Claude working when last updated (see `noteFinish`). */
+  shownBusy: boolean;
+  /** Sets `finishAfter` once Claude has stayed idle for `FINISH_SETTLE_MS`; null when not waiting. */
+  finishSettle: ReturnType<typeof setTimeout> | null;
+  /** A finish is due: the first tab check numbered above this confirms it (see `confirmFinish`); null when none is. */
+  finishAfter: number | null;
   /** Directory the tab was opened in; saves use its live directory when they can. */
   cwd?: string;
   /** The process's current directory, last time it was checked. */
@@ -163,6 +170,8 @@ interface Settings {
   disableAutoMemory: boolean;
   /** The terminals' font size in pixels. */
   fontSize: number;
+  /** The sound played when Claude in a tab finishes its turn. */
+  finishSound: FinishSound;
 }
 
 /** The terminals' font size, and the range allowed: mirrors `settings::DEFAULT_FONT_SIZE` and `FONT_SIZES`. */
@@ -179,6 +188,12 @@ const UNTRACKED_GRACE_MS = 10_000;
 
 /** How often the tabs' directories and terminal tabs' Claude are checked (see `pollTabs`). */
 const TAB_POLL_MS = 2_000;
+/**
+ * How long Claude must stay idle before a tab check can confirm it finished: time
+ * for its Stop hook to record background tasks, which a check started earlier
+ * could miss. The sound then plays on the next check, up to `TAB_POLL_MS` later.
+ */
+const FINISH_SETTLE_MS = 1_000;
 
 /** How often the Session history box, while it can be seen, reads the saved Claude sessions again, as Claude adds to them. */
 const HISTORY_POLL_MS = 10_000;
@@ -253,7 +268,7 @@ const openPages: PageId[] = [];
 /** The page shown instead of a terminal; null when a terminal (or nothing) is shown. */
 let shownPage: PageId | null = null;
 /** The stored settings, as last loaded or saved; the defaults until the first load. */
-let settings: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: DEFAULT_FONT_SIZE };
+let settings: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: DEFAULT_FONT_SIZE, finishSound: "off" };
 let counter = 0;
 const encoder = new TextEncoder();
 
@@ -294,7 +309,7 @@ async function spawn(opts: SpawnOptions) {
     run.kind === "claude" ? `Claude ${++counter}` : run.command?.split(" ")[0] || `shell ${++counter}`;
   const s: Session = {
     tabId: opts.tabId ?? crypto.randomUUID(), run,
-    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, background: null, turnStarted: 0, skipsPermissions: false, inClaude: false,
+    id: null, starts: 0, term, el, exited: false, closing: false, busy: false, background: null, turnStarted: 0, shownBusy: false, finishSettle: null, finishAfter: null, skipsPermissions: false, inClaude: false,
     claudeOpen: run.kind === "terminal" ? run.claudeSession : null, resumingUntil: 0,
     renamed: opts.renamed ?? Boolean(opts.name),
     cwd: opts.cwd || undefined,
@@ -421,9 +436,10 @@ async function spawn(opts: SpawnOptions) {
 async function start(s: Session, fallbackToHome: boolean) {
   const { term } = s;
   const startNo = ++s.starts;
-  // What an earlier Claude in the tab waited on is not this one's.
+  // What an earlier Claude in the tab waited on, or was finishing, is not this one's.
   s.turnStarted = Date.now();
   s.background = null;
+  resetFinish(s);
   const onData = new Channel<ArrayBuffer>();
   onData.onmessage = (buf) => show(s, new Uint8Array(buf));
   // Attached before pty_spawn runs, so an immediate exit is not missed.
@@ -564,6 +580,7 @@ function markExited(s: Session, message: string, error = false) {
   s.exited = true;
   s.busy = false;
   s.background = null;
+  resetFinish(s);
   if (s.run.kind === "terminal") {
     s.inClaude = false;
     s.skipsPermissions = false;
@@ -620,6 +637,7 @@ function showInstead(tab: Session | null, page: PageId | null) {
 function close(s: Session) {
   if (s.closing) return;
   s.closing = true;
+  cancelFinish(s);
   // Its run can never be answered again: the tab's id is not reused.
   invoke("flow_stop_tab", { tabId: s.tabId }).catch((err) => console.error("misag: could not end the tab's flow run", err));
   // Not one of a closed tab while the stop is on its way; if it fails, the next poll shows it as one.
@@ -857,6 +875,8 @@ function tabIcon(s: Session): HTMLElement {
  * finishing the rename renders it again.
  */
 function updateTab(s: Session) {
+  // Before the elements are looked up: a tab being renamed has none, and still finishes.
+  noteFinish(s);
   const tab = tabsEl.children[sessions.indexOf(s)];
   const label = tab?.querySelector(".name");
   const mark = tab?.querySelector(".icon");
@@ -865,6 +885,49 @@ function updateTab(s: Session) {
   tab.classList.toggle("busy", showsBusy(s));
   label.textContent = tabLabel(s);
   mark.replaceWith(tabIcon(s));
+}
+
+/**
+ * Notes when the tab stops showing Claude working: once it has stayed so for
+ * `FINISH_SETTLE_MS`, a finish is due, which the next tab check confirms (see
+ * `confirmFinish`). Working again drops it.
+ */
+function noteFinish(s: Session) {
+  const busy = showsBusy(s);
+  if (busy) cancelFinish(s);
+  else if (s.shownBusy && s.finishSettle === null && s.finishAfter === null) {
+    s.finishSettle = setTimeout(() => {
+      s.finishSettle = null;
+      s.finishAfter = checksStarted;
+    }, FINISH_SETTLE_MS);
+  }
+  s.shownBusy = busy;
+}
+
+/** Drops a finish the tab was waiting to confirm. */
+function cancelFinish(s: Session) {
+  if (s.finishSettle !== null) clearTimeout(s.finishSettle);
+  s.finishSettle = null;
+  s.finishAfter = null;
+}
+
+/** Forgets what the tab showed: its process exited or started, so no turn of it is finishing. */
+function resetFinish(s: Session) {
+  cancelFinish(s);
+  s.shownBusy = false;
+}
+
+/**
+ * Plays the finish sound for a due finish once tab check `check`, which started
+ * after the finish settled and read the background tasks, shows Claude still idle
+ * and still in the tab: a turn that ends waiting on background tasks, or a Claude
+ * that exits or quits, has not finished.
+ */
+function confirmFinish(s: Session, check: number) {
+  if (s.finishAfter === null || check <= s.finishAfter) return;
+  const finished = !showsBusy(s) && claudeHere(s);
+  cancelFinish(s);
+  if (finished) playFinishSound(settings.finishSound);
 }
 
 /** The home directory, shown as `~`; null until known, or if it cannot be. */
@@ -879,6 +942,8 @@ homeDir().then(
 
 /** True while `pollTabs` waits for the backend, so a slow check is not started twice. */
 let polling = false;
+/** How many tab checks have started, numbering them for `confirmFinish`. */
+let checksStarted = 0;
 
 /**
  * Checks the running tabs' directories, the Claude in terminal tabs, and which
@@ -886,14 +951,16 @@ let polling = false;
  * directory or a terminal tab's Claude changed it saves (a Claude starting or
  * quitting in a terminal tab changes nothing else) and redraws the Session history
  * box, whose marks of the tabs that have a session open may have changed; a change
- * in what Claude waits on only redraws its tab. Answers for a tab that exited,
- * restarted or closed meanwhile are dropped.
+ * in what Claude waits on only redraws its tab. A check that read the background
+ * tasks also confirms the tabs' due finishes (see `confirmFinish`). Answers for a
+ * tab that exited, restarted or closed meanwhile are dropped.
  */
 async function pollTabs() {
   if (polling) return;
   const running = sessions.filter((s) => s.id !== null && !s.exited).map((s) => ({ s, id: s.id!, starts: s.starts }));
   if (!running.length) return;
   polling = true;
+  const check = ++checksStarted;
   try {
     const terminals = running.filter(({ s }) => s.run.kind === "terminal");
     const [cwds, claudes, background] = await Promise.all([
@@ -911,6 +978,7 @@ async function pollTabs() {
         s.background = since;
         updateTab(s);
       }
+      if (background) confirmFinish(s, check);
       if (cwds[id]) s.liveCwd = cwds[id];
       if (s.liveCwd === before.dir && s.claudeOpen === before.claude) continue;
       changed = true;
@@ -966,6 +1034,7 @@ function fillSettingsForms() {
   settingsField("skipPermissions").checked = settings.skipPermissions;
   settingsField<HTMLSelectElement>("disableAutoMemory").value = String(settings.disableAutoMemory ?? false);
   settingsField("fontSize").value = String(settings.fontSize ?? DEFAULT_FONT_SIZE);
+  settingsField<HTMLSelectElement>("finishSound").value = settings.finishSound ?? "off";
   (pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement).value = settings.workspace ?? "";
 }
 
@@ -975,6 +1044,7 @@ function readSettingsForm(): Settings {
     skipPermissions: settingsField("skipPermissions").checked,
     disableAutoMemory: settingsField<HTMLSelectElement>("disableAutoMemory").value === "true",
     fontSize: Number(settingsField("fontSize").value),
+    finishSound: chosenSound(),
   };
 }
 
@@ -1026,9 +1096,12 @@ async function saveSettingsForm() {
     showPageError(pages.settings, `Settings not saved: the font size must be ${min} to ${max}.`);
   } else {
     try {
+      const before = settings.finishSound;
       settings = await invoke<Settings>("settings_save", { settings: next });
       showPageError(pages.settings, null);
       applyFontSize();
+      // A newly chosen sound plays, so it can be heard before a Claude finishes.
+      if (settings.finishSound !== before) playFinishSound(settings.finishSound);
     } catch (err) {
       console.error("misag: could not save settings", err);
       showPageError(pages.settings, `Settings not saved: ${errorText(err)}`);
@@ -1044,6 +1117,29 @@ const queueSettings = (task: () => Promise<void>) => {
   settingsQueue = settingsQueue.then(task).catch((err) => console.error("misag: settings task failed", err));
 };
 settingsForm.onchange = () => queueSettings(saveSettingsForm);
+/** The finish sound chosen on the page; one it does not know keeps the stored one. */
+function chosenSound(): FinishSound {
+  const value = settingsField<HTMLSelectElement>("finishSound").value;
+  return isFinishSound(value) ? value : (settings.finishSound ?? "off");
+}
+
+/** Plays a finish sound, unless it is off (or missing, from an older backend); if it cannot play, a notice says why. */
+function playFinishSound(sound: FinishSound | undefined) {
+  if (!sound || sound === "off") return;
+  playSound(sound, (err) => {
+    console.error("misag: could not play the finish sound", err);
+    setNotice("finish-sound", `The finish sound could not play (${errorText(err)}). Check your sound output, or turn the sound off in Settings.`);
+  });
+}
+
+// A context started without a key or click may stay silent, so each one primes it while a sound is chosen.
+for (const area of [$("#tabbar"), $("#content")]) {
+  for (const type of ["pointerdown", "keydown"]) {
+    area.addEventListener(type, () => {
+      if (settings.finishSound && settings.finishSound !== "off") primeAudio();
+    }, true);
+  }
+}
 for (const id of pageIds) pages[id].form.onsubmit = (e) => e.preventDefault();
 
 /** Opens the page's tab (loading the stored settings into it) and shows it. */

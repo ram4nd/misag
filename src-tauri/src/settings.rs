@@ -1,6 +1,7 @@
 //! User settings, edited on the settings tab and stored by `db` in the `settings`
 //! table. Mirrored by `Settings` in src/main.ts.
 
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -13,6 +14,52 @@ const FONT_SIZES: std::ops::RangeInclusive<u32> = 8..=32;
 
 fn default_font_size() -> u32 {
     DEFAULT_FONT_SIZE
+}
+
+/// The sound played when Claude in a tab finishes its turn (a CHECK in the schema,
+/// see db.rs). The sounds themselves are made in src/sounds.ts.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FinishSound {
+    #[default]
+    Off,
+    Chime,
+    Bell,
+    Pop,
+}
+
+impl FinishSound {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FinishSound::Off => "off",
+            FinishSound::Chime => "chime",
+            FinishSound::Bell => "bell",
+            FinishSound::Pop => "pop",
+        }
+    }
+
+    /// A value this version does not know is an error, as the schema allows none.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "off" => Ok(FinishSound::Off),
+            "chime" => Ok(FinishSound::Chime),
+            "bell" => Ok(FinishSound::Bell),
+            "pop" => Ok(FinishSound::Pop),
+            other => Err(format!("the finish sound {other:?} is not one this version knows")),
+        }
+    }
+}
+
+impl ToSql for FinishSound {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        self.as_str().to_sql()
+    }
+}
+
+impl FromSql for FinishSound {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        FinishSound::parse(value.as_str()?).map_err(|e| FromSqlError::Other(e.into()))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -30,11 +77,14 @@ pub struct Settings {
     /// The font size of every terminal, in pixels.
     #[serde(default = "default_font_size")]
     pub font_size: u32,
+    /// The sound played when Claude in a tab finishes its turn.
+    #[serde(default)]
+    pub finish_sound: FinishSound,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { skip_permissions: false, workspace: None, disable_auto_memory: false, font_size: DEFAULT_FONT_SIZE }
+        Settings { skip_permissions: false, workspace: None, disable_auto_memory: false, font_size: DEFAULT_FONT_SIZE, finish_sound: FinishSound::Off }
     }
 }
 
@@ -107,8 +157,8 @@ mod tests {
 
     #[test]
     fn the_frontend_sees_camel_case_fields() {
-        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: true, font_size: 16 };
-        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src", "disableAutoMemory": true, "fontSize": 16 });
+        let s = Settings { skip_permissions: true, workspace: Some("~/src".into()), disable_auto_memory: true, font_size: 16, finish_sound: FinishSound::Chime };
+        let json = serde_json::json!({ "skipPermissions": true, "workspace": "~/src", "disableAutoMemory": true, "fontSize": 16, "finishSound": "chime" });
         assert_eq!(serde_json::to_value(&s).unwrap(), json);
         assert_eq!(serde_json::from_value::<Settings>(json).unwrap(), s);
     }
@@ -123,6 +173,19 @@ mod tests {
         assert_eq!(with(32).unwrap().font_size, 32);
         assert_eq!(with(7).unwrap_err(), "the font size must be 8 to 32");
         assert_eq!(with(33).unwrap_err(), "the font size must be 8 to 32");
+    }
+
+    #[test]
+    fn the_finish_sound_defaults_to_off_and_names_round_trip() {
+        let missing = serde_json::json!({ "skipPermissions": false, "workspace": null, "disableAutoMemory": false });
+        assert_eq!(serde_json::from_value::<Settings>(missing).unwrap().finish_sound, FinishSound::Off);
+        for sound in [FinishSound::Off, FinishSound::Chime, FinishSound::Bell, FinishSound::Pop] {
+            assert_eq!(FinishSound::parse(sound.as_str()), Ok(sound));
+            assert_eq!(serde_json::to_value(sound).unwrap(), sound.as_str());
+        }
+        assert!(FinishSound::parse("siren").is_err());
+        let unknown = serde_json::json!({ "skipPermissions": false, "workspace": null, "disableAutoMemory": false, "finishSound": "siren" });
+        assert!(serde_json::from_value::<Settings>(unknown).is_err(), "an unknown sound is not saved");
     }
 
     #[test]

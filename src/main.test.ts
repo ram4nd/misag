@@ -157,6 +157,16 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 vi.mock("@wterm/dom/src/terminal.css", () => ({}));
 vi.mock("@wterm/dom", () => ({ WTerm: fakes.FakeTerminal }));
+/** The sounds played, by name, and how often audio was primed: jsdom has no Web Audio. `fail` makes playing fail. */
+const sounds = vi.hoisted(() => ({ played: [] as string[], primed: 0, fail: null as Error | null }));
+vi.mock("./sounds", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./sounds")>()),
+  playSound: (name: string, onFail: (err: unknown) => void) => {
+    if (sounds.fail) onFail(sounds.fail);
+    else sounds.played.push(name);
+  },
+  primeAudio: () => void sounds.primed++,
+}));
 
 type Call = { cmd: string; args: Record<string, unknown> };
 type SpawnCall = {
@@ -227,7 +237,7 @@ let fsHidden: Record<string, number>;
 let fsTree: Record<string, { name: string; dir: boolean }[]>;
 /** settings_load waits for this, so a test can hold the load back. */
 let settingsLoadGate: Promise<void>;
-const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: 14 };
+const DEFAULTS: Settings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: 14, finishSound: "off" };
 type Flow = { id: number; name: string; archived: boolean; unconfirmed?: boolean };
 /** The stored flows in order, archived ones included; the flow commands change it like the backend. */
 let storedFlows: Flow[];
@@ -438,6 +448,9 @@ beforeEach(() => {
   reported = new Set();
   missingDirs = new Set();
   storedSettings = { ...DEFAULTS };
+  sounds.played = [];
+  sounds.primed = 0;
+  sounds.fail = null;
   settingsLoadGate = Promise.resolve();
   storedFlows = [];
   busyFlows = new Set();
@@ -899,6 +912,181 @@ describe("tab icons", () => {
     expect(busy()).toEqual([true]);
     expect(tabs()[0].querySelector(".name")!.textContent).toBe("other");
     expect(error).toHaveBeenCalledWith("misag: could not check for background tasks", "background_tabs failed");
+  });
+
+  /**
+   * The finish sound plays on the first tab check that starts at least
+   * FINISH_SETTLE_MS (mirrors main.ts) after Claude went idle, so it waits up to a
+   * check interval longer; tab checks run every TAB_POLL_MS from boot.
+   */
+  const FINISH_SETTLE_MS = 1_000;
+  const FINISH_SOUND_MAX_MS = FINISH_SETTLE_MS + TAB_POLL_MS;
+  /** Runs a turn in the first tab: Claude works, then goes idle. */
+  function turn(i = 0) {
+    terms()[i].onTitle!("◐ Claude Code");
+    terms()[i].onTitle!("✳ Claude Code");
+  }
+
+  test("a Claude tab plays the chosen sound once a tab check confirms Claude stayed done", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    await boot();
+    await clickClaude();
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SETTLE_MS - 1);
+    expect(sounds.played).toEqual([]);
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS - FINISH_SETTLE_MS + 1);
+    expect(sounds.played).toEqual(["chime"]);
+    // A title change while idle is not another finish.
+    terms()[0].onTitle!("✳ Greeting reply");
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS * 2);
+    expect(sounds.played).toEqual(["chime"]);
+  });
+
+  test("no sound plays when the finish sound is off, including when it is turned off while one is due", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    await boot();
+    await clickClaude();
+    turn();
+    storedSettings = { ...DEFAULTS };
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    for (let i = 0; i < 3; i++) await flush();
+    tabs()[0].click();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual([]);
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual([]);
+  });
+
+  test("a turn that starts again soon, or ends waiting on background tasks, has not finished", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "bell" };
+    await boot();
+    await clickClaude();
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SETTLE_MS / 2);
+    nextMs();
+    terms()[0].onTitle!("◐ Claude Code");
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual([]);
+    terms()[0].onTitle!("✳ Claude Code");
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS * 2);
+    expect(sounds.played).toEqual([]);
+    // The tasks woke Claude, and that turn ended waiting on none.
+    nextMs();
+    terms()[0].onTitle!("◐ Claude Code");
+    backgroundTabs = {};
+    terms()[0].onTitle!("✳ Claude Code");
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual(["bell"]);
+  });
+
+  test("a finish waits for a tab check that could read the background tasks", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    storedSettings = { ...DEFAULTS, finishSound: "bell" };
+    await boot();
+    await clickClaude();
+    failing.add("background_tabs");
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS * 2);
+    expect(sounds.played).toEqual([]);
+    failing.delete("background_tabs");
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(sounds.played).toEqual(["bell"]);
+  });
+
+  test("a Claude that exits or quits mid-turn, or another tool's spinner, plays no sound", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "pop" };
+    await boot();
+    await clickClaude();
+    terms()[0].onTitle!("◐ Claude Code");
+    spawns()[0].onExit.onmessage(0);
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    await clickTerminal();
+    terms()[1].onTitle!("⠂ Installing");
+    terms()[1].onTitle!("done");
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    openClaudes[2] = SESSION;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    terms()[1].onTitle!("◐ Fix the build");
+    delete openClaudes[2];
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual([]);
+  });
+
+  test("restarting a tab whose Claude exited mid-turn plays no sound", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "pop" };
+    await boot();
+    await clickClaude();
+    terms()[0].onTitle!("◐ Claude Code");
+    spawns()[0].onExit.onmessage(1);
+    terms()[0].onData!("\r");
+    await flush();
+    expect(spawns()).toHaveLength(2);
+    terms()[0].onTitle!("✳ Claude Code");
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS * 2);
+    expect(sounds.played).toEqual([]);
+  });
+
+  test("a finish while the tab is being renamed still plays", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    await boot();
+    await clickClaude();
+    terms()[0].onTitle!("◐ Claude Code");
+    tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    expect(tabs()[0].querySelector("input")).not.toBeNull();
+    terms()[0].onTitle!("✳ Claude Code");
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual(["chime"]);
+  });
+
+  test("closing a tab whose finish is due plays no sound", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    await boot();
+    await clickClaude();
+    turn();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS * 2);
+    expect(sounds.played).toEqual([]);
+  });
+
+  test("tabs that finish together each play", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "pop" };
+    await boot();
+    await clickClaude();
+    await clickClaude();
+    turn(0);
+    turn(1);
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual(["pop", "pop"]);
+  });
+
+  test("a sound that cannot play says so once in a notice", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    sounds.fail = new Error("no audio device");
+    await boot();
+    await clickClaude();
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(noticeVisible()).toBe(true);
+    expect(noticeText()).toContain("finish sound could not play (no audio device)");
+  });
+
+  test("a key or click primes audio while a finish sound is chosen", async () => {
+    await boot();
+    await clickClaude();
+    terms()[0].element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    expect(sounds.primed).toBe(0);
+    document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+    for (let i = 0; i < 3; i++) await flush();
+    const select = document.querySelector<HTMLSelectElement>("#settings select[name=finishSound]")!;
+    select.value = "chime";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    for (let i = 0; i < 3; i++) await flush();
+    tabs()[0].dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    terms()[0].element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
+    expect(sounds.primed).toBe(2);
   });
 
   test("a working Claude tab shows a loader in place of the Claude icon", async () => {
@@ -1871,6 +2059,60 @@ describe("settings", () => {
     expect(pageError().textContent).toContain("8 to 32");
     expect(field.value).toBe("14");
     expect(document.documentElement.style.getPropertyValue("--terminal-font-size")).toBe("14px");
+  });
+
+  test("choosing a finish sound saves it and plays it, and Off plays nothing", async () => {
+    const select = () => page().querySelector<HTMLSelectElement>("select[name=finishSound]")!;
+    async function choose(value: string) {
+      select().value = value;
+      select().dispatchEvent(new Event("change", { bubbles: true }));
+      for (let i = 0; i < 3; i++) await flush();
+    }
+    await boot();
+    await openSettings();
+    expect(select().value).toBe("off");
+    expect([...select().options].map((o) => o.value)).toEqual(["off", "chime", "bell", "pop"]);
+    await choose("bell");
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ ...DEFAULTS, finishSound: "bell" });
+    expect(sounds.played).toEqual(["bell"]);
+    // Changing another setting does not play it again.
+    await change("skipPermissions", true);
+    expect(sounds.played).toEqual(["bell"]);
+    await choose("off");
+    expect(callsOf("settings_save").at(-1)!.args.settings).toEqual({ ...DEFAULTS, skipPermissions: true });
+    expect(sounds.played).toEqual(["bell"]);
+  });
+
+  test("a finish sound that could not be saved is not played", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await openSettings();
+    failing.add("settings_save");
+    const select = page().querySelector<HTMLSelectElement>("select[name=finishSound]")!;
+    select.value = "pop";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    for (let i = 0; i < 3; i++) await flush();
+    expect(sounds.played).toEqual([]);
+    expect(select.value).toBe("off");
+  });
+
+  test("a finish sound the page does not know is not sent", async () => {
+    await boot();
+    await openSettings();
+    const select = page().querySelector<HTMLSelectElement>("select[name=finishSound]")!;
+    select.append(new Option("Siren", "siren"));
+    select.value = "siren";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("settings_save").every((c) => (c.args.settings as Settings).finishSound === "off")).toBe(true);
+    expect(sounds.played).toEqual([]);
+  });
+
+  test("a missing finish sound shows as Off", async () => {
+    storedSettings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: 14 };
+    await boot();
+    await openSettings();
+    expect(page().querySelector<HTMLSelectElement>("select[name=finishSound]")!.value).toBe("off");
   });
 
   test("a missing font size shows as 14", async () => {

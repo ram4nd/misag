@@ -73,6 +73,15 @@
                 </select>
               </label>
               <p class="hint">Auto leaves it to your Claude settings; Disable turns off Claude's auto memory. Applies to Claude tabs started, restarted or restored from now on, and to every <code>claude</code> started in a terminal tab.</p>
+              <label>Finish sound
+                <select name="finishSound">
+                  <option value="off">Off</option>
+                  <option value="chime">Chime</option>
+                  <option value="bell">Bell</option>
+                  <option value="pop">Pop</option>
+                </select>
+              </label>
+              <p class="hint">Plays a few seconds after Claude in a tab finishes its turn. A turn that ends waiting on background tasks plays nothing until Claude finishes after them. Choosing one plays it.</p>
             </fieldset>
             <fieldset>
               <h2><span data-icon="square-terminal"></span>Terminal</h2>
