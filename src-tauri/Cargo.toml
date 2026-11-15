@@ -1,6 +1,6 @@
 [package]
 name = "misag"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 # The app; `misag-cli` is the console build of the same commands for Windows terminals.
 default-run = "misag"
