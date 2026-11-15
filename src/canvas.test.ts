@@ -65,7 +65,7 @@ describe("canvas", () => {
     const { el, transform } = setup();
     const drawn = el.querySelector(".drawflow")!;
     drawn.dispatchEvent(new WheelEvent("wheel", { deltaY: 100, ctrlKey: true, bubbles: true, cancelable: true }));
-    expect(transform()).toBe("translate(0px, 0px) scale(0.9)");
+    expect(transform()).toBe("translate(0px) scale(0.9)");
     drawn.dispatchEvent(new WheelEvent("wheel", { deltaY: 100, bubbles: true, cancelable: true }));
     expect(transform()).toBe("translate(0px, -100px) scale(0.9)");
   });
