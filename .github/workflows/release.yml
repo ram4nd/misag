@@ -32,8 +32,9 @@ jobs:
     runs-on: ${{ matrix.platform }}
     env:
       # Only macOS builds from main or a version tag get the Apple signing secrets, so
-      # a run of another branch cannot sign its code as ours.
-      SIGN: ${{ matrix.platform == 'macos-latest' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+      # a run of another branch cannot sign its code as ours. Not named SIGN: the
+      # AppImage bundler GPG-signs when a variable of that name is set at all.
+      MISAG_SIGN_MACOS: ${{ matrix.platform == 'macos-latest' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -84,7 +85,7 @@ jobs:
       # opens the app without a warning. Handed to the build step only, after the
       # tests, and never empty: a missing secret would quietly build an unsigned app.
       - name: Apple signing credentials
-        if: env.SIGN == 'true'
+        if: env.MISAG_SIGN_MACOS == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -115,7 +116,7 @@ jobs:
           args: ${{ matrix.args }}
 
       - name: Check that the app is signed and notarized
-        if: env.SIGN == 'true'
+        if: env.MISAG_SIGN_MACOS == 'true'
         shell: bash
         run: |
           app="src-tauri/target/release/bundle/macos/Mischief of Agents.app"
