@@ -1,19 +1,20 @@
 # Maintainer: Ra Mänd
-# Repackages the .deb from `pnpm tauri build --bundles deb`; build.sh builds it from a copy in build/.
+# Repackages the Linux .deb from the GitHub release; build.sh builds it from a local
+# `pnpm tauri build --bundles deb` instead.
 pkgname=misag-bin
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Mischief of Agents: a Linux terminal for keeping AI agents on the path you set"
 arch=('x86_64')
-url="https://github.com/ram4nd/raterm"
+url="https://github.com/ram4nd/mischief-of-agents"
 license=('GPL-3.0-only')
 depends=('webkit2gtk-4.1' 'gtk3')
 optdepends=('claude-code: Claude tabs and flows')
 provides=('misag')
 conflicts=('misag')
 options=('!strip' '!debug')
-source=("misag_${pkgver}_amd64.deb")
-sha256sums=('SKIP')
+source=("$url/releases/download/v$pkgver/Mischief-of-Agents_${pkgver}_Linux_x64.deb")
+sha256sums=('a8107bb4e8e203d58981a30b40ce5d20074d58407e8046c6a7a42973d3b44c6d')
 
 package() {
   bsdtar -xf data.tar.gz -C "$pkgdir"
