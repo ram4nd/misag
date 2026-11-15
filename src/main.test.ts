@@ -1227,6 +1227,44 @@ describe("input", () => {
       await release();
       expect(copy).not.toHaveBeenCalled();
     });
+
+    test("copying does not also focus the terminal", async () => {
+      await boot();
+      await clickClaude();
+      document.execCommand = vi.fn(() => true);
+      terms()[0].selected = "some output";
+      const before = terms()[0].focused;
+      await release();
+      expect(terms()[0].focused).toBe(before);
+    });
+
+    test("a hidden tab's terminal, or one under the settings page, copies nothing", async () => {
+      await boot();
+      await clickClaude();
+      await clickClaude();
+      const copy = vi.fn(() => true);
+      document.execCommand = copy;
+      terms()[0].selected = "stale output";
+      await release();
+      expect(copy).not.toHaveBeenCalled();
+      document.querySelector<HTMLButtonElement>(".tab")!.click();
+      await flush();
+      document.querySelector<HTMLButtonElement>("#open-settings")!.click();
+      await flush();
+      await release();
+      expect(copy).not.toHaveBeenCalled();
+    });
+
+    test("only the left button copies", async () => {
+      await boot();
+      await clickClaude();
+      const copy = vi.fn(() => true);
+      document.execCommand = copy;
+      terms()[0].selected = "some output";
+      terms()[0].element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 2 }));
+      for (let i = 0; i < 6; i++) await flush();
+      expect(copy).not.toHaveBeenCalled();
+    });
   });
 
   describe("right-click paste", () => {

@@ -9,7 +9,6 @@ pub mod history;
 pub mod runs;
 pub mod layout;
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod login_path;
 pub mod proc_tree;
 pub mod session;
@@ -418,7 +417,7 @@ fn install_wrapper(store: &db::Db, exe: &commands::AppExe) -> commands::Wrapper 
 
 pub fn run() {
     #[cfg(target_os = "macos")]
-    login_path::adopt();
+    login_path::start(session::default_shell());
     let exe = own_exe(Build::App);
     let sessions = match exe.path_str() {
         Ok(exe) => session::Sessions::default().with_trampoline(exe.to_owned()),
@@ -449,6 +448,8 @@ pub fn run() {
             if let Ok(dir) = &dir {
                 log_to_file(&in_build(dir.clone()));
             }
+            #[cfg(unix)]
+            login_path::report();
             let old_dir = dir.as_deref().ok().and_then(raterm_data_dir);
             let store = open_store(dir.map(in_build), old_dir.map(in_build));
             app.manage(install_wrapper(&store, &app.state::<commands::AppExe>()));

@@ -141,8 +141,10 @@ pub struct TabDirs<'a> {
     pub wrapper: Option<&'a Path>,
     /// The `misag` shim's directory.
     pub cli: Option<&'a Path>,
-    /// misag's own PATH.
+    /// The PATH tabs start from: misag's own, or on macOS the login shell's.
     pub path: Option<std::ffi::OsString>,
+    /// `path` is not misag's own, so tabs must be given it even when unchanged.
+    pub replaced: bool,
     /// The wrapper and shim directories of a misag, or a raterm, misag was started from.
     pub inherited: Vec<std::ffi::OsString>,
 }
@@ -151,10 +153,15 @@ impl<'a> TabDirs<'a> {
     /// `wrapper`'s directories, with misag's own environment.
     pub fn of(wrapper: &'a Wrapper) -> Self {
         let inherited = [claude::WRAPPER_ENV, claude::RATERM_WRAPPER_ENV, claude::CLI_ENV];
+        #[cfg(unix)]
+        let login = crate::login_path::path();
+        #[cfg(not(unix))]
+        let login: Option<String> = None;
         TabDirs {
             wrapper: wrapper.claude.as_deref().ok(),
             cli: wrapper.cli.as_deref().ok(),
-            path: std::env::var_os("PATH"),
+            replaced: login.is_some(),
+            path: login.map(Into::into).or_else(|| std::env::var_os("PATH")),
             inherited: inherited.into_iter().filter_map(std::env::var_os).collect(),
         }
     }
@@ -328,7 +335,8 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, dirs: &TabDirs) -> Res
     let first: Vec<&Path> = wrapper.into_iter().chain(cli).collect();
     let (launch, mut env) = launch_for(&plan);
     let inherited: Vec<&OsStr> = dirs.inherited.iter().map(|d| d.as_os_str()).collect();
-    if let Some(path) = tab_path(dirs.path.as_deref(), &inherited, &first) {
+    let given = || dirs.path.as_ref().filter(|_| dirs.replaced).and_then(|p| p.to_str()).map(str::to_owned);
+    if let Some(path) = tab_path(dirs.path.as_deref(), &inherited, &first).or_else(given) {
         // Only claimed once they are really on PATH, so a misag started here knows what to drop.
         let on_path = |dir: Option<&Path>| dir.and_then(Path::to_str).filter(|d| path.split(PATH_SEPARATOR).any(|p| p == *d)).map(str::to_owned);
         if let Some(dir) = on_path(wrapper) {
@@ -913,6 +921,17 @@ mod tests {
         assert_eq!(run(None), (Launch::LoginShell, vec![]));
     }
 
+    #[test]
+    fn tabs_get_a_path_other_than_misags_own_even_when_unchanged() {
+        let memory = Db::open_or_recover(Err("no data dir".into()));
+        let (request, exe) = (terminal_tab(), exe());
+        let env = |dirs: &TabDirs| plan_spawn(&request, &exe, &memory, dirs).unwrap().request.env;
+        let own = TabDirs { path: Some("/usr/bin".into()), ..Default::default() };
+        assert!(!env(&own).iter().any(|(k, _)| k == "PATH"), "inherited as is");
+        let login = TabDirs { path: Some("/login/bin".into()), replaced: true, ..Default::default() };
+        assert!(env(&login).contains(&("PATH".to_string(), "/login/bin".to_string())));
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminal_tabs_find_the_claude_wrapper_first_on_their_path() {
@@ -958,6 +977,7 @@ mod tests {
             cli: Some(&cli),
             path: Some("/o/cli:/usr/bin".into()),
             inherited: vec!["/o/cli".into()],
+            replaced: false,
         };
         let plan = plan_spawn(&claude_tab(), &exe(), &db, &dirs).unwrap();
         let env: HashMap<_, _> = plan.request.env.into_iter().collect();

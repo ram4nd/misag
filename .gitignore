@@ -21,3 +21,6 @@ packaging/arch/*.deb
 packaging/arch/*.pkg.tar.*
 packaging/arch/src
 packaging/arch/pkg
+
+# Left by the console build script of older versions on Windows; delete the folder.
+src-tauri/binaries

@@ -229,7 +229,7 @@ impl Default for Sessions {
 
 /// The user's shell: `$SHELL`, else `/bin/sh`.
 #[cfg(unix)]
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| {
         eprintln!("misag: $SHELL is not set, falling back to /bin/sh");
         "/bin/sh".into()

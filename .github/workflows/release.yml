@@ -30,6 +30,10 @@ jobs:
             args: '--bundles msi'
             os: Windows_x64
     runs-on: ${{ matrix.platform }}
+    env:
+      # Only macOS builds from main or a version tag get the Apple signing secrets, so
+      # a run of another branch cannot sign its code as ours.
+      SIGN: ${{ matrix.platform == 'macos-latest' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -76,17 +80,29 @@ jobs:
       - name: Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - uses: tauri-apps/tauri-action@v1
+      # Signs with the Developer ID certificate and notarizes with Apple, so Gatekeeper
+      # opens the app without a warning. Handed to the build step only, after the
+      # tests, and never empty: a missing secret would quietly build an unsigned app.
+      - name: Apple signing credentials
+        if: env.SIGN == 'true'
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # macOS: sign with the Developer ID certificate and notarize with Apple, so
-          # Gatekeeper opens the app without a warning. Unused on the other platforms.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            [ -n "${!name}" ] || { echo "::error::The $name secret is empty, so the app would not be signed and notarized"; exit 1; }
+            echo "$name=${!name}" >> "$GITHUB_ENV"
+          done
+
+      # Pinned to v1's commit, since this step gets the signing credentials.
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('Mischief of Agents {0}', github.ref_name) || '' }}
@@ -97,3 +113,12 @@ jobs:
           releaseAssetNamePattern: Mischief-of-Agents_[version]_${{ matrix.os }}[ext]
           uploadWorkflowArtifacts: ${{ github.ref_type != 'tag' }}
           args: ${{ matrix.args }}
+
+      - name: Check that the app is signed and notarized
+        if: env.SIGN == 'true'
+        shell: bash
+        run: |
+          app="src-tauri/target/release/bundle/macos/Mischief of Agents.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute --verbose=2 "$app"
