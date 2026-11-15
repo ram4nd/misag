@@ -8,6 +8,9 @@ pub mod flows;
 pub mod history;
 pub mod runs;
 pub mod layout;
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod login_path;
 pub mod proc_tree;
 pub mod session;
 pub mod settings;
@@ -414,6 +417,8 @@ fn install_wrapper(store: &db::Db, exe: &commands::AppExe) -> commands::Wrapper 
 }
 
 pub fn run() {
+    #[cfg(target_os = "macos")]
+    login_path::adopt();
     let exe = own_exe(Build::App);
     let sessions = match exe.path_str() {
         Ok(exe) => session::Sessions::default().with_trampoline(exe.to_owned()),
