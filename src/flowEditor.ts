@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvas } from "./canvas";
-import { STATUS_LABELS, type Run } from "./flows";
+import { awaitsPrompt, statusLabel, type Run } from "./flows";
 
-/** Mirrors `flows::Kind` in src-tauri/src/flows.rs. */
-export type StepKind = "start" | "prompt" | "manual" | "end";
+/** Mirrors `flows::Kind`; "manual" is a Pause, under the name older misags read. */
+export type StepKind = "start" | "prompt" | "manual" | "manual_prompt" | "end";
 
 /** Mirrors `flows::Node`. */
 export interface Step {
@@ -48,9 +48,10 @@ const MAX_INFO = 4000;
 const MAX_OUTPUTS = 8;
 const MAX_RUNS = 100;
 /** The steps the toolbar adds. An End marks where the flow ends; an output with no next step ends it too. */
-const NEW_STEPS: Record<"prompt" | "manual" | "end", { title: string; outputs: string[] }> = {
+const NEW_STEPS: Record<"prompt" | "manual" | "manual_prompt" | "end", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
-  manual: { title: "Manual step", outputs: ["done"] },
+  manual: { title: "Pause", outputs: ["done"] },
+  manual_prompt: { title: "Manual prompt", outputs: ["sent"] },
   end: { title: "End", outputs: [] },
 };
 
@@ -83,7 +84,8 @@ function editorMarkup(): string {
       <fieldset>
         <div class="toolbar">
           <button type="button" class="add-prompt">+ Prompt</button>
-          <button type="button" class="add-manual">+ Manual step</button>
+          <button type="button" class="add-manual-prompt" title="Puts base info and a draft into Claude's input for you to finish and send; goes on once Claude answers">+ Manual prompt</button>
+          <button type="button" class="add-pause" title="Waits for you to do something and press ▶">+ Pause</button>
           <button type="button" class="add-end">+ End</button>
           <span class="status" role="status"></span>
         </div>
@@ -215,15 +217,21 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     text.value = s.text;
     outputs.value = s.outputs.join(", ");
     maxRuns.value = s.maxRuns === undefined ? "" : String(s.maxRuns);
-    const words = s.kind === "prompt" || s.kind === "manual";
-    text.closest("label")!.hidden = !words && s.kind !== "start";
-    // A manual step goes on one way, with ▶; only one from an older flow, with several, shows them to cut down.
-    outputs.closest("label")!.hidden = !(s.kind === "prompt" || (s.kind === "manual" && s.outputs.length > 1));
-    // Leaving a manual step is always your pick, which no limit holds back.
+    const oneWay = s.kind === "manual" || s.kind === "manual_prompt";
+    text.closest("label")!.hidden = s.kind === "end";
+    // A pause or manual prompt goes on one way; only one from an older flow, with several, shows them to cut down.
+    outputs.closest("label")!.hidden = !(s.kind === "prompt" || (oneWay && s.outputs.length > 1));
+    // Leaving a pause or a manual prompt is always your doing, which no limit holds back.
     maxRuns.closest("label")!.hidden = s.kind !== "prompt";
     clear.checked = s.clear === true;
     clear.closest("label")!.hidden = s.kind !== "start";
-    $(".text-label").textContent = { start: "Base info", prompt: "Prompt", manual: "What the person does", end: "" }[s.kind];
+    $(".text-label").textContent = {
+      start: "Base info",
+      prompt: "Prompt",
+      manual: "What the person does",
+      manual_prompt: "Draft, put into Claude's input for you to finish",
+      end: "",
+    }[s.kind];
     text.maxLength = s.kind === "start" ? MAX_INFO : MAX_TEXT;
     text.placeholder = s.kind === "start" ? "Optional: where things are and what Claude should know, sent ahead of the first prompt" : "";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
@@ -291,7 +299,8 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   }
 
   $<HTMLButtonElement>(".add-prompt").onclick = () => addStep("prompt");
-  $<HTMLButtonElement>(".add-manual").onclick = () => addStep("manual");
+  $<HTMLButtonElement>(".add-pause").onclick = () => addStep("manual");
+  $<HTMLButtonElement>(".add-manual-prompt").onclick = () => addStep("manual_prompt");
   $<HTMLButtonElement>(".add-end").onclick = () => addStep("end");
   $<HTMLButtonElement>(".delete-step").onclick = () => {
     const s = find(selected);
@@ -315,7 +324,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   /** Applies the outputs field to the selected step, or says why it cannot. */
   function commitOutputs() {
     const s = find(selected);
-    if (!s || (s.kind !== "prompt" && s.kind !== "manual") || outputs.value === s.outputs.join(", ")) return;
+    if (!s || s.kind === "start" || s.kind === "end" || outputs.value === s.outputs.join(", ")) return;
     const words = [...new Set(outputs.value.split(",").map((w) => w.trim().toLowerCase()).filter((w) => w !== ""))];
     const bad = words.filter((w) => !OUTPUT.test(w) || w === "attention");
     const why =
@@ -326,8 +335,10 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
           : words.length > MAX_OUTPUTS
             ? `A step has at most ${MAX_OUTPUTS} outputs.`
             : s.kind === "manual" && words.length > 1
-              ? "A manual step has one output: ▶ goes on from it, and ■ stops the run."
-              : null;
+              ? "A pause has one output: ▶ goes on from it, and ■ stops the run."
+              : s.kind === "manual_prompt" && words.length > 1
+                ? "A manual prompt has one output: the run goes on by it once Claude answers your prompt."
+                : null;
     invalid.hidden = why === null;
     invalid.textContent = why ?? "";
     if (why !== null) return;
@@ -410,7 +421,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   function showWhere() {
     if (!run) return;
     const gone = graph.nodes.some((s) => s.id === run!.stepId) ? "" : " (no longer in this flow)";
-    $(".run-bar .where").textContent = `${STATUS_LABELS[run.status]}: ${run.step}${gone}`;
+    $(".run-bar .where").textContent = `${statusLabel(run)}: ${run.step}${gone}`;
   }
 
   /**
@@ -448,7 +459,11 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       b.type = "button";
       b.className = "output";
       b.textContent = output;
-      b.title = shown.status === "running" ? `Claude is still on this step; go on as "${output}" anyway` : `Go on as "${output}"`;
+      b.title = awaitsPrompt(shown)
+        ? `Skip without sending your prompt: go on as "${output}"`
+        : shown.status === "running"
+          ? `Claude is still on this step; go on as "${output}" anyway`
+          : `Go on as "${output}"`;
       b.onclick = () => once(() => opts.onContinue(shown, output));
       return b;
     });

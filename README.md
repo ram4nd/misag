@@ -12,7 +12,7 @@ The name and logo come from the same idea. A *mischief* is a group of rats, a no
 
 ## Features
 
-- **Flows.** Draw a graph of prompt steps and manual steps on a canvas, then run it in a Claude tab. Claude ends each reply with the output it chose (`FLOW: yes`), and the run moves on to the next step by itself, looping for review and fix rounds with a limit on how often a step runs, and waiting for you at manual steps or when something goes wrong.
+- **Flows.** Draw a graph of prompt steps, manual prompts and pauses on a canvas, then run it in a Claude tab. Claude ends each reply with the output it chose (`FLOW: yes`), and the run moves on to the next step by itself, looping for review and fix rounds with a limit on how often a step runs, and waiting for you at pauses, at manual prompts you write yourself, or when something goes wrong.
 - **Control over every Claude it starts.** Turn auto memory off and skip permission prompts for Claude tabs and for `claude` in terminal tabs alike, without touching your own Claude config.
 - **Tabs that remember Claude.** Claude tabs and terminal tabs reopen after a restart, and Claude comes back in the conversation it was last in, including after `/clear` and `/resume`. A `claude` started at a terminal tab's prompt is tracked too.
 - **Session history.** See every Claude conversation you have saved, in any folder, resume one in a new tab, and pin the ones you keep coming back to.

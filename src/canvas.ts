@@ -23,7 +23,7 @@ export interface Canvas {
   mark(id: string | null): void;
 }
 
-const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Manual", end: "End" };
+const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Pause", manual_prompt: "Manual prompt", end: "End" };
 
 /**
  * A Drawflow canvas showing a flow's steps, drawn in an element it adds to `canvasEl`.

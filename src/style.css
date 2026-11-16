@@ -326,7 +326,7 @@ svg.lucide { display: block; flex: none; }
 .flow-editor .drawflow .drawflow-node .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-editor .drawflow .drawflow-node.start { border-left: 4px solid #1e8e3e; }
 .flow-editor .drawflow .drawflow-node.prompt { border-left: 4px solid #d97757; }
-.flow-editor .drawflow .drawflow-node.manual { border-left: 4px solid var(--accent); }
+.flow-editor .drawflow .drawflow-node.manual, .flow-editor .drawflow .drawflow-node.manual_prompt { border-left: 4px solid var(--accent); }
 .flow-editor .drawflow .drawflow-node.end { border-left: 4px solid var(--muted); }
 .flow-editor .drawflow .drawflow-node .input, .flow-editor .drawflow .drawflow-node .output {
   width: 14px; height: 14px; border: 2px solid var(--muted); background: var(--surface);
@@ -343,19 +343,19 @@ svg.lucide { display: block; flex: none; }
 
 /* ---------- flow runs (see src/flows.ts and src/flowEditor.ts) ---------- */
 #flows-box .flows > li .name { flex: 1; }
-#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run, #flows-box .flows > li > button.resume, #flows-box .flows > li > button.go-on { padding: 2px; background: none; }
+#flows-box .flows > li > button.run, #flows-box .flows > li > button.stop-run, #flows-box .flows > li > button.go-on { padding: 2px; background: none; }
 #flows-box .flows > li > button.run { visibility: hidden; }
 #flows-box .flows > li:hover > button.run, #flows-box .flows > li > button.run:focus-visible { visibility: visible; }
 /* A flow running in the active tab. */
 #flows-box .flows > li.running { font-weight: 600; }
 #flows-box .flows > li.running > svg:first-child { color: var(--accent); }
-#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child, #flows-box .flows > li > button.resume, #flows-box .flows > li > button.go-on { color: #e8710a; }
+#flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child, #flows-box .flows > li > button.go-on { color: #e8710a; }
 /* A run whose tab is gone: it can only be stopped. */
 #flows-box .flows > li.orphan { font-weight: normal; font-style: italic; }
 #flows-box .flows > li.orphan > svg:first-child { color: var(--muted); }
 #flows-box .flows > li > button.run:disabled { opacity: 0.4; cursor: default; }
-/* A manual step's outputs, picked from the list: only for a run of an older flow whose manual step has several. */
-#flows-box .flows > li.manual { flex-wrap: wrap; }
+/* A waiting step's outputs, picked from the list: a step that needs attention, or an older flow's Pause, with several. */
+#flows-box .flows > li.manual, #flows-box .flows > li.attention { flex-wrap: wrap; }
 #flows-box .flows > li > .picks { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px; padding-left: 20px; }
 #flows-box .flows > li > .picks button { padding: 1px 8px; font-weight: normal; color: #e8710a; }
 /* Where the active tab's run of this flow is. */

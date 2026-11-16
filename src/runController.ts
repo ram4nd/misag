@@ -9,6 +9,12 @@ export interface Started {
   prompt: string | null;
 }
 
+/** Mirrors `runs::Prefill`. */
+export interface Prefill {
+  text: string;
+  token: number;
+}
+
 /** Mirrors `runs::Cleared`. */
 export type Cleared = { state: "pending" | "gone" } | { state: "ready"; prompt: string | null };
 
@@ -105,6 +111,12 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   let runsError: string | null = null;
   /** Tabs whose Claude input may hold text the person typed and has not sent. */
   const dirtyTabs = new Set<string>();
+  /** Runs whose manual prompt is being put into Claude's input right now. */
+  const filling = new Set<number>();
+  /** Runs whose manual prompt could not be put into Claude's input, or waits for the person to clear it, said once. */
+  const fillFailed = new Set<number>();
+  /** Tabs whose Claude input holds a manual prompt's paste the person has not touched. */
+  const pastedTabs = new Set<string>();
   /** How many flow starts and prompts are typing into each tab right now. */
   const lockCounts = new Map<string, number>();
 
@@ -169,6 +181,64 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       opts.write(tab, encoder.encode("\r"));
       return true;
     });
+  }
+
+  /**
+   * Puts the text of the manual prompt `run` waits at into its tab's Claude input,
+   * as a paste without Enter, for the person to finish and send. Waits while Claude
+   * works or a flow types there, and while the input holds text the person typed,
+   * which it does not wipe: it says how to get the draft, once. The backend owes
+   * the paste until it is told it was made, so a paste that fails is tried again
+   * at the next poll; its error is shown once.
+   */
+  async function fill(run: Run) {
+    const tab = opts.tabs().find((t) => t.tabId === run.tabId);
+    if (!tab || filling.has(run.id) || lockCounts.has(tab.tabId) || opts.busy(tab)) return;
+    if (dirtyTabs.has(tab.tabId)) {
+      if (!fillFailed.has(run.id)) {
+        fillFailed.add(run.id);
+        flows.showBoxError(
+          `Claude's input in ${opts.label(tab)} has text in it: clear it (Ctrl+C) or send it, and "${run.step}"'s draft goes in.`,
+        );
+      }
+      return;
+    }
+    filling.add(run.id);
+    let pasted = false;
+    try {
+      await withLock(tab, async () => {
+        if (!(await opts.live(tab))) return;
+        const fill = await invoke<Prefill | null>("flow_prefill_text", { runId: run.id, stepId: run.stepId });
+        // Claude may have started a turn, or the person typed, meanwhile.
+        if (fill === null || opts.busy(tab) || dirtyTabs.has(tab.tabId)) return;
+        opts.write(tab, encoder.encode(`\x1b[200~${fill.text}\x1b[201~`));
+        pasted = true;
+        dirtyTabs.add(tab.tabId);
+        pastedTabs.add(tab.tabId);
+        await invoke("flow_prefilled", { runId: run.id, stepId: run.stepId, token: fill.token });
+      });
+      fillFailed.delete(run.id);
+    } catch (err) {
+      console.error("misag: could not fill Claude's input for the manual prompt", err);
+      if (!fillFailed.has(run.id)) {
+        fillFailed.add(run.id);
+        flows.showBoxError(
+          pasted
+            ? `Pasted "${run.step}" into ${opts.label(tab)}, but could not record it (${opts.errorText(err)}); it is pasted again once the input is cleared.`
+            : `Could not put the manual prompt into ${opts.label(tab)}: ${opts.errorText(err)}`,
+        );
+      }
+    } finally {
+      filling.delete(run.id);
+    }
+  }
+
+  /** Takes a manual prompt's paste the person has not touched back out of the tab's Claude input. */
+  async function clearPaste(tab: T) {
+    if (!pastedTabs.delete(tab.tabId) || !(await opts.live(tab))) return;
+    opts.write(tab, encoder.encode("\x03"));
+    dirtyTabs.delete(tab.tabId);
+    await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
   }
 
   /** Why a prompt typed into `tab` was not sent, for the person. */
@@ -289,7 +359,12 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       error = `Claude is not running in ${tab ? opts.label(tab) : "the run's tab"}; start it there first, or stop the run.`;
     } else {
       try {
-        const prompt = await withLock(tab, go);
+        const prompt = await withLock(tab, async () => {
+          const next = await go();
+          // Gone on from a manual prompt: its unsent draft is no longer for anything.
+          await clearPaste(tab);
+          return next;
+        });
         if (prompt !== null && !(await typePrompt(tab, prompt))) error = `${notSent(tab)}; start Claude there and go on again.`;
       } catch (err) {
         console.error("misag: could not continue the run", err);
@@ -304,6 +379,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     try {
       await invoke("flow_stop", { runId: run.id });
       flows.showBoxError(null);
+      const tab = opts.tabs().find((t) => t.tabId === run.tabId);
+      if (tab) await withLock(tab, () => clearPaste(tab));
     } catch (err) {
       console.error("misag: could not stop the run", err);
       flows.showBoxError(`Could not stop the run: ${opts.errorText(err)}`);
@@ -323,6 +400,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
         if (run.status !== "running") waitingTabs.add(run.tabId);
       }
       opts.markWaiting((tab) => waitingTabs.has(tab.tabId));
+      for (const run of runs) if (run.prefill) void fill(run);
     } catch (err) {
       console.error("misag: could not read the flow runs", err);
       runsError = `Flow runs could not be read: ${opts.errorText(err)}`;
@@ -353,6 +431,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       const sent = (text.endsWith("\r") && !text.includes("\x1b[200~")) || text === "\x03";
       if (sent) dirtyTabs.delete(tab.tabId);
       else if (text) dirtyTabs.add(tab.tabId);
+      // A paste the person has added to, sent or cleared is theirs.
+      if (text) pastedTabs.delete(tab.tabId);
     },
     locked: (tab) => lockCounts.has(tab.tabId),
   };

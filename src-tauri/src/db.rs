@@ -169,6 +169,14 @@ const MIGRATIONS: &[&str] = &[r#"
     -- The sound played when Claude in a tab finishes its turn (see settings::FinishSound).
     ALTER TABLE settings ADD COLUMN finish_sound TEXT NOT NULL DEFAULT 'off'
         CHECK (finish_sound IN ('off', 'chime', 'bell', 'pop'));
+"#, r#"
+    -- 1 while a run waits at a manual prompt whose text the app has yet to put into
+    -- Claude's input (see runs::prefill_text).
+    ALTER TABLE flow_runs ADD COLUMN prefill INTEGER NOT NULL DEFAULT 0 CHECK (prefill IN (0, 1));
+"#, r#"
+    -- Names the paste a run owes while prefill is 1, so the record of an earlier
+    -- paste does not cancel one owed since (see runs::prefilled).
+    ALTER TABLE flow_runs ADD COLUMN prefill_token INTEGER;
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -915,6 +923,14 @@ impl Db {
 
     pub fn cleared_run(&self, run_id: i64) -> Result<runs::Cleared, String> {
         runs::cleared(&mut self.conn(), run_id)
+    }
+
+    pub fn prefill_text(&self, run_id: i64, step_id: &str) -> Result<Option<runs::Prefill>, String> {
+        runs::prefill_text(&mut self.conn(), run_id, step_id)
+    }
+
+    pub fn prefilled(&self, run_id: i64, step_id: &str, token: i64) -> Result<(), String> {
+        runs::prefilled(&mut self.conn(), run_id, step_id, token)
     }
 
     pub fn proceed_run(&self, run_id: i64, step_id: &str, output: &str) -> Result<Option<String>, String> {

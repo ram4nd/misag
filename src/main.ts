@@ -1724,7 +1724,6 @@ const flows = createFlows({
   onChange: followFlows,
   onRun: (flow) => void runs.start(flow),
   onStop: (run) => void runs.stop(run),
-  onResume: async (run) => flows.showBoxError(await runs.resume(run)),
   onContinue: async (run, output) => flows.showBoxError(await runs.proceed(run, output)),
 });
 
@@ -2004,7 +2003,7 @@ checkStore();
 // Session-hook failures can happen at any time, so they are checked on a timer.
 setInterval(checkStore, STORE_POLL_MS);
 // Directories and the Claude in terminal tabs change without telling misag, and
-// flow runs move on in the Stop hook.
+// flow runs move on in Claude's hooks.
 setInterval(pollTabs, TAB_POLL_MS);
 setInterval(runs.poll, TAB_POLL_MS);
 // `misag flow import` adds flows without telling the app.

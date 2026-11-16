@@ -201,8 +201,9 @@ fn hook_entry(exe: &Path, direct: bool) -> Value {
 
 /// The `--settings` JSON: `keys` (from misag's own settings) plus, with `hook_exe`,
 /// misag's hook for SessionStart (to record the tab's session), Stop (to record
-/// background tasks and move the tab's flow run on) and SessionEnd (to forget the
-/// background tasks). None when there are no keys and no hook, so no
+/// background tasks and move the tab's flow run on), SessionEnd (to forget the
+/// background tasks) and UserPromptSubmit (for a flow run waiting for the
+/// person's prompt). None when there are no keys and no hook, so no
 /// `--settings` is passed.
 fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Option<String> {
     if let Some(exe) = hook_exe {
@@ -210,7 +211,10 @@ fn settings_json(hook_exe: Option<&Path>, mut keys: Map<String, Value>) -> Optio
         // Windows may run hook commands through Git Bash or PowerShell, which quote
         // differently, so there the hook runs without a shell.
         let hook = serde_json::json!([{ "hooks": [hook_entry(exe, cfg!(windows))] }]);
-        keys.insert("hooks".into(), serde_json::json!({ "SessionStart": hook, "Stop": hook, "SessionEnd": hook }));
+        keys.insert(
+            "hooks".into(),
+            serde_json::json!({ "SessionStart": hook, "Stop": hook, "SessionEnd": hook, "UserPromptSubmit": hook }),
+        );
     }
     (!keys.is_empty()).then(|| Value::Object(keys).to_string())
 }
@@ -442,6 +446,12 @@ impl Stop {
     }
 }
 
+/// The part of Claude's UserPromptSubmit payload misag reads.
+#[derive(Deserialize)]
+struct PromptSubmit {
+    prompt: String,
+}
+
 /// The part of Claude's SessionEnd payload misag reads.
 #[derive(Deserialize)]
 struct SessionEnd {
@@ -459,6 +469,9 @@ enum Outcome {
     Stopped(Option<String>),
     /// Recorded that a session ended, so its tab waits on no background tasks.
     Ended,
+    /// Handled the person's prompt (see `runs::on_prompt`). It prints nothing, as
+    /// a UserPromptSubmit hook's output is added to Claude's context.
+    Prompted,
 }
 
 /// The hook output that has Claude go on with `prompt`. Context rather than a
@@ -512,9 +525,26 @@ fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
     db::record_background(&conn, tab_id, &event.session_id, false)
 }
 
+/// Tells the tab's flow run, if any, that the person sent a prompt.
+/// If it cannot, a run waiting at a manual prompt waits for the person instead,
+/// as it would never see Claude's answer.
+fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
+    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(()) };
+    let told = serde_json::from_str::<PromptSubmit>(input)
+        .map_err(|e| format!("bad hook payload: {e}"))
+        .and_then(|event| crate::runs::on_prompt(&mut conn, tab_id, &event.prompt));
+    let Err(e) = told else { return Ok(()) };
+    let why = format!("misag could not record your prompt ({e}), so Claude's answer will not move the run on. Pick an output to go on.");
+    match crate::runs::prompt_unseen(&mut conn, tab_id, &why) {
+        Ok(()) => Err(e),
+        Err(also) => Err(format!("{e}; and could not mark the run: {also}")),
+    }
+}
+
 /// Reads one hook payload from `input`: a SessionStart is recorded for `tab_id`,
 /// with the Claude process that sent it, a Stop records the background tasks and
-/// moves the tab's flow run on, and a SessionEnd forgets the background tasks.
+/// moves the tab's flow run on, a SessionEnd forgets the background tasks, and a
+/// UserPromptSubmit tells a run waiting at a manual prompt that the person sent it.
 fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<Outcome, String> {
     let (Some(tab_id), Some(db_path)) = (tab_id, db_path) else {
         return Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}"));
@@ -528,6 +558,9 @@ fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, cl
         Some("Stop") => stopped(&payload, tab_id, db_path)
             .map(Outcome::Stopped)
             .map_err(|e| format!("could not move the flow run on: {e}")),
+        Some("UserPromptSubmit") => prompted(&payload, tab_id, db_path)
+            .map(|()| Outcome::Prompted)
+            .map_err(|e| format!("could not tell the flow run about the prompt: {e}")),
         Some("SessionEnd") => ended(&payload, tab_id, db_path)
             .map(|()| Outcome::Ended)
             .map_err(|e| format!("could not record the end of the Claude session: {e}")),
@@ -657,7 +690,7 @@ pub fn run_hook() -> i32 {
             tab_id.as_ref(),
             &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
         ),
-        Ok(Outcome::Recorded | Outcome::Stopped(None) | Outcome::Ended) => {}
+        Ok(Outcome::Recorded | Outcome::Stopped(None) | Outcome::Ended | Outcome::Prompted) => {}
         Ok(Outcome::Stopped(Some(output))) => println!("{output}"),
     }
     0
@@ -709,6 +742,8 @@ mod tests {
         // when its session ends, so nothing is left waiting on background tasks.
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0], *hook);
         assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0], *hook);
+        // And when the person sends a prompt, which a manual prompt step waits for.
+        assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0], *hook);
         assert_eq!(settings.as_object().unwrap().len(), 1, "only the hook");
     }
 
@@ -1119,6 +1154,44 @@ mod tests {
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"clear"}}"#);
         record(&payload, &tid("tab-1"), &path, None).unwrap();
         assert!(matches!(crate::runs::cleared(&mut conn, run).unwrap(), crate::runs::Cleared::Ready { prompt: Some(_) }));
+    }
+
+    #[test]
+    fn the_person_s_prompt_moves_a_manual_prompt_on_to_claude_s_answer() {
+        let path = temp_db("hook-prompt");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        let mut g = crate::flows::tests::runnable();
+        g.nodes.push(crate::flows::tests::node("mp", crate::flows::Kind::ManualPrompt, &["sent"]));
+        g.edges[0].to = "mp".into();
+        g.edges.push(crate::flows::tests::edge("mp", "sent", "p"));
+        db.save_flow_graph(flow, &g).unwrap();
+        let mut conn = db::connect_existing(&path).unwrap();
+        crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
+        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit","prompt":"Fix it"}}"#);
+        // Nothing is printed: a UserPromptSubmit hook's output would reach Claude.
+        assert_eq!(hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap(), Outcome::Prompted);
+        assert_eq!(crate::runs::active(&conn).unwrap()[0].status, crate::runs::Status::Running);
+    }
+
+    #[test]
+    fn a_prompt_the_hook_cannot_read_makes_the_manual_prompt_wait_for_the_person() {
+        let path = temp_db("hook-prompt-bad");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        let mut g = crate::flows::tests::runnable();
+        g.nodes.push(crate::flows::tests::node("mp", crate::flows::Kind::ManualPrompt, &["sent"]));
+        g.edges[0].to = "mp".into();
+        db.save_flow_graph(flow, &g).unwrap();
+        let mut conn = db::connect_existing(&path).unwrap();
+        crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
+        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit"}}"#);
+        let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
+        assert!(err.contains("could not tell the flow run about the prompt"), "{err}");
+        // Not left at "Waiting for you" while Claude answers a prompt the run never saw.
+        let run = &crate::runs::active(&conn).unwrap()[0];
+        assert_eq!(run.status, crate::runs::Status::Attention);
+        assert!(run.note.as_deref().unwrap().contains("Pick an output"), "{:?}", run.note);
     }
 
     #[test]

@@ -31,6 +31,10 @@
     ],
     "unreadable": 0
   },
+  "prefill": {
+    "text": "Fix it",
+    "token": 7
+  },
   "run": {
     "flowId": 2,
     "flowName": "Deploy",
@@ -39,10 +43,12 @@
     "outputs": [
       "done"
     ],
+    "prefill": false,
     "resumable": true,
     "status": "attention",
     "step": "Fix",
     "stepId": "p",
+    "stepKind": "prompt",
     "steps": 3,
     "tabId": "tab-1"
   },

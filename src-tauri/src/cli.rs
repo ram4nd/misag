@@ -80,21 +80,28 @@ Steps ("nodes"):
             "prompt": sends "text" to Claude in the run's tab. misag adds an
               instruction to end the reply with "FLOW: <output>", which picks
               the output, so the text need not mention the outputs.
-            "manual": waits for the person, who goes on with ▶ in the app or
+            "manual": a pause, shown as Pause in the app ("pause" is read
+              too): waits for the person, who goes on with ▶ in the app or
               stops the run with ■; "text" says what to do. It has exactly
               one output; a flow with more still imports, but does not run
               until it has one.
+            "manual_prompt": puts Start's base info (if Claude lacks it) and
+              "text" (an optional draft) into Claude's input without sending
+              it. The person writes the prompt and sends it, and the run goes
+              on by the step's one output once Claude answers it; ▶ skips
+              the step.
             "end": ends the run and has no outputs. Optional: an output that
               leads nowhere ends it too.
   title     The step's name on the canvas (up to 200 characters).
-  text      The prompt, or what the person does (up to 20000 characters).
+  text      The prompt, what the person does at a pause, or a manual
+            prompt's draft (up to 20000 characters).
             Optional on Start: base info, such as where things are (up to
             4000 characters), sent ahead of the run's first prompt and again
             with the first prompt after each /clear.
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
             and _, starting with a letter or digit, up to 24 characters); a
-            manual step has exactly one. "attention" is reserved: Claude ends
-            with it to ask for the person.
+            pause or manual prompt has exactly one. "attention" is reserved:
+            Claude ends with it to ask for the person.
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run
             waits for the person.

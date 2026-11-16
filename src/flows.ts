@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
+import type { StepKind } from "./flowEditor";
 import { icon, type IconName } from "./icons";
 
 /** Mirrors the active statuses of `runs::Status` in src-tauri/src/runs.rs. */
@@ -19,9 +20,19 @@ export interface Run {
   steps: number;
   /** Whether Claude can be asked to go on with the step (a prompt step that needs attention). */
   resumable: boolean;
+  /** Whether the app has yet to fill Claude's input for the manual prompt the run waits at. */
+  prefill: boolean;
+  /** The kind of the step the run is at; null for a run that cannot be read. */
+  stepKind: StepKind | null;
 }
 
 export const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
+
+/** Whether the run waits for the person's own prompt, at a manual prompt (not while Claude answers it). */
+export const awaitsPrompt = (run: Run) => run.stepKind === "manual_prompt" && run.status !== "running";
+
+/** What the run is doing, for the person. */
+export const statusLabel = (run: Run) => (awaitsPrompt(run) && run.status === "manual" ? "Waiting for your prompt" : STATUS_LABELS[run.status]);
 
 /** Mirrors `db::FlowSummary` in src-tauri/src/db.rs. */
 export interface Flow {
@@ -50,9 +61,10 @@ export interface FlowsOptions {
   onRun(flow: Flow): void;
   /** Stops the run (the ■ button that takes ▶'s place). */
   onStop(run: Run): void;
-  /** Has Claude go on with a step that needs attention (the Continue button). */
-  onResume(run: Run): void;
-  /** Goes on from a manual step as `output` (▶ for its only output, else its buttons under the flow). */
+  /**
+   * Goes on from a run waiting for you (a Pause, a Manual prompt, a step that needs
+   * attention) as `output`: ▶ for its only output, else its buttons under the flow.
+   */
   onContinue(run: Run, output: string): void;
 }
 
@@ -234,7 +246,7 @@ export function createFlows(opts: FlowsOptions): Flows {
         const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
         const run = mine ?? orphan;
         li.title = mine
-          ? `${flow.name}: ${STATUS_LABELS[mine.status].toLowerCase()} at ${mine.step}${mine.note ? `. ${mine.note}` : ""}`
+          ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}${mine.note ? `. ${mine.note}` : ""}`
           : orphan
             ? `${flow.name}: running in a closed tab; ■ stops it`
             : `Edit ${flow.name}`;
@@ -254,22 +266,26 @@ export function createFlows(opts: FlowsOptions): Flows {
         if (attention) mark.classList.add("needs-attention");
         else if (flow.clear) mark.classList.add("clears");
         li.append(mark, nameSpan(flow));
-        if (mine?.resumable) {
-          const resume = button("resume", "step-forward", "Continue: have Claude go on with this step", () => opts.onResume(mine));
-          resume.addEventListener("click", (e) => e.stopPropagation());
-          li.append(resume);
-        }
         li.append(action);
-        if (mine?.status === "manual" && mine.outputs.length === 1) {
-          // Done with a manual step that has one way on: ▶ takes it.
-          const go = button("go-on", "play", `Done with "${mine.step}": go on`, () => {
+        // A run waiting for you goes on to the next step from here; having Claude go
+        // on with a step that needs attention is the editor's Continue.
+        const waits = mine !== undefined && mine.status !== "running";
+        const title = (run: Run) =>
+          awaitsPrompt(run)
+            ? `Skip "${run.step}" without sending a prompt`
+            : run.status === "attention"
+              ? `Go on from "${run.step}" to the next step`
+              : `Done with "${run.step}": go on`;
+        if (waits && mine.outputs.length === 1) {
+          // One way on (a Pause, a Manual prompt to skip, a one-output step): ▶ takes it.
+          const go = button("go-on", "play", title(mine), () => {
             go.disabled = true; // A second click would send the next step too; the poll after it redraws the row.
             opts.onContinue(mine, mine.outputs[0]);
           });
           go.addEventListener("click", (e) => e.stopPropagation());
           li.insertBefore(go, action);
-        } else if (mine?.status === "manual") {
-          // A run of an older flow whose manual step has several ways on (new ones have one): its outputs, on a line of their own.
+        } else if (waits && mine.outputs.length > 1) {
+          // Several ways on (a step that needs attention, or an older flow's Pause): its outputs, on a line of their own.
           const picks = document.createElement("div");
           picks.className = "picks";
           picks.append(

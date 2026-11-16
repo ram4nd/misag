@@ -28,8 +28,9 @@ pub const ATTENTION: &str = "attention";
 /// could misread. A graph is stored as the oldest format that holds it (see
 /// `stored`), so older misags keep reading the flows they can run correctly.
 /// Version 2 added step run limits (`Node::max_runs`), version 3 clearing the
-/// conversation at Start (`Node::clear`), version 4 Start's base info (its `text`).
-pub const GRAPH_VERSION: u32 = 4;
+/// conversation at Start (`Node::clear`), version 4 Start's base info (its `text`),
+/// version 5 manual prompts (`Kind::ManualPrompt`).
+pub const GRAPH_VERSION: u32 = 5;
 
 /// Mirrored by `Graph` in src/flowEditor.ts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -54,7 +55,15 @@ pub enum Kind {
     Prompt,
     /// Waits for a person, who goes on by its one output. Flows from older versions
     /// may have several, which `problems` reports, so such a flow does not start.
-    Manual,
+    /// Saved as "manual", its name before, so older misags still read flows with
+    /// pauses; "pause" loads too.
+    #[serde(rename = "manual", alias = "pause")]
+    Pause,
+    /// Puts Start's base info (if Claude lacks it) and `text` into Claude's input
+    /// without sending it; the person writes the prompt and sends it, and the run
+    /// goes on by its one output when Claude ends that turn.
+    #[serde(rename = "manual_prompt")]
+    ManualPrompt,
     End,
 }
 
@@ -65,7 +74,8 @@ pub struct Node {
     pub kind: Kind,
     #[serde(default)]
     pub title: String,
-    /// A prompt step's prompt, or what the person does at a manual step. For Start:
+    /// A prompt step's prompt, what the person does at a pause, or a manual prompt's
+    /// draft, put into Claude's input for the person to finish. For Start:
     /// optional base info (where things are and the like), sent ahead of the run's
     /// first prompt.
     #[serde(default)]
@@ -119,7 +129,8 @@ impl Node {
         match (self.title.trim(), self.kind) {
             ("", Kind::Start) => "Start",
             ("", Kind::Prompt) => "Prompt step",
-            ("", Kind::Manual) => "Manual step",
+            ("", Kind::Pause) => "Pause",
+            ("", Kind::ManualPrompt) => "Manual prompt",
             ("", Kind::End) => "End",
             (title, _) => title,
         }
@@ -159,7 +170,7 @@ fn check_outputs(node: &Node) -> Result<(), String> {
         }
         Kind::End if !node.outputs.is_empty() => return Err(format!("End step \"{name}\" cannot have outputs")),
         Kind::Start | Kind::End => return Ok(()),
-        Kind::Prompt | Kind::Manual => {}
+        Kind::Prompt | Kind::Pause | Kind::ManualPrompt => {}
     }
     if node.outputs.is_empty() || node.outputs.len() > MAX_OUTPUTS {
         return Err(format!("\"{name}\" needs between 1 and at most {MAX_OUTPUTS} outputs"));
@@ -200,8 +211,8 @@ fn check_node(node: &Node) -> Result<(), String> {
     }
     match (node.max_runs, node.kind) {
         (None, _) => {}
-        // Leaving a manual step is always the person's pick, which no limit holds back.
-        (Some(_), Kind::Start | Kind::Manual | Kind::End) => {
+        // Leaving a pause or a manual prompt is always the person's doing, which no limit holds back.
+        (Some(_), Kind::Start | Kind::Pause | Kind::ManualPrompt | Kind::End) => {
             return Err(format!("\"{}\" cannot have a run limit: only prompt steps can", node.name()));
         }
         (Some(n), _) if !(1..=MAX_RUNS).contains(&n) => {
@@ -220,6 +231,7 @@ fn check_node(node: &Node) -> Result<(), String> {
 pub fn stored(mut graph: Graph) -> Graph {
     // The format each step needs, by the newest field it uses.
     let needs = |n: &Node| match n {
+        Node { kind: Kind::ManualPrompt, .. } => 5,
         Node { kind: Kind::Start, text, .. } if !text.trim().is_empty() => 4,
         Node { kind: Kind::Start, clear: true, .. } => 3,
         Node { max_runs: Some(_), .. } => 2,
@@ -308,6 +320,20 @@ pub fn first_prompt_text(graph: &Graph, node: &Node) -> String {
     typeable(format!("{info}\n\n{}", prompt_text(node)))
 }
 
+/// What a manual prompt puts into Claude's input: Start's base info (trimmed) when
+/// `with_info`, then the step's draft (trimmed), either of which may be empty.
+pub fn prefill_text(graph: &Graph, node: &Node, with_info: bool) -> String {
+    let info = if with_info { base_info(graph) } else { String::new() };
+    // A trailing space stays, so what the person types does not run into the draft.
+    let draft = typeable(node.text.trim_start().trim_end_matches(['\n', '\r']).to_owned());
+    [info, draft].into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("\n\n")
+}
+
+/// Start's base info (trimmed), as it is typed to Claude; empty without any.
+pub fn base_info(graph: &Graph) -> String {
+    typeable(graph.nodes.iter().find(|n| n.kind == Kind::Start).map_or("", |n| n.text.trim()).to_owned())
+}
+
 /// What is sent to Claude to go on with a prompt step that needs attention, once
 /// the person has seen to it.
 pub fn resume_text(node: &Node) -> String {
@@ -357,9 +383,14 @@ pub fn problems(graph: &Graph) -> Vec<String> {
             problems.push(format!("\"{name}\" has no prompt."));
         }
         // Older versions let the person pick among several; ■ stops the run instead.
-        if node.kind == Kind::Manual && node.outputs.len() > 1 {
+        if node.kind == Kind::Pause && node.outputs.len() > 1 {
             problems.push(format!(
-                "\"{name}\" has more than one output; a manual step goes on one way, with ▶, so give it a single output."
+                "\"{name}\" has more than one output; a pause goes on one way, with ▶, so give it a single output."
+            ));
+        }
+        if node.kind == Kind::ManualPrompt && node.outputs.len() > 1 {
+            problems.push(format!(
+                "\"{name}\" has more than one output; a manual prompt goes on one way once Claude answers, so give it a single output."
             ));
         }
         // Start must lead somewhere; other outputs with no next step end the flow there.
@@ -450,7 +481,7 @@ pub(crate) mod tests {
         let read: Node = serde_json::from_value(serde_json::json!({ "id": "start", "kind": "start", "clear": true, "x": 0, "y": 0 })).unwrap();
         assert!(read.clear);
         assert_eq!(parsed.version, 1, "graphs stored before versions are version 1");
-        let newer = serde_json::json!({ "version": 5, "nodes": [], "edges": [] });
+        let newer = serde_json::json!({ "version": GRAPH_VERSION + 1, "nodes": [], "edges": [] });
         assert!(check(&serde_json::from_value(newer).unwrap()).unwrap_err().contains("newer Mischief of Agents"));
     }
 
@@ -543,7 +574,7 @@ pub(crate) mod tests {
             let n = g.nodes.iter_mut().find(|n| n.id == id).unwrap();
             n.kind = kind;
             n.max_runs = Some(max);
-            if kind == Kind::Manual {
+            if kind != Kind::Prompt {
                 n.text.clear();
             }
             g
@@ -551,8 +582,9 @@ pub(crate) mod tests {
         for max in [1, 3, 100] {
             check(&with_limit("p", Kind::Prompt, max)).unwrap();
         }
-        // Leaving a manual step is always the person's pick, which no limit holds back.
-        rejected(&with_limit("p", Kind::Manual, 2), "cannot have a run limit");
+        // Leaving a pause or a manual prompt is always the person's doing, which no limit holds back.
+        rejected(&with_limit("p", Kind::Pause, 2), "cannot have a run limit");
+        rejected(&with_limit("p", Kind::ManualPrompt, 2), "cannot have a run limit");
         rejected(&with_limit("e", Kind::End, 2), "cannot have a run limit");
         rejected(&with_limit("start", Kind::Start, 2), "cannot have a run limit");
         for bad in [0, 101] {
@@ -607,6 +639,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_graph_with_a_manual_prompt_is_a_newer_format() {
+        let mut g = runnable();
+        g.nodes[0].text = "The app is in src/.".into();
+        g.nodes.push(Node { text: String::new(), ..node("m", Kind::ManualPrompt, &["sent"]) });
+        assert_eq!(stored(g.clone()).version, 5);
+        check(&stored(g)).unwrap();
+        // A pause is the manual step older misags know, so it needs no newer format.
+        let mut g = runnable();
+        g.nodes.push(node("m", Kind::Pause, &["ok"]));
+        assert_eq!(stored(g).version, 1);
+    }
+
+    #[test]
     fn base_info_is_short_enough_to_leave_room_for_the_prompt() {
         let mut g = runnable();
         g.nodes[0].text = "x".repeat(MAX_INFO);
@@ -641,9 +686,53 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_manual_prompt_goes_on_one_way() {
+        let mut g = runnable();
+        g.nodes.push(node("m", Kind::ManualPrompt, &["ok", "redo"]));
+        g.edges.push(edge("p", "pass", "m"));
+        g.edges.retain(|e| e.to != "e");
+        g.nodes.retain(|n| n.id != "e");
+        check(&g).unwrap();
+        assert_eq!(
+            problems(&g),
+            vec!["\"M\" has more than one output; a manual prompt goes on one way once Claude answers, so give it a single output."]
+        );
+        // Its draft is optional: the person writes the prompt.
+        g.nodes.last_mut().unwrap().outputs.truncate(1);
+        assert!(problems(&g).is_empty());
+    }
+
+    #[test]
+    fn manual_and_manual_prompt_kinds_load() {
+        let old: Node = serde_json::from_str(r#"{"id": "m", "kind": "manual", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
+        assert_eq!(old.kind, Kind::Pause);
+        // Saved under the name older misags read; the new name loads too.
+        assert_eq!(serde_json::to_value(Kind::Pause).unwrap(), "manual");
+        let new: Node = serde_json::from_str(r#"{"id": "m", "kind": "pause", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
+        assert_eq!(new.kind, Kind::Pause);
+        let mp: Node = serde_json::from_str(r#"{"id": "m", "kind": "manual_prompt", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
+        assert_eq!(mp.kind, Kind::ManualPrompt);
+    }
+
+    #[test]
+    fn a_manual_prompt_s_prefill_leads_with_base_info_when_owed() {
+        let mut g = runnable();
+        g.nodes[0].text = " The app is in src/. ".into();
+        let mut m = node("m", Kind::ManualPrompt, &["ok"]);
+        m.text = "Fix the \u{1b}bug ".into();
+        // A trailing space stays, so what the person types does not run into the draft.
+        assert_eq!(prefill_text(&g, &m, true), "The app is in src/.\n\nFix the bug ");
+        assert_eq!(prefill_text(&g, &m, false), "Fix the bug ");
+        m.text = "\n  Fix it\n\n".into();
+        assert_eq!(prefill_text(&g, &m, false), "Fix it", "blank lines around it go");
+        m.text.clear();
+        assert_eq!(prefill_text(&g, &m, false), "");
+    }
+
+    #[test]
     fn a_manual_step_goes_on_one_way() {
         let mut g = runnable();
-        g.nodes.push(node("m", Kind::Manual, &["ok", "redo"]));
+        g.nodes.push(node("m", Kind::Pause, &["ok", "redo"]));
         g.edges.push(edge("p", "pass", "m"));
         g.edges.retain(|e| e.to != "e");
         g.nodes.retain(|n| n.id != "e");
@@ -651,7 +740,7 @@ pub(crate) mod tests {
         check(&g).unwrap();
         assert_eq!(
             problems(&g),
-            vec!["\"M\" has more than one output; a manual step goes on one way, with ▶, so give it a single output."]
+            vec!["\"M\" has more than one output; a pause goes on one way, with ▶, so give it a single output."]
         );
     }
 
@@ -660,7 +749,7 @@ pub(crate) mod tests {
         let mut g = runnable();
         g.nodes.push(node("x", Kind::End, &[]));
         g.nodes.push(Node { text: String::new(), ..node("q", Kind::Prompt, &["done"]) });
-        g.nodes.push(node("m", Kind::Manual, &["ok", "redo"]));
+        g.nodes.push(node("m", Kind::Pause, &["ok", "redo"]));
         g.edges.push(edge("q", "done", "m"));
         assert!(problems(&g).is_empty());
     }
@@ -671,7 +760,7 @@ pub(crate) mod tests {
         g.nodes[1].text = "  ".into();
         // An output with no next step ends the flow there, which is fine.
         g.edges.retain(|e| e.output != "fail");
-        g.nodes.push(Node { title: String::new(), ..node("m", Kind::Manual, &["done"]) });
+        g.nodes.push(Node { title: String::new(), ..node("m", Kind::Pause, &["done"]) });
         assert_eq!(problems(&g), vec!["\"P\" has no prompt."]);
         let mut g = runnable();
         g.nodes.remove(0);

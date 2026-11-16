@@ -4,8 +4,12 @@
 //! sends its text to Claude; when Claude ends its turn, the Stop hook
 //! (`misag --claude-hook`, a separate process) reads the `FLOW: <output>` line
 //! Claude ended with and moves on, handing Claude the next prompt as hook context.
-//! A manual step waits for the person, who goes on by its one output (▶ in the
-//! Flows box) or stops the run. A reply the runner cannot follow waits too: the
+//! A pause waits for the person, who goes on by its one output (▶ in the Flows
+//! box) or stops the run. A manual prompt has the app put Start's base info (if
+//! Claude lacks it) and the step's draft into Claude's input without sending it
+//! (`prefill_text`, `prefilled`); the person's own prompt, reported by the
+//! UserPromptSubmit hook (`on_prompt`), has the step run, and Claude's answer
+//! moves it on by its one output, with no `FLOW:` line. ▶ skips it. A reply the runner cannot follow waits too: the
 //! person picks an output in the editor's run bar (and can do so for a running
 //! step too, if Claude was interrupted) or has Claude go on with the step. A pick or Continue names the step it was made for, so one that
 //! arrives after the run moved on is refused. An output with no next step ends the
@@ -43,7 +47,9 @@ pub const CLEAR_TIMEOUT_SECS: i64 = 35;
 pub enum Status {
     /// Claude is working on a prompt step.
     Running,
-    /// At a manual step, waiting for the person to go on (by its one output) or stop the run.
+    /// Waiting for the person: at a pause, to go on (▶, by its one output) or stop
+    /// the run; at a manual prompt, also to send their prompt, which makes the step
+    /// `Running` until Claude answers.
     Manual,
     /// The run needs a person (its note says why): Claude's reply could not be
     /// followed, it asked for one, or the run hit `MAX_RUN_STEPS`. The person picks
@@ -73,6 +79,11 @@ pub struct Run {
     pub steps: i64,
     /// Whether Claude can be asked to go on with the step (see `resume`).
     pub resumable: bool,
+    /// Whether the app has yet to fill Claude's input for the manual prompt the run
+    /// waits at (see `prefill_text`).
+    pub prefill: bool,
+    /// The kind of the step the run is at; None for a run that cannot be read.
+    pub step_kind: Option<Kind>,
 }
 
 /// How Continue has Claude go on with a step that needs attention.
@@ -200,6 +211,8 @@ struct Stored {
     clear: Option<Clear>,
     /// Whether Claude has Start's base info: false from the start and after a clear.
     briefed: bool,
+    /// Whether the app has yet to fill Claude's input for the manual prompt.
+    prefill: bool,
 }
 
 impl Stored {
@@ -219,10 +232,10 @@ impl Stored {
 }
 
 /// The active run matching `filter` (`tab_id = ?1` or `id = ?1`).
-fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, String> {
-    let row = tx
+fn active_run(conn: &Connection, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, String> {
+    let row = conn
         .query_row(
-            &format!("SELECT id, graph, node_id, status, steps, resume, clear, briefed FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
+            &format!("SELECT id, graph, node_id, status, steps, resume, clear, briefed, prefill FROM flow_runs WHERE {filter} AND status IN {ACTIVE}"),
             [key],
             |r| {
                 Ok((
@@ -234,12 +247,13 @@ fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Resu
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
                 ))
             },
         )
         .optional()
         .map_err(sql)?;
-    row.map(|(id, graph, node_id, status, steps, resume, clear, briefed)| {
+    row.map(|(id, graph, node_id, status, steps, resume, clear, briefed, prefill)| {
         Ok(Stored {
             id,
             graph: parse_graph(&graph)?,
@@ -249,6 +263,7 @@ fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Resu
             resume: Resume::parse(resume)?,
             clear: Clear::parse(clear)?,
             briefed,
+            prefill,
         })
     })
     .transpose()
@@ -256,7 +271,7 @@ fn active_run(tx: &Transaction, filter: &str, key: &dyn rusqlite::ToSql) -> Resu
 
 fn set(tx: &Transaction, run: i64, node_id: &str, status: Status, steps: i64, note: Option<&str>) -> Result<(), String> {
     tx.execute(
-        "UPDATE flow_runs SET node_id = ?2, status = ?3, steps = ?4, note = ?5, resume = NULL, clear = NULL, updated_at = ?6 WHERE id = ?1",
+        "UPDATE flow_runs SET node_id = ?2, status = ?3, steps = ?4, note = ?5, resume = NULL, clear = NULL, prefill = 0, updated_at = ?6 WHERE id = ?1",
         params![run, node_id, status.as_str(), steps, note, now()],
     )
     .map(drop)
@@ -344,7 +359,12 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
             set(tx, run.id, &next.id, Status::Running, steps + 1, None)?;
             prompt_for(tx, run, next).map(Some)
         }
-        Kind::Manual => set(tx, run.id, &next.id, Status::Manual, steps, None).map(|()| None),
+        Kind::Pause => set(tx, run.id, &next.id, Status::Manual, steps, None).map(|()| None),
+        Kind::ManualPrompt => {
+            set(tx, run.id, &next.id, Status::Manual, steps, None)?;
+            owe_prefill(tx, run.id, &run.graph, next, run.briefed)?;
+            Ok(None)
+        }
         Kind::End | Kind::Start => set(tx, run.id, &next.id, Status::Done, steps, None).map(|()| None),
     }
 }
@@ -394,7 +414,7 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
         tx.commit().map_err(sql)?;
         return Ok(Started { run_id, clear, prompt: None });
     }
-    let run = Stored { id: run_id, graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None, clear: None, briefed: false };
+    let run = Stored { id: run_id, graph, node_id: start.id.clone(), status: Status::Running, steps: 0, resume: None, clear: None, briefed: false, prefill: false };
     let prompt = go(&tx, &run, &start, flows::START_OUTPUT, 0, By::Flow)?;
     tx.commit().map_err(sql)?;
     Ok(Started { run_id, clear, prompt })
@@ -419,8 +439,8 @@ pub fn cleared(conn: &mut Connection, run_id: i64) -> Result<Cleared, String> {
 
 /// Claude in tab `tab_id` ended its turn with `reply` (None when Claude Code did
 /// not report it): moves the tab's run on. Returns the next prompt to send, if
-/// any. A tab whose run is not working on a prompt (none, or one at a manual step)
-/// is left alone.
+/// any. A tab with no run, or whose run waits for the person, is left alone. A
+/// manual prompt the person sent goes on by its one output, whatever the reply.
 pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Result<Option<String>, String> {
     // Every turn of every tab ends here: most tabs run no flow, so look before
     // taking the write lock.
@@ -439,10 +459,21 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(None) };
     // A turn that ends before the clear (one Claude was in when ▶ was pressed) is
     // not the reply to any step.
-    if run.status == Status::Manual || run.clear.is_some() {
+    if run.clear.is_some() {
         return Ok(None);
     }
     let node = run.node()?.clone();
+    if node.kind == Kind::ManualPrompt {
+        // Running only once the person sent their prompt (see `on_prompt`): this is
+        // Claude's answer to it. Waiting for the person, any turn is left alone.
+        let Some(output) = node.outputs.first().filter(|_| run.status == Status::Running) else {
+            return Ok(None);
+        };
+        // The person stepped in, which restarts the count toward MAX_RUN_STEPS.
+        let prompt = go(&tx, &run, &node, output, 0, By::Flow)?;
+        tx.commit().map_err(sql)?;
+        return Ok(prompt);
+    }
     let wait = |why: String| wait_for_person(&tx, run.id, &node.id, run.steps, &why, Some(Resume::Remind));
     let Some(reply) = reply else {
         // Its next reply would not be reported either.
@@ -485,6 +516,146 @@ pub fn proceed(conn: &mut Connection, run_id: i64, step_id: &str, output: &str) 
     let prompt = go(&tx, &run, &node, output, 0, By::Person)?;
     tx.commit().map_err(sql)?;
     Ok(prompt)
+}
+
+/// Has the app put the manual prompt `node`'s text into Claude's input (see
+/// `prefill_text`), if there is any: Start's base info unless Claude has it
+/// (`briefed`), then the step's draft. Each time with a new token, so the record of
+/// an earlier paste cannot cancel it (see `prefilled`).
+fn owe_prefill(conn: &Connection, run_id: i64, graph: &Graph, node: &Node, briefed: bool) -> Result<(), String> {
+    if flows::prefill_text(graph, node, !briefed).is_empty() {
+        return Ok(());
+    }
+    // Kept within what JavaScript numbers hold exactly.
+    conn.execute(
+        "UPDATE flow_runs SET prefill = 1, prefill_token = abs(random() % 9007199254740991) WHERE id = ?1",
+        [run_id],
+    )
+    .map(drop)
+    .map_err(sql)
+}
+
+/// Whether the run waits for the person at a manual prompt: for their prompt, or,
+/// once Claude's answer to it was lost, for it again or an output.
+fn awaits_prompt(run: &Stored, node: &Node) -> bool {
+    node.kind == Kind::ManualPrompt && matches!(run.status, Status::Manual | Status::Attention)
+}
+
+/// What the app puts into Claude's input for a manual prompt (see `prefill_text`).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct Prefill {
+    pub text: String,
+    /// Names this paste to `prefilled`.
+    pub token: i64,
+}
+
+/// The text to put into Claude's input for the manual prompt run `run_id` waits at,
+/// `step_id`: Start's base info if Claude lacks it, then the step's draft. None if
+/// the app owes no paste there (anymore): the run moved on or was stopped, or the
+/// text was pasted. Reading it changes nothing; `prefilled` records the paste, so
+/// one that fails is tried again.
+pub fn prefill_text(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Option<Prefill>, String> {
+    let Some(run) = active_run(conn, "id = ?1", &run_id)? else { return Ok(None) };
+    if run.node_id != step_id || !run.prefill || !awaits_prompt(&run, run.node()?) {
+        return Ok(None);
+    }
+    let token: Option<i64> = conn
+        .query_row("SELECT prefill_token FROM flow_runs WHERE id = ?1", [run.id], |r| r.get(0))
+        .map_err(sql)?;
+    let text = flows::prefill_text(&run.graph, run.node()?, !run.briefed);
+    Ok(Some(Prefill { text, token: token.unwrap_or(0) }).filter(|p| !p.text.is_empty()))
+}
+
+/// The app put the manual prompt's text named by `token` into Claude's input (see
+/// `prefill_text`). A paste owed since (after a clear, say) stays owed. Claude has
+/// the base info only once the person sends it (see `on_prompt`).
+pub fn prefilled(conn: &mut Connection, run_id: i64, step_id: &str, token: i64) -> Result<(), String> {
+    conn.execute(
+        "UPDATE flow_runs SET prefill = 0, updated_at = ?3 WHERE id = ?1 AND node_id = ?2 AND prefill_token = ?4",
+        params![run_id, step_id, now(), token],
+    )
+    .map(drop)
+    .map_err(sql)
+}
+
+/// The person sent `prompt` to Claude in tab `tab_id` (the UserPromptSubmit hook):
+/// a run waiting at a manual prompt runs it, so Claude's answer moves it on (see
+/// `on_stop`). Claude has Start's base info if the prompt carried it. A slash
+/// command is not a prompt to Claude, and prompts at any other step change nothing.
+pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<(), String> {
+    if prompt.trim_start().starts_with('/') {
+        return Ok(());
+    }
+    // Every prompt in every tab comes here: look before taking the write lock.
+    let waiting = conn
+        .query_row(
+            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status IN ('manual', 'attention')",
+            [tab_id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sql)?;
+    if waiting.is_none() {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+    let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(()) };
+    let node = run.node()?;
+    if !awaits_prompt(&run, node) {
+        return Ok(());
+    }
+    set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
+    let info = flows::base_info(&run.graph);
+    if !run.briefed && (info.is_empty() || prompt.contains(&info)) {
+        tx.execute("UPDATE flow_runs SET briefed = 1 WHERE id = ?1", [run.id]).map_err(sql)?;
+    }
+    tx.commit().map_err(sql)
+}
+
+/// The UserPromptSubmit hook could not record the person's prompt in tab `tab_id`:
+/// a run waiting at a manual prompt would never see Claude's answer, so it waits
+/// for the person, saying `why`, rather than for a prompt already sent. Its paste,
+/// if still owed, stays owed.
+pub fn prompt_unseen(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+    let Some(run) = active_run(conn, "tab_id = ?1", &tab_id.as_str())? else { return Ok(()) };
+    if run.status != Status::Manual || run.node()?.kind != Kind::ManualPrompt {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = NULL, updated_at = ?3 WHERE id = ?1 AND status = 'manual'",
+        params![run.id, why, now()],
+    )
+    .map(drop)
+    .map_err(sql)
+}
+
+/// Claude's answer to the person's manual prompt in tab `tab_id` will not be seen
+/// (`why`: the conversation was cleared, misag restarted): the run waits for the
+/// prompt again, or an output. Continue has no step prompt to remind Claude of.
+fn answer_lost(conn: &Connection, tab_id: &str, why: &str) -> Result<(), String> {
+    let Some(run) = active_run(conn, "tab_id = ?1", &tab_id)? else { return Ok(()) };
+    if run.status != Status::Running || run.clear.is_some() || run.node()?.kind != Kind::ManualPrompt {
+        return Ok(());
+    }
+    let note = format!("{why} Claude's answer to your prompt will not be seen: send your prompt again, or pick an output to go on.");
+    conn.execute(
+        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = NULL, updated_at = ?3 WHERE id = ?1",
+        params![run.id, note, now()],
+    )
+    .map(drop)
+    .map_err(sql)
+}
+
+/// Has the app fill the input of the manual prompt the tab's run waits at again,
+/// as Claude's input was lost (a clear, a restart): with the base info, if Claude
+/// lacks it now.
+fn refill(conn: &Connection, tab_id: &str) -> Result<(), String> {
+    let Some(run) = active_run(conn, "tab_id = ?1", &tab_id)? else { return Ok(()) };
+    let node = run.node()?;
+    if awaits_prompt(&run, node) {
+        owe_prefill(conn, run.id, &run.graph, node, run.briefed)?;
+    }
+    Ok(())
 }
 
 /// The person has seen to a prompt step that needs attention (answered Claude, or
@@ -537,6 +708,7 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
     if changed == 0 {
         pause(&tx, tab_id, why)?;
     }
+    refill(&tx, tab_id.as_str())?;
     tx.commit().map_err(sql)
 }
 
@@ -549,6 +721,7 @@ pub fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
 }
 
 fn pause(conn: &Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+    answer_lost(conn, tab_id.as_str(), why)?;
     conn.execute(
         "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running' AND clear IS NULL",
         params![tab_id.as_str(), why, now()],
@@ -585,12 +758,14 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
                 params![tab, "Mischief of Agents was restarted before the conversation was cleared. Pick an output to go on without clearing, or stop the run and press ▶ again.", now()],
             )
             .map_err(sql)?;
+            answer_lost(&tx, &tab, "Mischief of Agents was restarted while Claude answered your prompt.")?;
             tx.execute(
                 // Claude comes back in its conversation, so it can be reminded.
                 "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'remind', updated_at = ?3 WHERE tab_id = ?1 AND status = 'running'",
                 params![tab, "Mischief of Agents was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.", now()],
             )
             .map_err(sql)?;
+            refill(&tx, &tab)?;
         } else {
             tx.execute(
                 &format!("UPDATE flow_runs SET status = 'stopped', updated_at = ?2 WHERE tab_id = ?1 AND status IN {ACTIVE}"),
@@ -628,11 +803,11 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
     .map_err(sql)?;
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume, r.clear
+            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume, r.clear, r.prefill
              FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE r.status IN {ACTIVE} ORDER BY r.id"
         ))
         .map_err(sql)?;
-    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64, Option<String>, Option<String>);
+    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64, Option<String>, Option<String>, bool);
     let rows = stmt
         .query_map([], |r| {
             Ok((
@@ -647,13 +822,14 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
                 r.get(8)?,
                 r.get(9)?,
                 r.get(10)?,
+                r.get(11)?,
             ))
         })
         .map_err(sql)?
         .collect::<Result<Vec<Row>, _>>()
         .map_err(sql)?;
     rows.into_iter()
-        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume, clear)| {
+        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume, clear, prefill)| {
             // A run that cannot be read is still listed, saying why, so it can be stopped.
             let node = parse_graph(&graph).and_then(|graph| {
                 let node = graph.nodes.into_iter().find(|n| n.id == step_id);
@@ -661,21 +837,21 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
             });
             let status = Status::parse(&status)?;
             let states = Resume::parse(resume).and_then(|resume| Ok((resume, Clear::parse(clear)?)));
-            let (step, outputs, note, resumable) = match node.and_then(|node| states.map(|states| (node, states))) {
+            let (step, outputs, note, resumable, step_kind) = match node.and_then(|node| states.map(|states| (node, states))) {
                 Ok((node, (resume, clear))) => {
                     // The same test as `resume`'s.
                     let resumable = status == Status::Attention && node.kind == Kind::Prompt && resume.is_some();
                     if clear.is_some() {
                         // Nothing to pick until the first step is taken (see `proceed`).
                         let note = Some("Clearing the conversation before the first step.".to_owned());
-                        (node.name().to_owned(), Vec::new(), note, false)
+                        (node.name().to_owned(), Vec::new(), note, false, Some(node.kind))
                     } else {
-                        (node.name().to_owned(), node.outputs, note, resumable)
+                        (node.name().to_owned(), node.outputs, note, resumable, Some(node.kind))
                     }
                 }
-                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false),
+                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false, None),
             };
-            Ok(Run { id, flow_id, flow_name, tab_id, step, outputs, step_id, status, note, steps, resumable })
+            Ok(Run { id, flow_id, flow_name, tab_id, step, outputs, step_id, status, note, steps, resumable, prefill, step_kind })
         })
         .collect()
 }
@@ -707,10 +883,10 @@ mod tests {
         Graph { version: 1, nodes: all, edges }
     }
 
-    /// Start → a manual step → a prompt.
+    /// Start → a pause → a prompt.
     fn manual_first() -> Graph {
         graph(
-            vec![node("m", Kind::Manual, &["ok"]), node("p", Kind::Prompt, &["done"])],
+            vec![node("m", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
             vec![edge("start", "next", "m"), edge("m", "ok", "p")],
         )
     }
@@ -775,7 +951,7 @@ mod tests {
     #[test]
     fn start_s_base_info_waits_for_the_first_prompt_after_manual_steps() {
         let mut g = graph(
-            vec![node("m", Kind::Manual, &["ok"]), node("m2", Kind::Manual, &["ok"]), node("p", Kind::Prompt, &["done"])],
+            vec![node("m", Kind::Pause, &["ok"]), node("m2", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
             vec![edge("start", "next", "m"), edge("m", "ok", "m2"), edge("m2", "ok", "p")],
         );
         g.nodes[0].text = "The app is in src/.".into();
@@ -807,7 +983,7 @@ mod tests {
     fn a_clear_at_a_manual_step_owes_base_info_to_the_next_prompt() {
         let g = briefing(
             graph(
-                vec![node("m", Kind::Manual, &["ok"]), node("p", Kind::Prompt, &["done"])],
+                vec![node("m", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
                 vec![edge("start", "next", "m"), edge("m", "ok", "p"), edge("p", "done", "m")],
             ),
             "The app is in src/.",
@@ -947,6 +1123,236 @@ mod tests {
         assert_eq!(only_run(&conn).status, Status::Running);
     }
 
+    /// Start (with base info) → a manual prompt with a draft → a prompt.
+    fn manual_prompt_first(draft: &str) -> Graph {
+        let mut mp = node("mp", Kind::ManualPrompt, &["sent"]);
+        mp.text = draft.into();
+        briefing(
+            graph(vec![mp, node("p", Kind::Prompt, &["done"])], vec![edge("start", "next", "mp"), edge("mp", "sent", "p")]),
+            "The app is in src/.",
+        )
+    }
+
+    /// What the app pastes for the run's manual prompt, then marks pasted.
+    fn paste(conn: &mut Connection, run: i64) -> Option<String> {
+        let step = at(conn, run);
+        let fill = prefill_text(conn, run, &step).unwrap()?;
+        prefilled(conn, run, &step, fill.token).unwrap();
+        Some(fill.text)
+    }
+
+    /// The text `prefill_text` gives the run, without pasting it.
+    fn owed(conn: &mut Connection, run: i64, step: &str) -> Option<String> {
+        prefill_text(conn, run, step).unwrap().map(|fill| fill.text)
+    }
+
+    // The draft keeps its trailing space, for the person to go on typing.
+    const INFO_AND_DRAFT: &str = "The app is in src/.\n\nFix the bug in ";
+
+    #[test]
+    fn a_manual_prompt_fills_claude_s_input_and_goes_on_once_claude_answers_the_person() {
+        let g = manual_prompt_first("Fix the bug in ");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt", &g);
+        let started = start(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!(started.prompt, None, "nothing is sent");
+        let run = only_run(&conn);
+        assert_eq!((run.status, run.step_id.as_str(), run.prefill), (Status::Manual, "mp", true));
+        assert!(owed(&mut conn, run.id, "p").is_none(), "a fill for another step gets nothing");
+        // Reading the text does not use it up: a paste that fails is tried again.
+        assert_eq!(owed(&mut conn, run.id, "mp").as_deref(), Some(INFO_AND_DRAFT));
+        assert_eq!(paste(&mut conn, run.id).as_deref(), Some(INFO_AND_DRAFT));
+        assert!(!only_run(&conn).prefill);
+        assert_eq!(owed(&mut conn, run.id, "mp"), None, "it is pasted once");
+        // A turn the person did not start (a background task waking Claude) is not their prompt.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Task done.")).unwrap(), None);
+        assert_eq!(only_run(&conn).status, Status::Manual);
+        on_prompt(&mut conn, &tab("t1"), "The app is in src/.\n\nFix the bug in main.rs").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Running, "Claude is answering the person");
+        // Claude's reply needs no FLOW line, and the person's prompt carried the base info.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed it.")).unwrap(), prompt_of(&g, "p"));
+        assert_eq!(only_run(&conn).step_id, "p");
+    }
+
+    #[test]
+    fn base_info_the_person_did_not_send_goes_with_the_next_prompt() {
+        let g = manual_prompt_first("Fix the bug in ");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-no-info", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        paste(&mut conn, run);
+        // The person deleted the base info before sending.
+        on_prompt(&mut conn, &tab("t1"), "Fix the bug in main.rs").unwrap();
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed it.")).unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
+    }
+
+    #[test]
+    fn a_manual_prompt_with_nothing_to_fill_waits_for_the_person_s_prompt() {
+        let mut g = manual_prompt_first("");
+        g.nodes[0].text.clear();
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-empty", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        assert!(!only_run(&conn).prefill);
+        assert_eq!(owed(&mut conn, run, "mp"), None);
+        // A turn already under way when the run got here is not the person's prompt.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Done.")).unwrap(), None);
+        on_prompt(&mut conn, &tab("t1"), "Do it").unwrap();
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Done.")).unwrap(), prompt_of(&g, "p"));
+    }
+
+    #[test]
+    fn a_prompt_can_lead_to_a_manual_prompt() {
+        let mut mp = node("mp", Kind::ManualPrompt, &["sent"]);
+        mp.text = "Now ask about ".into();
+        let g = briefing(
+            graph(vec![node("p", Kind::Prompt, &["done"]), mp], vec![edge("start", "next", "p"), edge("p", "done", "mp")]),
+            "The app is in src/.",
+        );
+        let (_db, mut conn, flow) = setup("runs-to-manual-prompt", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        // Claude stops; the app fills the input once it sees the run there.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap(), None);
+        assert_eq!(paste(&mut conn, run).as_deref(), Some("Now ask about "), "Claude has the base info");
+        on_prompt(&mut conn, &tab("t1"), "Now ask about it").unwrap();
+        // The flow ends after the person's prompt is answered.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Answer.")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn manual_prompts_can_follow_each_other() {
+        let mut first = node("a", Kind::ManualPrompt, &["sent"]);
+        first.text = "one".into();
+        let mut second = node("b", Kind::ManualPrompt, &["sent"]);
+        second.text = "two".into();
+        let g = graph(vec![first, second], vec![edge("start", "next", "a"), edge("a", "sent", "b")]);
+        let (_db, mut conn, flow) = setup("runs-manual-prompts", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        assert_eq!(paste(&mut conn, run).as_deref(), Some("one"));
+        on_prompt(&mut conn, &tab("t1"), "one").unwrap();
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("ok")).unwrap(), None);
+        assert_eq!((only_run(&conn).step_id.as_str(), only_run(&conn).prefill), ("b", true));
+        assert_eq!(paste(&mut conn, run).as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn a_clear_or_a_restart_fills_the_manual_prompt_again() {
+        let g = manual_prompt_first("Fix the bug in ");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-refill", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        paste(&mut conn, run);
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Manual, "a clear does not hold up a manual prompt");
+        assert_eq!(paste(&mut conn, run).as_deref(), Some(INFO_AND_DRAFT));
+        after_restart(&mut conn, &[tab("t1")]).unwrap();
+        assert_eq!(paste(&mut conn, run).as_deref(), Some(INFO_AND_DRAFT), "Claude's input was lost with the app");
+    }
+
+    #[test]
+    fn a_prompt_at_any_other_step_changes_nothing() {
+        let g = manual_first();
+        let (_db, mut conn, flow) = setup("runs-prompt-at-pause", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        on_prompt(&mut conn, &tab("t1"), "hi").unwrap();
+        on_prompt(&mut conn, &tab("t2"), "hi").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Manual);
+    }
+
+    #[test]
+    fn a_paste_recorded_late_does_not_cancel_a_refill() {
+        let g = manual_prompt_first("Fix the bug in ");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-late", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        let first = prefill_text(&mut conn, run, "mp").unwrap().unwrap();
+        // A clear comes between the paste and its record: the input is empty again.
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        prefilled(&mut conn, run, "mp", first.token).unwrap();
+        assert!(only_run(&conn).prefill, "the paste after the clear is still owed");
+        assert_eq!(paste(&mut conn, run).as_deref(), Some(INFO_AND_DRAFT));
+    }
+
+    #[test]
+    fn a_slash_command_is_not_the_person_s_prompt() {
+        let g = manual_prompt_first("");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-slash", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        on_prompt(&mut conn, &tab("t1"), "  /model opus").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Manual);
+    }
+
+    #[test]
+    fn a_manual_prompt_whose_answer_was_lost_waits_for_the_prompt_again() {
+        let g = manual_prompt_first("Fix the bug in ");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-lost", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        paste(&mut conn, run);
+        on_prompt(&mut conn, &tab("t1"), "Fix the bug in a.rs").unwrap();
+        // Claude's answer will not come: the conversation was cleared while it worked.
+        clear_tab(&mut conn, &tab("t1"), "The conversation was cleared.").unwrap();
+        let waiting = only_run(&conn);
+        assert_eq!((waiting.status, waiting.resumable), (Status::Attention, false), "Continue has nothing to remind Claude of");
+        assert!(waiting.note.as_deref().unwrap().contains("send your prompt again"), "{:?}", waiting.note);
+        assert_eq!(paste(&mut conn, run).as_deref(), Some(INFO_AND_DRAFT), "the input is filled again");
+        // A turn Claude takes by itself does not move it on; the person's prompt does.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("hi")).unwrap(), None);
+        on_prompt(&mut conn, &tab("t1"), "The app is in src/.\n\nFix the bug in a.rs").unwrap();
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed.")).unwrap(), prompt_of(&g, "p"));
+    }
+
+    #[test]
+    fn a_restart_while_claude_answers_a_manual_prompt_waits_for_the_prompt_again() {
+        let g = manual_prompt_first("");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-restart", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        on_prompt(&mut conn, &tab("t1"), "The app is in src/. Go").unwrap();
+        after_restart(&mut conn, &[tab("t1")]).unwrap();
+        let waiting = only_run(&conn);
+        assert_eq!((waiting.status, waiting.resumable), (Status::Attention, false));
+        assert!(waiting.note.as_deref().unwrap().contains("send your prompt again"), "{:?}", waiting.note);
+    }
+
+    #[test]
+    fn a_prompt_the_hook_could_not_record_makes_the_manual_prompt_wait_for_the_person() {
+        let g = manual_prompt_first("");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-unseen", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        prompt_unseen(&mut conn, &tab("t1"), "Your prompt could not be recorded.").unwrap();
+        let waiting = only_run(&conn);
+        assert_eq!((waiting.status, waiting.note.as_deref()), (Status::Attention, Some("Your prompt could not be recorded.")));
+        // A run at any other step is left as it is.
+        let (_db2, mut conn2, flow2) = setup("runs-pause-unseen", &manual_first());
+        start(&mut conn2, flow2, &tab("t1")).unwrap();
+        prompt_unseen(&mut conn2, &tab("t1"), "x").unwrap();
+        assert_eq!(only_run(&conn2).status, Status::Manual);
+    }
+
+    #[test]
+    fn a_run_says_what_kind_of_step_it_is_at() {
+        let g = manual_prompt_first("");
+        let (_db, mut conn, flow) = setup("runs-step-kind", &g);
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!(only_run(&conn).step_kind, Some(Kind::ManualPrompt));
+    }
+
+    #[test]
+    fn the_person_can_skip_a_manual_prompt_and_base_info_still_goes() {
+        let g = manual_prompt_first("draft");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-skip", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        // Pasted, but never sent: Claude still lacks the base info.
+        paste(&mut conn, run);
+        assert_eq!(pick(&mut conn, run, "sent").unwrap(), Some(flows::first_prompt_text(&g, &g.nodes[2])));
+        assert!(!only_run(&conn).prefill);
+    }
+
+    #[test]
+    fn a_run_stored_with_the_old_kind_name_goes_on_from_its_pause() {
+        let g = manual_first();
+        let (_db, mut conn, flow) = setup("runs-old-manual", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        let stored: String = conn.query_row("SELECT graph FROM flow_runs", [], |r| r.get(0)).unwrap();
+        assert!(stored.contains(r#""kind":"manual""#), "older misags read it: {stored}");
+        assert_eq!(pick(&mut conn, run, "ok").unwrap(), prompt_of(&g, "p"));
+    }
+
     #[test]
     fn the_person_can_move_a_running_run_on_by_hand() {
         // Claude was interrupted, crashed or never ran the hook: no Stop will come.
@@ -962,7 +1368,7 @@ mod tests {
     #[test]
     fn a_prompt_can_lead_to_a_manual_step() {
         let g = graph(
-            vec![node("p", Kind::Prompt, &["done"]), node("m", Kind::Manual, &["ok"])],
+            vec![node("p", Kind::Prompt, &["done"]), node("m", Kind::Pause, &["ok"])],
             vec![edge("start", "next", "p"), edge("p", "done", "m")],
         );
         let (_db, mut conn, flow) = setup("runs-to-manual", &g);

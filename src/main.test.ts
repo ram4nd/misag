@@ -252,13 +252,20 @@ let storedGraphs: Record<number, Graph>;
 let flowProblems: string[];
 type Run = {
   id: number; flowId: number; flowName: string; tabId: string; stepId: string; step: string;
-  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number; resumable: boolean;
+  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number; resumable: boolean; prefill: boolean;
+  stepKind: "start" | "prompt" | "manual" | "manual_prompt" | "end" | null;
 };
 /** What flow_runs reports. */
 let activeRuns: Run[];
 /** The prompt flow_start and flow_continue return; a string makes them fail with it. */
 let runPrompt: string | null;
 let runRefusal: string | null;
+/** Makes flow_prefill_text fail with it. */
+let prefillError: string | null;
+/** Makes flow_prefilled fail with it. */
+let prefilledError: string | null;
+/** What flow_prefill_text returns, one per call; then null. */
+let prefills: ({ text: string; token: number } | null)[];
 /** What flow_cleared reports, one per call; then "pending". */
 let clearStates: ({ state: "pending" | "gone" } | { state: "ready"; prompt: string | null })[];
 /** What primary_selection reports: the text selected anywhere on the desktop, if any. */
@@ -387,6 +394,12 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
     }
     case "flow_cleared":
       return clearStates.shift() ?? { state: "pending" };
+    case "flow_prefill_text":
+      if (prefillError) throw { code: "failed", message: prefillError };
+      return prefills.shift() ?? null;
+    case "flow_prefilled":
+      if (prefilledError) throw { code: "failed", message: prefilledError };
+      return null;
     case "flow_continue":
     case "flow_resume":
       if (runRefusal) throw { code: "failed", message: runRefusal };
@@ -459,6 +472,9 @@ beforeEach(() => {
   activeRuns = [];
   runPrompt = null;
   runRefusal = null;
+  prefills = [];
+  prefillError = null;
+  prefilledError = null;
   clearStates = [];
   pastSessions = [];
   historyUnreadable = 0;
@@ -3545,10 +3561,10 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     tool("add-prompt").click();
-    tool("add-manual").click();
+    tool("add-pause").click();
     tool("add-end").click();
     await settle();
-    expect(titles()).toEqual(["Start", "Prompt", "Manual step", "End"]);
+    expect(titles()).toEqual(["Start", "Prompt", "Pause", "End"]);
     expect(callsOf("flow_save_graph")).toHaveLength(0);
     await afterSave();
     expect(callsOf("flow_save_graph")).toHaveLength(1);
@@ -3642,9 +3658,9 @@ describe("flow editor", () => {
     await select("Start");
     expect(field("maxRuns").closest("label")!.hidden).toBe(true);
     // Leaving a manual step is always your pick, which no limit holds back.
-    tool("add-manual").click();
+    tool("add-pause").click();
     await settle();
-    await select("Manual step");
+    await select("Pause");
     expect(field("maxRuns").closest("label")!.hidden).toBe(true);
   });
 
@@ -3770,12 +3786,12 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await afterSave();
     const first = saved()!.nodes[1].id;
-    await select("Manual step");
+    await select("Pause");
     panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
-    tool("add-manual").click();
+    tool("add-pause").click();
     await afterSave();
     expect(saved()!.nodes[1].id).not.toBe(first);
   });
@@ -3784,10 +3800,38 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await settle();
-    await select("Manual step");
+    await select("Pause");
     expect(field("outputs").closest("label")!.hidden).toBe(true);
+  });
+
+  test("a manual prompt has a draft, one output and no run limit", async () => {
+    storedFlows = flows("Deploy");
+    await boot();
+    await openFromBox("Deploy");
+    tool("add-manual-prompt").click();
+    await settle();
+    await select("Manual prompt");
+    expect(field("text").closest("label")!.hidden).toBe(false);
+    expect(panel().querySelector(".text-label")!.textContent).toContain("Draft");
+    expect(field("outputs").closest("label")!.hidden).toBe(true);
+    expect(field("maxRuns").closest("label")!.hidden).toBe(true);
+    await afterSave();
+    expect(saved()!.nodes.map((n) => [n.kind, n.outputs])).toEqual([
+      ["start", ["next"]],
+      ["manual_prompt", ["sent"]],
+    ]);
+  });
+
+  test("a manual prompt from a flow file with several outputs says it has one", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = { nodes: [START, step("m", "manual_prompt", "Ask", ["a", "b"])], edges: [] };
+    await boot();
+    await openFromBox("Deploy");
+    await select("Ask");
+    await edit("outputs", "a, c");
+    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A manual prompt has one output");
   });
 
   test("a manual step from an older flow with several outputs shows them, to cut down to one", async () => {
@@ -3801,7 +3845,7 @@ describe("flow editor", () => {
     await select("Review");
     expect(field("outputs").closest("label")!.hidden).toBe(false);
     await edit("outputs", "approve, again");
-    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A manual step has one output");
+    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A pause has one output");
     await edit("outputs", "approve");
     await afterSave();
     expect(saved()!.nodes.find((n) => n.id === "m")!.outputs).toEqual(["approve"]);
@@ -3884,7 +3928,7 @@ describe("flow editor", () => {
     const problems = () => [...editor().querySelectorAll(".problems li")].map((li) => li.textContent);
     expect(problems()).toEqual(["Start is not connected to a step."]);
     flowProblems = [];
-    tool("add-manual").click();
+    tool("add-pause").click();
     await afterSave();
     expect(problems()).toEqual([]);
     expect(editor().querySelector(".problems")!.textContent).toContain("Ready to run");
@@ -3895,12 +3939,12 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await afterSave();
     expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(false);
     expect(editor().querySelector(".error")!.textContent).toContain("flow_save_graph failed");
     failing.delete("flow_save_graph");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await afterSave();
     expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
     expect(storedGraphs[1].nodes).toHaveLength(3);
@@ -3910,7 +3954,7 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await settle();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await settle();
@@ -3923,7 +3967,7 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await settle();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await settle();
@@ -3941,7 +3985,7 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await boot();
     await openFromBox("Deploy");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await settle();
     await win.closeRequested!();
     expect(win.prevented).toBe(false);
@@ -3953,7 +3997,7 @@ describe("flow editor", () => {
     await boot();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-manual").click();
+    tool("add-pause").click();
     await settle();
     await win.closeRequested!();
     expect(win.prevented).toBe(true);
@@ -3985,7 +4029,7 @@ describe("flow editor", () => {
     await settle();
     expect(tabNames()).toEqual(["Ship", "Flows"]);
     // A change still waiting is dropped with the flow, not saved into nothing.
-    document.querySelector<HTMLElement>(".page.flow-editor button.add-manual")!.click();
+    document.querySelector<HTMLElement>(".page.flow-editor button.add-pause")!.click();
     rows()[0].querySelector<HTMLButtonElement>("button.delete")!.click();
     await settle();
     await vi.advanceTimersByTimeAsync(SAVE_MS);
@@ -4011,7 +4055,7 @@ describe("flow runs", () => {
   const step = (id: string, kind: Step["kind"], title: string, outputs: string[]): Step => ({ id, kind, title, text: "x", outputs, x: 0, y: 0 });
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, resumable: false, ...over,
+    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, resumable: false, prefill: false, stepKind: "prompt", ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -4181,6 +4225,139 @@ describe("flow runs", () => {
     expect(typed()).toEqual([]);
   });
 
+  test("a run at a manual prompt fills Claude's input once, without sending it", async () => {
+    prefills = [{ text: "The app is in src/.\n\nFix the bug in ", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], prefill: true })];
+    await poll();
+    await poll();
+    expect(callsOf("flow_prefill_text")[0].args).toEqual({ runId: 5, stepId: "mp" });
+    // Only once it is in Claude's input does the backend stop owing it.
+    expect(callsOf("flow_prefilled").map((c) => c.args)).toEqual([{ runId: 5, stepId: "mp", token: 7 }]);
+    expect(typed()).toEqual(["\x1b[200~The app is in src/.\n\nFix the bug in \x1b[201~"]);
+    activeRuns = [run({ tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"] })];
+    await poll();
+    expect(typed()).toHaveLength(1);
+  });
+
+  test("a manual prompt that cannot be filled is tried again, saying so once", async () => {
+    prefillError = "database is locked";
+    prefills = [{ text: "Draft", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], prefill: true })];
+    await poll();
+    expect(box().querySelector(".error")!.textContent).toContain("database is locked");
+    box().querySelector<HTMLElement>(".error")!.textContent = "";
+    await poll();
+    expect(box().querySelector(".error")!.textContent).toBe("");
+    prefillError = null;
+    await poll();
+    expect(typed()).toEqual(["\x1b[200~Draft\x1b[201~"]);
+  });
+
+  /** A run waiting at the manual prompt "Ask" in the first Claude tab. */
+  const atManualPrompt = (over: Partial<Run> = {}) =>
+    run({ tabId: spawns()[0].tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], stepKind: "manual_prompt", ...over });
+
+  test("a manual prompt does not wipe what the person is typing, and says how to get its draft", async () => {
+    prefills = [{ text: "Draft", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    terms()[0].onData!("half a thought");
+    activeRuns = [atManualPrompt({ prefill: true })];
+    await poll();
+    await poll();
+    expect(typed()).toEqual(["half a thought"]);
+    expect(callsOf("flow_prefill_text")).toHaveLength(0);
+    expect(box().querySelector(".error")!.textContent).toContain("clear it");
+    // Once the input is cleared (Ctrl+C), the draft goes in.
+    terms()[0].onData!("\x03");
+    await poll();
+    expect(typed()).toEqual(["half a thought", "\x03", "\x1b[200~Draft\x1b[201~"]);
+  });
+
+  test("skipping a manual prompt takes its untouched draft back out of Claude's input", async () => {
+    prefills = [{ text: "Draft", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [atManualPrompt({ prefill: true })];
+    await poll();
+    activeRuns = [atManualPrompt()];
+    await poll();
+    const go = flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!;
+    expect(go.title).toBe('Skip "Ask" without sending a prompt');
+    expect(flowRow("Deploy").title).toContain("waiting for your prompt");
+    go.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    // The next step is a pause: nothing is typed but the clear.
+    expect(typed()).toEqual(["\x1b[200~Draft\x1b[201~", "\x03"]);
+  });
+
+  test("a draft the person has added to stays when the run is stopped", async () => {
+    prefills = [{ text: "Draft", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [atManualPrompt({ prefill: true })];
+    await poll();
+    terms()[0].onData!(" more");
+    activeRuns = [atManualPrompt()];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    await settle();
+    expect(typed()).toEqual(["\x1b[200~Draft\x1b[201~", " more"]);
+  });
+
+  test("stopping a run takes its untouched manual prompt draft out of Claude's input", async () => {
+    prefills = [{ text: "Draft", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [atManualPrompt({ prefill: true })];
+    await poll();
+    activeRuns = [atManualPrompt()];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    await settle();
+    expect(typed()).toEqual(["\x1b[200~Draft\x1b[201~", "\x03"]);
+  });
+
+  test("a paste that could not be recorded says it was pasted", async () => {
+    prefills = [{ text: "Draft", token: 7 }];
+    prefilledError = "database is locked";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [atManualPrompt({ prefill: true })];
+    await poll();
+    expect(box().querySelector(".error")!.textContent).toContain("Pasted");
+  });
+
+  test("the run bar offers a manual prompt's output as a skip", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [atManualPrompt()];
+    await poll();
+    await open("Deploy");
+    expect(runBar().querySelector(".where")!.textContent).toBe("Waiting for your prompt: Ask (no longer in this flow)");
+    expect(outputs()[0].title).toBe('Skip without sending your prompt: go on as "sent"');
+  });
+
+  test("a manual prompt waits to fill the input while Claude is working", async () => {
+    prefills = [{ text: "Draft", token: 7 }];
+    await boot();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    terms()[0].onTitle!("◐ Claude Code");
+    activeRuns = [run({ tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], prefill: true })];
+    await poll();
+    expect(callsOf("flow_prefill_text")).toHaveLength(0);
+    terms()[0].onTitle!("✳ Claude Code");
+    await poll();
+    expect(typed()).toEqual(["\x1b[200~Draft\x1b[201~"]);
+  });
+
   test("without Claude in the active tab, ▶ says where flows run", async () => {
     await boot();
     await play("Deploy");
@@ -4220,26 +4397,44 @@ describe("flow runs", () => {
     expect(tabs().map((t) => t.classList.contains("needs-you"))).toEqual([false, false]);
   });
 
-  test("a run that needs attention is marked in the flow list, and Continue has Claude go on with its step", async () => {
-    runPrompt = "Go on with the flow step.";
+  test("▶ on a run that needs attention goes on to the next step", async () => {
+    runPrompt = "Deploy it.";
     await boot();
     await openClaudeTabs(1);
-    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Check the form", outputs: ["ok"] })];
-    await poll();
-    // A manual step is picked by you; there is nothing for Claude to go on with.
-    expect(flowRow("Deploy").querySelector("button.resume")).toBeNull();
-    activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", outputs: ["done"], resumable: true })];
     await poll();
     const row = flowRow("Deploy");
     expect(row.classList.contains("attention")).toBe(true);
     expect(row.querySelector(".needs-attention")).not.toBeNull();
     expect(row.title).toContain("Claude asked for a person.");
-    row.querySelector<HTMLButtonElement>("button.resume")!.click();
+    // No reminder to Claude about this step from the list: ▶ moves the run on.
+    expect(row.querySelector("button.resume")).toBeNull();
+    const go = row.querySelector<HTMLButtonElement>("button.go-on")!;
+    expect(go.title).toBe('Go on from "Fix the tests" to the next step');
+    go.click();
     await settle();
     await vi.advanceTimersByTimeAsync(200);
-    expect(callsOf("flow_resume").map((c) => c.args)).toEqual([{ runId: 5, stepId: "p" }]);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, stepId: "p", output: "done" }]);
+    expect(callsOf("flow_resume")).toHaveLength(0);
     expect(callsOf("flow_load")).toHaveLength(0);
-    expect(typed()).toEqual(["\x1b[200~Go on with the flow step.\x1b[201~", "\r"]);
+    expect(typed()).toEqual(["\x1b[200~Deploy it.\x1b[201~", "\r"]);
+  });
+
+  test("a run that needs attention at a step with several outputs offers them in the flow list", async () => {
+    runPrompt = "Fix it.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
+    await poll();
+    const row = flowRow("Deploy");
+    expect(row.querySelector("button.go-on")).toBeNull();
+    const picks = [...row.querySelectorAll<HTMLButtonElement>(".picks button.pick")];
+    expect(picks.map((b) => b.textContent)).toEqual(["pass", "fail"]);
+    picks[1].click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(callsOf("flow_continue").map((c) => c.args)).toEqual([{ runId: 5, stepId: "p", output: "fail" }]);
+    expect(typed()).toEqual(["\x1b[200~Fix it.\x1b[201~", "\r"]);
   });
 
   test("a run waiting at a manual step goes on from the flow list with the output picked there", async () => {
@@ -4463,7 +4658,7 @@ describe("flow runs and Claude's state", () => {
   const runError = () => document.querySelector<HTMLElement>(".page.flow-editor.active .run-bar .run-error")!;
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "manual", note: null, outputs: ["ok"], steps: 1, resumable: false, ...over,
+    status: "manual", note: null, outputs: ["ok"], steps: 1, resumable: false, prefill: false, stepKind: "prompt", ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
