@@ -36,6 +36,8 @@
     "token": 7
   },
   "run": {
+    "briefing": false,
+    "done": 1,
     "flowId": 2,
     "flowName": "Deploy",
     "id": 1,
@@ -50,7 +52,8 @@
     "stepId": "p",
     "stepKind": "prompt",
     "steps": 3,
-    "tabId": "tab-1"
+    "tabId": "tab-1",
+    "total": 4
   },
   "started": {
     "clear": true,

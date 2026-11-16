@@ -50,10 +50,11 @@ pub const WRAPPER_DIR: &str = "bin";
 /// off PATH before it starts Claude.
 pub const CLI_DIR: &str = "cli";
 /// Claude Code's cap on Stop-hook continuations in a row (8 by default). Tabs get
-/// it raised to just above misag's own limit (`runs::MAX_RUN_STEPS`), so a flow
-/// run is not cut short; it applies to the user's own Stop hooks in those tabs too.
+/// it raised above what a flow run can need (each step's prompt up to
+/// `runs::MAX_RUN_STEPS`, then the closing message), with room to spare, so a run
+/// is not cut short; it applies to the user's own Stop hooks in those tabs too.
 pub const STOP_CAP_ENV: &str = "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP";
-pub const STOP_CAP: u32 = 51;
+pub const STOP_CAP: u32 = 60;
 /// Hook context longer than this reaches Claude only as a preview, so a longer
 /// prompt is handed over as a "block" reason instead.
 const MAX_CONTEXT: usize = 9_000;
@@ -1168,6 +1169,7 @@ mod tests {
         db.save_flow_graph(flow, &g).unwrap();
         let mut conn = db::connect_existing(&path).unwrap();
         crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
+        crate::runs::on_stop(&mut conn, &tid("tab-1"), Some("Ready")).unwrap();
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit","prompt":"Fix it"}}"#);
         // Nothing is printed: a UserPromptSubmit hook's output would reach Claude.
         assert_eq!(hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap(), Outcome::Prompted);
@@ -1185,6 +1187,7 @@ mod tests {
         db.save_flow_graph(flow, &g).unwrap();
         let mut conn = db::connect_existing(&path).unwrap();
         crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
+        crate::runs::on_stop(&mut conn, &tid("tab-1"), Some("Ready")).unwrap();
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit"}}"#);
         let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
         assert!(err.contains("could not tell the flow run about the prompt"), "{err}");

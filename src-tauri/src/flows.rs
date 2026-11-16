@@ -11,8 +11,8 @@ pub const MAX_STEPS: usize = 200;
 pub const MAX_OUTPUTS: usize = 8;
 const MAX_TITLE: usize = 200;
 const MAX_TEXT: usize = 20_000;
-/// The most Start's base info can be, in characters: it goes with a prompt, which
-/// can have `MAX_TEXT` of its own.
+/// The most Start's base info can be, in characters: after a clear it goes with a
+/// prompt (see `first_prompt_text`), which can have `MAX_TEXT` of its own.
 pub const MAX_INFO: usize = 4_000;
 const MAX_ID: usize = 40;
 const MAX_OUTPUT: usize = 24;
@@ -76,8 +76,8 @@ pub struct Node {
     pub title: String,
     /// A prompt step's prompt, what the person does at a pause, or a manual prompt's
     /// draft, put into Claude's input for the person to finish. For Start:
-    /// optional base info (where things are and the like), sent ahead of the run's
-    /// first prompt.
+    /// optional base info (where things are and the like), sent in the run's
+    /// briefing (see `briefing_text`).
     #[serde(default)]
     pub text: String,
     /// The ways the step can end, each leading to at most one next step.
@@ -310,14 +310,49 @@ pub fn prompt_text(node: &Node) -> String {
     typeable(format!("{}\n\n{}", node.text.trim_end(), reply_rule(node)))
 }
 
-/// `prompt_text` for the first prompt Claude gets in a run, or the first after the
-/// run's conversation was cleared: led by Start's base info (trimmed), if it has any.
-pub fn first_prompt_text(graph: &Graph, node: &Node) -> String {
-    let info = graph.nodes.iter().find(|n| n.kind == Kind::Start).map_or("", |n| n.text.trim());
-    if info.is_empty() {
-        return prompt_text(node);
-    }
-    typeable(format!("{info}\n\n{}", prompt_text(node)))
+/// What a run tells Claude before its first step: the run's rules, what Claude
+/// should know before the flow (Start's base info, if any), and to wait for the
+/// first step, so Claude does not start on the whole job. Claude loses it with a
+/// clear, so `first_prompt_text` gives it again.
+pub fn briefing_text(graph: &Graph, flow: &str) -> String {
+    typeable(format!("{}{}\n\nDo not act on this message. Reply only with: Ready", rules(flow), background(graph)))
+}
+
+/// The first prompt after the run's conversation was cleared (whether the run took
+/// the step, or the person picked an output): the run's rules and Start's base
+/// info, which Claude lost with it, then `node`'s prompt.
+pub fn first_prompt_text(graph: &Graph, flow: &str, node: &Node) -> String {
+    typeable(format!("{}{}\n\nThe current step:\n\n{}", rules(flow), background(graph), prompt_text(node)))
+}
+
+/// Whether Claude's reply to a run's briefing only says it is ready, as asked, so
+/// it did not start on the job: a short reply with "ready" and no FLOW line.
+pub fn says_ready(reply: &str) -> bool {
+    let reply = reply.trim();
+    reply.chars().count() <= 60 && reply.to_lowercase().contains("ready") && parse_marker(reply).is_none()
+}
+
+/// What a run tells Claude once it is done.
+pub fn closing_text(flow: &str) -> String {
+    typeable(format!(
+        "The flow \"{flow}\" is finished. You no longer need to end your replies with a FLOW line; carry on as usual. Reply only with: OK"
+    ))
+}
+
+fn rules(flow: &str) -> String {
+    format!(
+        "Mischief of Agents runs the flow \"{flow}\" in this conversation. Its steps come to you one at a time, each as a message:\n\
+         - Do only what the current step asks. Do not start on later work until its step arrives.\n\
+         - Each step names its outputs. When you have finished the step, end your reply with a last line that is exactly `FLOW: <output>`, the output that fits.\n\
+         - If you need a person to decide or do something first, end your reply with `FLOW: {ATTENTION}` instead and say why.\n\
+         - Some steps are the person's own: they will write to you themselves."
+    )
+}
+
+/// Start's base info, as the briefing gives it; empty without any.
+fn background(graph: &Graph) -> String {
+    let info = base_info(graph);
+    if info.is_empty() { String::new() } else { format!("\n\nBackground for the flow:\n\n{info}") }
 }
 
 /// What a manual prompt puts into Claude's input: Start's base info (trimmed) when
@@ -343,7 +378,8 @@ pub fn resume_text(node: &Node) -> String {
 fn reply_rule(node: &Node) -> String {
     let outputs: Vec<String> = node.outputs.iter().map(|o| format!("`FLOW: {o}`")).collect();
     format!(
-        "When you have finished, end your reply with a last line that is exactly {}, whichever fits. \
+        "Do only this step; the next one comes after your reply. \
+         When you have finished, end your reply with a last line that is exactly {}, whichever fits. \
          If you need a person to decide or do something first, end it with `FLOW: {ATTENTION}` instead and say why.",
         outputs.join(" or ")
     )
@@ -661,12 +697,42 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_first_prompt_carries_start_s_base_info() {
+    fn a_run_s_briefing_sets_out_the_rules_and_the_background() {
         let mut g = runnable();
-        assert_eq!(first_prompt_text(&g, &g.nodes[1]), prompt_text(&g.nodes[1]));
+        let text = briefing_text(&g, "Deploy");
+        assert!(text.starts_with("Mischief of Agents runs the flow \"Deploy\" in this conversation."), "{text}");
+        for rule in ["one at a time", "Do only what the current step asks", "`FLOW: <output>`", "`FLOW: attention`", "the person's own"] {
+            assert!(text.contains(rule), "{rule}: {text}");
+        }
+        assert!(text.ends_with("Do not act on this message. Reply only with: Ready"), "{text}");
+        assert!(!text.contains("Background"), "no base info, no background");
         g.nodes[0].text = "The app is in src/.\u{1b}\n\n".into();
-        let text = first_prompt_text(&g, &g.nodes[1]);
-        assert_eq!(text, format!("The app is in src/.\n\n{}", prompt_text(&g.nodes[1])));
+        let text = briefing_text(&g, "Deploy");
+        assert!(text.contains("Background for the flow:\n\nThe app is in src/.\n\nDo not act"), "{text}");
+    }
+
+    #[test]
+    fn after_a_clear_the_step_s_prompt_briefs_claude_again() {
+        let mut g = runnable();
+        g.nodes[0].text = "The app is in src/.".into();
+        let text = first_prompt_text(&g, "Deploy", &g.nodes[1]);
+        assert!(text.starts_with("Mischief of Agents runs the flow \"Deploy\""), "{text}");
+        assert!(text.contains("Background for the flow:\n\nThe app is in src/."), "{text}");
+        assert!(text.ends_with(&format!("The current step:\n\n{}", prompt_text(&g.nodes[1]))), "{text}");
+        assert!(!text.contains("Reply only with"), "{text}");
+    }
+
+    #[test]
+    fn each_step_asks_for_that_step_only() {
+        let g = runnable();
+        assert!(prompt_text(&g.nodes[1]).contains("Do only this step"));
+    }
+
+    #[test]
+    fn the_end_of_a_run_lets_claude_go_back_to_normal() {
+        let text = closing_text("Deploy");
+        assert!(text.contains("\"Deploy\" is finished"), "{text}");
+        assert!(text.contains("no longer need to end your replies with a FLOW line"), "{text}");
     }
 
     #[test]

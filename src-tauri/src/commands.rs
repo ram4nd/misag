@@ -777,8 +777,9 @@ pub fn flow_resume(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<St
     Ok(db.resume_run(run_id, &step_id)?)
 }
 
+/// Stops the run; returns what to tell Claude, for the page to send if Claude is idle (see `runs::stop`).
 #[tauri::command(async)]
-pub fn flow_stop(db: State<'_, Db>, run_id: i64) -> Result<(), CommandError> {
+pub fn flow_stop(db: State<'_, Db>, run_id: i64) -> Result<Option<String>, CommandError> {
     Ok(db.stop_run(run_id)?)
 }
 
@@ -1189,7 +1190,7 @@ mod tests {
                 ("MISAG_DB".into(), "/data/misag.db".into()),
                 // A flow sends prompt after prompt from the Stop hook; Claude Code's own
                 // cap on hook continuations (8) would cut it short.
-                ("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP".into(), "51".into()),
+                ("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP".into(), "60".into()),
             ]
         );
     }

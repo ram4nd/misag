@@ -272,7 +272,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     if (!tab || startingTabs.has(tab.tabId)) return;
     startingTabs.add(tab.tabId);
     try {
-      // Locked from /clear to the first prompt, so nothing typed lands in between.
+      // Locked from /clear to the briefing, so nothing typed lands in between.
       if (await confirmed(flow)) await withLock(tab, () => startIn(tab, flow));
     } finally {
       startingTabs.delete(tab.tabId);
@@ -283,6 +283,12 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   async function startIn(tab: T, flow: Flow) {
     if (!(await opts.live(tab))) {
       flows.showBoxError("Flows run in a Claude tab: select one (or a terminal tab running claude) and press ▶ again.");
+      return;
+    }
+    if (opts.busy(tab)) {
+      // The end of Claude's turn would be taken for its reply to the run's briefing
+      // (and /clear would wait for it).
+      flows.showBoxError(`Claude is working in ${opts.label(tab)}, so "${flow.name}" was not started; press ▶ again when it is idle.`);
       return;
     }
     let started: Started;
@@ -365,7 +371,12 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
           await clearPaste(tab);
           return next;
         });
-        if (prompt !== null && !(await typePrompt(tab, prompt))) error = `${notSent(tab)}; start Claude there and go on again.`;
+        if (prompt !== null && !(await typePrompt(tab, prompt))) {
+          await poll();
+          // A run that finished only had its closing message for Claude.
+          const goesOn = runs.some((r) => r.id === run.id);
+          error = goesOn ? `${notSent(tab)}; start Claude there and go on again.` : `${notSent(tab)}; the run has finished.`;
+        }
       } catch (err) {
         console.error("misag: could not continue the run", err);
         error = `Could not go on: ${opts.errorText(err)}`;
@@ -377,10 +388,14 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
 
   async function stop(run: Run) {
     try {
-      await invoke("flow_stop", { runId: run.id });
+      const closing = await invoke<string | null>("flow_stop", { runId: run.id });
       flows.showBoxError(null);
       const tab = opts.tabs().find((t) => t.tabId === run.tabId);
-      if (tab) await withLock(tab, () => clearPaste(tab));
+      if (tab) {
+        await withLock(tab, () => clearPaste(tab));
+        // Claude, briefed, is told the flow is finished; not in the middle of a turn.
+        if (closing !== null && !opts.busy(tab)) await typePrompt(tab, closing);
+      }
     } catch (err) {
       console.error("misag: could not stop the run", err);
       flows.showBoxError(`Could not stop the run: ${opts.errorText(err)}`);

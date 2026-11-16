@@ -177,6 +177,10 @@ const MIGRATIONS: &[&str] = &[r#"
     -- Names the paste a run owes while prefill is 1, so the record of an earlier
     -- paste does not cancel one owed since (see runs::prefilled).
     ALTER TABLE flow_runs ADD COLUMN prefill_token INTEGER;
+"#, r#"
+    -- 1 while a run waits at Start for Claude's reply to its briefing (see
+    -- runs::on_stop): only that reply takes the first step.
+    ALTER TABLE flow_runs ADD COLUMN briefing INTEGER NOT NULL DEFAULT 0 CHECK (briefing IN (0, 1));
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -941,7 +945,7 @@ impl Db {
         runs::resume(&mut self.conn(), run_id, step_id)
     }
 
-    pub fn stop_run(&self, run_id: i64) -> Result<(), String> {
+    pub fn stop_run(&self, run_id: i64) -> Result<Option<String>, String> {
         runs::stop(&self.conn(), run_id)
     }
 
@@ -2126,6 +2130,8 @@ pub(crate) mod tests {
         for (id, tab) in ids.iter().zip(["t1", "t2"]) {
             db.save_flow_graph(*id, &runnable).unwrap();
             crate::runs::start(&mut runs, *id, &tid(tab)).unwrap();
+            // Claude's reply to the briefing takes the first step.
+            crate::runs::on_stop(&mut runs, &tid(tab), Some("Ready")).unwrap();
         }
         let idle_run = crate::runs::active(&runs).unwrap()[1].id;
         crate::runs::stop(&runs, idle_run).unwrap();

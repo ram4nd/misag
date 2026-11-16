@@ -18,12 +18,17 @@ export interface Run {
   note: string | null;
   outputs: string[];
   steps: number;
+  /** How many of the flow's steps (all but Start and End) are done, each once however often it ran, and how many there are. */
+  done: number;
+  total: number;
   /** Whether Claude can be asked to go on with the step (a prompt step that needs attention). */
   resumable: boolean;
   /** Whether the app has yet to fill Claude's input for the manual prompt the run waits at. */
   prefill: boolean;
   /** The kind of the step the run is at; null for a run that cannot be read. */
   stepKind: StepKind | null;
+  /** Whether the run waits at Start for Claude's reply to its briefing. */
+  briefing: boolean;
 }
 
 export const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
@@ -32,7 +37,11 @@ export const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", ma
 export const awaitsPrompt = (run: Run) => run.stepKind === "manual_prompt" && run.status !== "running";
 
 /** What the run is doing, for the person. */
-export const statusLabel = (run: Run) => (awaitsPrompt(run) && run.status === "manual" ? "Waiting for your prompt" : STATUS_LABELS[run.status]);
+export function statusLabel(run: Run): string {
+  if (awaitsPrompt(run) && run.status === "manual") return "Waiting for your prompt";
+  if (run.briefing) return "Briefing Claude";
+  return STATUS_LABELS[run.status];
+}
 
 /** Mirrors `db::FlowSummary` in src-tauri/src/db.rs. */
 export interface Flow {
@@ -246,7 +255,7 @@ export function createFlows(opts: FlowsOptions): Flows {
         const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
         const run = mine ?? orphan;
         li.title = mine
-          ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}${mine.note ? `. ${mine.note}` : ""}`
+          ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}, ${mine.done} of ${mine.total} steps done${mine.note ? `. ${mine.note}` : ""}`
           : orphan
             ? `${flow.name}: running in a closed tab; ■ stops it`
             : `Edit ${flow.name}`;
@@ -266,6 +275,12 @@ export function createFlows(opts: FlowsOptions): Flows {
         if (attention) mark.classList.add("needs-attention");
         else if (flow.clear) mark.classList.add("clears");
         li.append(mark, nameSpan(flow));
+        if (run) {
+          const progress = document.createElement("span");
+          progress.className = "progress";
+          progress.textContent = `${run.done}/${run.total}`;
+          li.append(progress);
+        }
         li.append(action);
         // A run waiting for you goes on to the next step from here; having Claude go
         // on with a step that needs attention is the editor's Continue.

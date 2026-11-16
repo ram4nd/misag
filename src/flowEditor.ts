@@ -10,7 +10,7 @@ export interface Step {
   id: string;
   kind: StepKind;
   title: string;
-  /** A prompt, what the person does, or for Start: optional base info sent ahead of the first prompt. */
+  /** A prompt, what the person does, or for Start: optional base info, sent in the run's briefing. */
   text: string;
   outputs: string[];
   /** How many times a run may take the step before it waits for the person; absent: no limit. */
@@ -84,7 +84,7 @@ function editorMarkup(): string {
       <fieldset>
         <div class="toolbar">
           <button type="button" class="add-prompt">+ Prompt</button>
-          <button type="button" class="add-manual-prompt" title="Puts base info and a draft into Claude's input for you to finish and send; goes on once Claude answers">+ Manual prompt</button>
+          <button type="button" class="add-manual-prompt" title="Puts a draft into Claude's input for you to finish and send; goes on once Claude answers">+ Manual prompt</button>
           <button type="button" class="add-pause" title="Waits for you to do something and press ▶">+ Pause</button>
           <button type="button" class="add-end">+ End</button>
           <span class="status" role="status"></span>
@@ -233,7 +233,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       end: "",
     }[s.kind];
     text.maxLength = s.kind === "start" ? MAX_INFO : MAX_TEXT;
-    text.placeholder = s.kind === "start" ? "Optional: where things are and what Claude should know, sent ahead of the first prompt" : "";
+    text.placeholder = s.kind === "start" ? "Optional: where things are and what Claude should know, sent to Claude in the run's briefing before the first step" : "";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
 

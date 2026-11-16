@@ -252,8 +252,8 @@ let storedGraphs: Record<number, Graph>;
 let flowProblems: string[];
 type Run = {
   id: number; flowId: number; flowName: string; tabId: string; stepId: string; step: string;
-  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number; resumable: boolean; prefill: boolean;
-  stepKind: "start" | "prompt" | "manual" | "manual_prompt" | "end" | null;
+  status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number; done: number; total: number; resumable: boolean; prefill: boolean;
+  stepKind: "start" | "prompt" | "manual" | "manual_prompt" | "end" | null; briefing: boolean;
 };
 /** What flow_runs reports. */
 let activeRuns: Run[];
@@ -262,6 +262,8 @@ let runPrompt: string | null;
 let runRefusal: string | null;
 /** Makes flow_prefill_text fail with it. */
 let prefillError: string | null;
+/** What flow_stop returns for Claude. */
+let stopClosing: string | null;
 /** Makes flow_prefilled fail with it. */
 let prefilledError: string | null;
 /** What flow_prefill_text returns, one per call; then null. */
@@ -422,7 +424,7 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
       return null;
     case "flow_stop":
       activeRuns = activeRuns.filter((r) => r.id !== args.runId);
-      return null;
+      return stopClosing;
     case "flow_stop_tab":
       activeRuns = activeRuns.filter((r) => r.tabId !== args.tabId);
       return null;
@@ -473,6 +475,7 @@ beforeEach(() => {
   runPrompt = null;
   runRefusal = null;
   prefills = [];
+  stopClosing = null;
   prefillError = null;
   prefilledError = null;
   clearStates = [];
@@ -4055,7 +4058,7 @@ describe("flow runs", () => {
   const step = (id: string, kind: Step["kind"], title: string, outputs: string[]): Step => ({ id, kind, title, text: "x", outputs, x: 0, y: 0 });
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, resumable: false, prefill: false, stepKind: "prompt", ...over,
+    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, done: 0, total: 2, resumable: false, prefill: false, stepKind: "prompt", briefing: false, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -4080,7 +4083,7 @@ describe("flow runs", () => {
     };
   });
 
-  test("▶ starts a flow in the active Claude tab and types its first prompt", async () => {
+  test("▶ starts a flow in the active Claude tab and types what the run sends first (its briefing)", async () => {
     runPrompt = "Fix the tests.\nEnd with FLOW: pass";
     await boot();
     await openClaudeTabs(2);
@@ -4122,7 +4125,7 @@ describe("flow runs", () => {
     await settle();
   }
 
-  test("a flow whose Start clears starts its run, types /clear, and sends the first prompt once Claude has cleared", async () => {
+  test("a flow whose Start clears starts its run, types /clear, and sends the briefing once Claude has cleared", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
     clearStates = [{ state: "pending" }, { state: "ready", prompt: "Fix the tests." }];
     await boot();
@@ -4175,7 +4178,18 @@ describe("flow runs", () => {
     await openClaudeTabs(1);
     terms()[0].onTitle!("◐ Fixing");
     await playAndEnter("Deploy");
-    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
+    expect(callsOf("flow_start")).toHaveLength(0);
+    expect(typed()).toEqual([]);
+    expect(box().querySelector(".error")!.textContent).toContain("working");
+  });
+
+  test("no flow starts while Claude is working, as the turn's end would be taken for the briefing's reply", async () => {
+    runPrompt = "The briefing.";
+    await boot();
+    await openClaudeTabs(1);
+    terms()[0].onTitle!("◐ Fixing");
+    await play("Deploy");
+    expect(callsOf("flow_start")).toHaveLength(0);
     expect(typed()).toEqual([]);
     expect(box().querySelector(".error")!.textContent).toContain("working");
   });
@@ -4332,6 +4346,43 @@ describe("flow runs", () => {
     activeRuns = [atManualPrompt({ prefill: true })];
     await poll();
     expect(box().querySelector(".error")!.textContent).toContain("Pasted");
+  });
+
+  test("stopping a run tells an idle Claude the flow is finished", async () => {
+    stopClosing = "The flow is finished.";
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(typed()).toEqual(["\x1b[200~The flow is finished.\x1b[201~", "\r"]);
+  });
+
+  test("stopping a run while Claude works sends no closing into its turn", async () => {
+    stopClosing = "The flow is finished.";
+    await boot();
+    await openClaudeTabs(1);
+    terms()[0].onTitle!("◐ Fixing");
+    activeRuns = [run({ tabId: spawns()[0].tabId })];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
+    await settle();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(typed()).toEqual([]);
+  });
+
+  test("a run says it is briefing Claude before its first step", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, stepId: "start", step: "Start", outputs: [], stepKind: "start", briefing: true })];
+    await poll();
+    expect(flowRow("Deploy").title).toContain("briefing claude at Start");
+    // Clearing first, the run is not briefing yet.
+    activeRuns = [run({ tabId: spawns()[0].tabId, stepId: "start", step: "Start", outputs: [], stepKind: "start", note: "Clearing the conversation before the first step." })];
+    await poll();
+    expect(flowRow("Deploy").title).toContain("running at Start");
   });
 
   test("the run bar offers a manual prompt's output as a skip", async () => {
@@ -4561,6 +4612,20 @@ describe("flow runs", () => {
     expect(runBar().hidden).toBe(true);
   });
 
+  test("a running flow shows how many of its steps are done", async () => {
+    await boot();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId, done: 1, total: 3 })];
+    await poll();
+    const progress = () => flowRow("Deploy").querySelector(".progress");
+    expect(progress()?.textContent).toBe("1/3");
+    expect(flowRow("Deploy").title).toContain("1 of 3 steps done");
+    activeRuns = [];
+    await poll();
+    expect(progress()).toBeNull();
+  });
+
   test("a run whose tab is gone shows on its flow, and ■ stops it", async () => {
     await boot();
     await openClaudeTabs(1);
@@ -4658,7 +4723,7 @@ describe("flow runs and Claude's state", () => {
   const runError = () => document.querySelector<HTMLElement>(".page.flow-editor.active .run-bar .run-error")!;
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "manual", note: null, outputs: ["ok"], steps: 1, resumable: false, prefill: false, stepKind: "prompt", ...over,
+    status: "manual", note: null, outputs: ["ok"], steps: 1, done: 0, total: 2, resumable: false, prefill: false, stepKind: "prompt", briefing: false, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -4719,7 +4784,7 @@ describe("flow runs and Claude's state", () => {
     expect(typed()).toEqual(["\x1b[200~Next.\x1b[201~"]);
   });
 
-  test("a first prompt that cannot be sent, as Claude left the tab, says so", async () => {
+  test("a briefing that cannot be sent, as Claude left the tab, says so", async () => {
     runPrompt = "Fix it.";
     await boot();
     await clickTerminal();

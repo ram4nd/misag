@@ -130,7 +130,7 @@ export function createCanvas(canvasEl: HTMLElement, events: CanvasEvents): Canva
         const limit = s.maxRuns === undefined ? "" : `<span class="limit" title="Runs at most ${s.maxRuns} times">≤${s.maxRuns}</span>`;
         const clears = s.clear ? `<span class="clears" title="Starts with /clear">/clear</span>` : "";
         const info =
-          s.kind === "start" && s.text.trim() !== "" ? `<span class="info" title="Sends base info with the first prompt">info</span>` : "";
+          s.kind === "start" && s.text.trim() !== "" ? `<span class="info" title="Sends base info in the run's briefing">info</span>` : "";
         const html = `<div class="kind">${KIND_LABELS[s.kind]}${limit}${clears}${info}</div><div class="title"></div>`;
         const id = df.addNode(s.kind, inputs, s.outputs.length, s.x, s.y, s.kind, {}, html, false);
         stepOf.set(String(id), s);

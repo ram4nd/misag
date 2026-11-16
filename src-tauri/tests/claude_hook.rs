@@ -211,12 +211,16 @@ fn a_stop_moves_the_tabs_flow_run_on_and_sends_the_next_prompt() {
     runs::start(&mut conn, flow, &TabId::parse("t1").unwrap()).unwrap();
     let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
 
+    // Claude's reply to the run's briefing: the hook hands it the first step.
+    let out: serde_json::Value = serde_json::from_str(&run_stop_hook(&env, "Ready")).unwrap();
+    assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::prompt_text(&graph.nodes[1]));
     // fail loops back: the hook hands Claude the prompt again, as hook context.
     let out: serde_json::Value = serde_json::from_str(&run_stop_hook(&env, "Still broken.\nFLOW: fail")).unwrap();
     assert_eq!(out["hookSpecificOutput"]["hookEventName"], "Stop");
     assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::prompt_text(&graph.nodes[1]));
-    // pass has no next step: the run ends and Claude is left to stop.
-    assert_eq!(run_stop_hook(&env, "Fixed.\nFLOW: pass"), "");
+    // pass has no next step: the run ends, telling Claude the flow is finished.
+    let out: serde_json::Value = serde_json::from_str(&run_stop_hook(&env, "Fixed.\nFLOW: pass")).unwrap();
+    assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::closing_text("F"));
     assert!(runs::active(&conn).unwrap().is_empty());
     // A tab without a run, and a Stop that records no session, are left alone.
     assert_eq!(run_stop_hook(&[(claude::TAB_ENV, "t2"), (claude::DB_ENV, db_path.to_str().unwrap())], "FLOW: pass"), "");
@@ -304,7 +308,10 @@ fn a_stop_whose_background_tasks_cannot_be_read_still_moves_the_run_on() {
     assert!(run_hook(exe, &env, &payload(SESSION)).success());
 
     for odd in [serde_json::Value::Null, serde_json::json!({}), serde_json::json!("none")] {
-        runs::start(&mut db::connect_existing(&db_path).unwrap(), flow, &TabId::parse("t1").unwrap()).unwrap();
+        let mut started = db::connect_existing(&db_path).unwrap();
+        runs::start(&mut started, flow, &TabId::parse("t1").unwrap()).unwrap();
+        // Claude's reply to the briefing takes the first step.
+        runs::on_stop(&mut started, &TabId::parse("t1").unwrap(), Some("Ready")).unwrap();
         let stop = serde_json::json!({
             "session_id": SESSION, "hook_event_name": "Stop", "last_assistant_message": "Fixed.\nFLOW: pass", "background_tasks": odd,
         });

@@ -78,15 +78,16 @@ Steps ("nodes"):
   id        1 to 40 letters, digits, - or _, unique in the flow; edges use it.
   kind      "start": where a run begins. Exactly one; its one output is "next".
             "prompt": sends "text" to Claude in the run's tab. misag adds an
-              instruction to end the reply with "FLOW: <output>", which picks
-              the output, so the text need not mention the outputs.
+              instruction to do only this step and to end the reply with
+              "FLOW: <output>", which picks the output, so the text need not
+              mention the outputs.
             "manual": a pause, shown as Pause in the app ("pause" is read
               too): waits for the person, who goes on with ▶ in the app or
               stops the run with ■; "text" says what to do. It has exactly
               one output; a flow with more still imports, but does not run
               until it has one.
-            "manual_prompt": puts Start's base info (if Claude lacks it) and
-              "text" (an optional draft) into Claude's input without sending
+            "manual_prompt": puts "text" (an optional draft; after a /clear,
+              led by Start's base info) into Claude's input without sending
               it. The person writes the prompt and sends it, and the run goes
               on by the step's one output once Claude answers it; ▶ skips
               the step.
@@ -96,8 +97,11 @@ Steps ("nodes"):
   text      The prompt, what the person does at a pause, or a manual
             prompt's draft (up to 20000 characters).
             Optional on Start: base info, such as where things are (up to
-            4000 characters), sent ahead of the run's first prompt and again
-            with the first prompt after each /clear.
+            4000 characters). A run first briefs Claude with the flow's
+            rules (one step at a time, end each with "FLOW: <output>") and
+            the base info, and waits for Claude to reply "Ready". After each
+            /clear, the next step's prompt carries them again. When the run
+            ends or is stopped, Claude is told the flow is finished.
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
             and _, starting with a letter or digit, up to 24 characters); a
             pause or manual prompt has exactly one. "attention" is reserved:

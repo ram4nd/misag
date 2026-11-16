@@ -348,6 +348,7 @@ svg.lucide { display: block; flex: none; }
 #flows-box .flows > li:hover > button.run, #flows-box .flows > li > button.run:focus-visible { visibility: visible; }
 /* A flow running in the active tab. */
 #flows-box .flows > li.running { font-weight: 600; }
+#flows-box .flows > li > .progress { color: var(--muted); font-weight: normal; font-variant-numeric: tabular-nums; }
 #flows-box .flows > li.running > svg:first-child { color: var(--accent); }
 #flows-box .flows > li.manual > svg:first-child, #flows-box .flows > li.attention > svg:first-child, #flows-box .flows > li > button.go-on { color: #e8710a; }
 /* A run whose tab is gone: it can only be stopped. */

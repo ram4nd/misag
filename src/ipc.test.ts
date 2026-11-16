@@ -11,7 +11,7 @@ import type { Cleared, Prefill, Started } from "./runController";
  */
 const RUN: Record<keyof Run, true> = {
   id: true, flowId: true, flowName: true, tabId: true, stepId: true, step: true,
-  status: true, note: true, outputs: true, steps: true, resumable: true, prefill: true, stepKind: true,
+  status: true, note: true, outputs: true, steps: true, done: true, total: true, resumable: true, prefill: true, stepKind: true, briefing: true,
 };
 const PREFILL: Record<keyof Prefill, true> = { text: true, token: true };
 const STARTED: Record<keyof Started, true> = { runId: true, clear: true, prompt: true };
