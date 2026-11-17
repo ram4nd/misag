@@ -6,6 +6,7 @@ use crate::claude::{self, HookProblem, SessionId};
 use crate::db::{Db, FlowSummary, StoreStatus};
 use crate::flows::{self, Graph};
 use crate::layout::{Layout, TabId};
+use crate::runs;
 use crate::session::{self, Launch, SpawnError, Sessions, SpawnRequest};
 use crate::settings::{skips_permissions, Settings};
 use serde::{Deserialize, Serialize};
@@ -745,54 +746,54 @@ pub fn flow_save_graph(db: State<'_, Db>, id: i64, graph: Graph) -> Result<Vec<S
 
 #[tauri::command(async)]
 pub fn flow_start(db: State<'_, Db>, flow_id: i64, tab_id: TabId) -> Result<crate::runs::Started, CommandError> {
-    Ok(db.start_run(flow_id, &tab_id)?)
+    Ok(db.with_conn(|c| runs::start(c, flow_id, &tab_id))?)
 }
 
 /// How a run that cleared at its start is getting on (see `runs::cleared`).
 #[tauri::command(async)]
 pub fn flow_cleared(db: State<'_, Db>, run_id: i64) -> Result<crate::runs::Cleared, CommandError> {
-    Ok(db.cleared_run(run_id)?)
+    Ok(db.with_conn(|c| runs::cleared(c, run_id))?)
 }
 
 /// The text to put into Claude's input for the run's manual prompt, if the app owes it (see `runs::prefill_text`).
 #[tauri::command(async)]
 pub fn flow_prefill_text(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<Option<crate::runs::Prefill>, CommandError> {
-    Ok(db.prefill_text(run_id, &step_id)?)
+    Ok(db.with_conn(|c| runs::prefill_text(c, run_id, &step_id))?)
 }
 
 /// The app put the run's manual prompt into Claude's input (see `runs::prefilled`).
 #[tauri::command(async)]
 pub fn flow_prefilled(db: State<'_, Db>, run_id: i64, step_id: String, token: i64) -> Result<(), CommandError> {
-    Ok(db.prefilled(run_id, &step_id, token)?)
+    Ok(db.with_conn(|c| runs::prefilled(c, run_id, &step_id, token))?)
 }
 
 #[tauri::command(async)]
 pub fn flow_continue(db: State<'_, Db>, run_id: i64, step_id: String, output: String) -> Result<Option<crate::runs::StepPrompt>, CommandError> {
-    Ok(db.proceed_run(run_id, &step_id, &output)?)
+    Ok(db.with_conn(|c| runs::proceed(c, run_id, &step_id, &output))?)
 }
 
 /// Has Claude go on with the run's step that needs attention; returns the prompt to type.
 #[tauri::command(async)]
 pub fn flow_resume(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<crate::runs::StepPrompt, CommandError> {
-    Ok(db.resume_run(run_id, &step_id)?)
+    Ok(db.with_conn(|c| runs::resume(c, run_id, &step_id))?)
 }
 
 /// The prompt flow_continue or flow_resume returned could not be typed: the run waits for the person (see `runs::unsent`).
 /// Returns whether it does, false when the run had already moved on.
 #[tauri::command(async)]
 pub fn flow_unsent(db: State<'_, Db>, run_id: i64, step_id: String, briefs: bool, why: String) -> Result<bool, CommandError> {
-    Ok(db.unsent_run(run_id, &step_id, briefs, &why)?)
+    Ok(db.with_conn(|c| runs::unsent(c, run_id, &step_id, briefs, &why))?)
 }
 
 #[tauri::command(async)]
 pub fn flow_stop(db: State<'_, Db>, run_id: i64) -> Result<(), CommandError> {
-    Ok(db.stop_run(run_id)?)
+    Ok(db.with_conn(|c| runs::stop(c, run_id))?)
 }
 
 /// Ends the tab's run, if any, as the tab is closing.
 #[tauri::command(async)]
 pub fn flow_stop_tab(db: State<'_, Db>, tab_id: TabId) -> Result<(), CommandError> {
-    Ok(db.stop_tab_run(&tab_id)?)
+    Ok(db.with_conn(|c| runs::stop_tab(c, &tab_id))?)
 }
 
 /// The active runs, after making those whose time at Start is up wait for you
@@ -805,10 +806,10 @@ pub fn flow_runs(db: State<'_, Db>) -> Result<Vec<crate::runs::Run>, CommandErro
 /// A timeout that cannot be applied now (another writer held the lock past the
 /// busy timeout, say) is applied on a later poll, so the runs are still listed.
 fn poll_runs(db: &Db) -> Result<Vec<crate::runs::Run>, String> {
-    if let Err(e) = db.expire_runs() {
+    if let Err(e) = db.with_conn(runs::expire) {
         eprintln!("misag: could not apply the flow run timeouts: {e}");
     }
-    db.active_runs()
+    db.with_conn(|c| runs::active(c))
 }
 
 #[tauri::command(async)]
@@ -903,7 +904,7 @@ pub fn claude_tab_sessions(db: State<'_, Db>) -> Result<HashMap<String, SessionI
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::tests::{temp_db, tid};
+    use crate::db::test_util::{temp_db, tid};
     use crate::db::{connect_existing, record_claude_session, SessionReport};
 
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
@@ -925,7 +926,7 @@ mod tests {
         .unwrap();
         conn.execute_batch("CREATE TRIGGER fail BEFORE UPDATE ON flow_runs BEGIN SELECT RAISE(ABORT, 'database is locked'); END")
             .unwrap();
-        assert!(db.expire_runs().is_err());
+        assert!(db.with_conn(runs::expire).is_err());
         let runs = poll_runs(&db).unwrap();
         assert_eq!(runs.len(), 1, "{runs:?}");
         assert_eq!(runs[0].status, crate::runs::Status::Running);
@@ -962,7 +963,7 @@ mod tests {
     }
 
     fn report<'a>(tab_id: &'a TabId, session_id: &'a SessionId, transcript_path: Option<&'a str>) -> SessionReport<'a> {
-        SessionReport { transcript_path, ..crate::db::tests::report(tab_id, session_id) }
+        SessionReport { transcript_path, ..crate::db::test_util::report(tab_id, session_id) }
     }
 
     #[test]

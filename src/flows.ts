@@ -47,7 +47,7 @@ export function statusLabel(run: Run): string {
   return STATUS_LABELS[run.status];
 }
 
-/** Mirrors `db::FlowSummary` in src-tauri/src/db.rs. */
+/** Mirrors `db::FlowSummary` in src-tauri/src/db/flows.rs. */
 export interface Flow {
   id: number;
   name: string;

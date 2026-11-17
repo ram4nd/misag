@@ -252,7 +252,7 @@ fn new_token() -> i64 {
 
 /// Where a run is with its step, and what only that place has. Each phase has one
 /// status (see `Phase::status`); `RunState::from_columns` and `RunState::columns`
-/// map it to and from `flow_runs`' columns. The CHECKs on `flow_runs` (in db.rs's
+/// map it to and from `flow_runs`' columns. The CHECKs on `flow_runs` (in `db::schema`'s
 /// MIGRATIONS) spell out the same rules, and SQLite cannot change a table's CHECKs:
 /// changing the phases or how they are stored needs a new migration that rebuilds
 /// the table with new CHECKs.
@@ -352,8 +352,8 @@ impl Columns {
 /// another's order. The raw UPDATEs that remain: stopping a run this version cannot
 /// read (in `stop` and in `stop_in`), dropping the note owed for an ended run
 /// (`drop_closing`, and `on_prompt`'s `closing` UPDATE ... RETURNING), and stopping
-/// the runs of tabs a raterm import leaves behind (in db.rs). Every other state
-/// change is a load and a save. The CHECKs on `flow_runs` (in db.rs's MIGRATIONS)
+/// the runs of tabs a raterm import leaves behind (in `db::raterm_import`). Every other state
+/// change is a load and a save. The CHECKs on `flow_runs` (in `db::schema`'s MIGRATIONS)
 /// hold an active row to the combinations `from_columns` reads, for every writer.
 #[derive(Clone, Debug, PartialEq)]
 struct RunState {
@@ -1363,7 +1363,7 @@ mod tests {
     /// A database with `graph` stored as flow "F"; the run functions get their own
     /// connection, as the hook does.
     fn setup(name: &str, graph: &Graph) -> (Db, Connection, i64) {
-        let path = db::tests::temp_db(name);
+        let path = db::test_util::temp_db(name);
         let db = Db::open(path.clone()).unwrap();
         let id = db.create_flow("F").unwrap().id;
         db.save_flow_graph(id, graph).unwrap();
@@ -1615,7 +1615,7 @@ mod tests {
 
     #[test]
     fn expiring_with_nothing_timed_out_does_not_wait_for_another_writer() {
-        let path = db::tests::temp_db("runs-expire-no-lock");
+        let path = db::test_util::temp_db("runs-expire-no-lock");
         let db = Db::open(path.clone()).unwrap();
         let flow = db.create_flow("F").unwrap().id;
         db.save_flow_graph(flow, &runnable()).unwrap();
@@ -1633,7 +1633,7 @@ mod tests {
 
     #[test]
     fn an_expired_run_this_version_cannot_read_is_left_alone_and_takes_no_lock() {
-        let path = db::tests::temp_db("runs-expire-unreadable");
+        let path = db::test_util::temp_db("runs-expire-unreadable");
         let db = Db::open(path.clone()).unwrap();
         let flow = db.create_flow("F").unwrap().id;
         db.save_flow_graph(flow, &runnable()).unwrap();
@@ -2334,7 +2334,7 @@ mod tests {
 
     #[test]
     fn after_a_restart_runs_of_closed_tabs_stop_and_running_ones_wait() {
-        let path = db::tests::temp_db("runs-restart");
+        let path = db::test_util::temp_db("runs-restart");
         let db = Db::open(path.clone()).unwrap();
         let flow = db.create_flow("F").unwrap().id;
         db.save_flow_graph(flow, &runnable()).unwrap();
@@ -2633,7 +2633,7 @@ mod tests {
 
     #[test]
     fn a_flow_added_from_a_tab_runs_only_once_confirmed() {
-        let path = db::tests::temp_db("runs-unconfirmed");
+        let path = db::test_util::temp_db("runs-unconfirmed");
         let db = Db::open(path.clone()).unwrap();
         let flow = db.import_unconfirmed_flow("Planted", &runnable()).unwrap();
         assert!(flow.unconfirmed);
@@ -2827,7 +2827,7 @@ mod tests {
         ]
     }
 
-    /// Each save also passes flow_runs' CHECKs (see db.rs), which hold every phase.
+    /// Each save also passes flow_runs' CHECKs (see `db::schema`'s MIGRATIONS), which hold every phase.
     #[test]
     fn a_run_s_state_is_saved_and_loaded_whole() {
         let (_db, mut conn, flow) = setup("runs-state-round-trip", &manual_first());

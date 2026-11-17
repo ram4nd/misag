@@ -648,7 +648,7 @@ mod tests {
         previous.save_layout(Layout { active: 0, tabs: vec![tab] }).unwrap();
         let conn = db::connect_existing(&dir.join(db::FILE)).unwrap();
         for tab_id in ["kept", "closed"].map(|id| TabId::parse(id).unwrap()) {
-            db::record_claude_session(&conn, &db::tests::report(&tab_id, &session)).unwrap();
+            db::record_claude_session(&conn, &db::test_util::report(&tab_id, &session)).unwrap();
         }
         drop(previous);
 

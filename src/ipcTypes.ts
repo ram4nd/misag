@@ -50,7 +50,7 @@ export type ClaudeState =
   | { state: "untracked"; pid: number; skipsPermissions: boolean }
   | { state: "unknown" };
 
-/** Mirrors `db::StoreStatus` in src-tauri/src/db.rs. */
+/** Mirrors `db::StoreStatus` in src-tauri/src/db/mod.rs. */
 export type StoreStatus =
   | { state: "saving" }
   | { state: "recovered"; notice: string }

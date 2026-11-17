@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 /// The Claude flag that runs tools without asking.
 pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 /// The terminals' font size in pixels: the default, and the range allowed (also a
-/// CHECK in the schema, see db.rs).
+/// CHECK in the schema, see `db::schema`'s MIGRATIONS).
 pub const DEFAULT_FONT_SIZE: u32 = 14;
 const FONT_SIZES: std::ops::RangeInclusive<u32> = 8..=32;
 
@@ -17,7 +17,7 @@ fn default_font_size() -> u32 {
 }
 
 /// The sound played when Claude in a tab finishes its turn (a CHECK in the schema,
-/// see db.rs). The sounds themselves are made in src/sounds.ts.
+/// see `db::schema`'s MIGRATIONS). The sounds themselves are made in src/sounds.ts.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum FinishSound {

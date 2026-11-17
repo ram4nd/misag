@@ -700,7 +700,7 @@ pub fn run_hook() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::tests::{temp_db, tid};
+    use crate::db::test_util::{temp_db, tid};
     use crate::layout::{Layout, Tab, TabKind};
     use std::fs;
     use std::io::Write;
@@ -1075,7 +1075,7 @@ mod tests {
         let session = id();
         let report = |at: u64, tab: &str| {
             let tab = tid(tab);
-            db::record_claude_session(&conn, &db::tests::report(&tab, &session)).unwrap();
+            db::record_claude_session(&conn, &db::test_util::report(&tab, &session)).unwrap();
             conn.execute("UPDATE claude_sessions SET updated_at = ?1 WHERE tab_id = ?2", rusqlite::params![(opened + at) as i64, tab.as_str()])
                 .unwrap();
         };
