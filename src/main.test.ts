@@ -6,6 +6,7 @@ import indexHtml from "../index.html?raw";
 import capabilities from "../src-tauri/capabilities/default.json?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json?raw";
 import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
+import { boot } from "./main";
 
 // wterm needs WASM and real layout, so the tests drive a stand-in that
 // records writes and exposes the callbacks tabs.ts and terminalView.ts assign.
@@ -313,31 +314,64 @@ const notice = () => document.querySelector<HTMLDivElement>("#notice")!;
 const noticeVisible = () => !notice().hidden;
 const noticeText = () => notice().querySelector("span")!.textContent ?? "";
 const dismissButton = () => notice().querySelector<HTMLButtonElement>("button")!;
-const flush = () =>
-  vi.isFakeTimers() ? vi.advanceTimersByTimeAsync(0) : new Promise((r) => setTimeout(r, 0));
+/** Runs the due 0 ms timers and the promise callbacks they lead to; needs the fake timers every test starts with. */
+const flush = () => vi.advanceTimersByTimeAsync(0);
+/**
+ * Flushes until the app is quiet: two flushes in a row after which the IPC call count,
+ * the net count of pending timers and the count of changes to the attached DOM are all
+ * unchanged. Unlike a fixed count of flushes, this does not break when the code between
+ * an action and its effect gains a promise hop. It compares counts only: a timer started
+ * and cleared within one flush is not seen, and pending timers with a delay do not hold
+ * it open, so effects behind them still need vi.advanceTimersByTimeAsync. Detached
+ * elements are not watched. Throws when something keeps changing things for 50
+ * flushes, as a chain outside the fake clock (message events, real I/O) would. A 0 ms fake
+ * timer set during a flush is due 1 ms later, so a fake-timer chain stalls instead: it
+ * is held back until a test advances the clock.
+ */
+async function settle() {
+  let changes = 0;
+  const observer = new MutationObserver((records) => (changes += records.length));
+  observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+  const state = () => `${calls.length} ${vi.getTimerCount()} ${changes}`;
+  try {
+    let before = state();
+    for (let quiet = 0, i = 0; quiet < 2; i++) {
+      if (i === 50) throw new Error("settle: the app did not go quiet after 50 flushes");
+      await flush();
+      const now = state();
+      quiet = now === before ? quiet + 1 : 0;
+      before = now;
+    }
+  } finally {
+    observer.disconnect();
+  }
+}
 const lastSaved = () => callsOf("layout_save").at(-1)?.args.layout as Layout | undefined;
 
 /**
- * Stops the app the last `startApp` started, as main.boot()'s dispose does: it clears its
+ * Stops the app the last `startApp` started, as boot()'s dispose does: it clears its
  * timers, removes its window, document and Tauri listeners, disconnects its ResizeObserver,
  * and keeps its pending callbacks from changing anything.
  */
 let dispose: (() => void) | null = null;
 
-/** Loads index.html into the page and starts the app on it with main.boot(), then lets startup settle. */
+/**
+ * Loads index.html into the page and starts the app on it with boot(), then lets startup
+ * settle. Tests boot through the statically imported boot, so a fresh app depends on
+ * dispose having cleaned up the previous one.
+ */
 async function startApp() {
   dispose?.();
   document.body.innerHTML = new DOMParser().parseFromString(indexHtml, "text/html").body.innerHTML;
-  const main = await import("./main");
-  dispose = main.boot();
-  for (let i = 0; i < 5; i++) await flush();
+  dispose = boot();
+  await settle();
 }
 
 /** Clicks the new-terminal button at the top right; Shift opens the dialog. */
 async function clickTerminal(shiftKey = false) {
   const button = document.querySelector<HTMLButtonElement>("#new-terminal")!;
   button.dispatchEvent(new MouseEvent("click", { bubbles: true, shiftKey }));
-  for (let i = 0; i < 3; i++) await flush();
+  await settle();
 }
 
 /** Opens a Claude tab from the Claude button of the workspace's first folder (by default ~/work). */
@@ -345,7 +379,7 @@ async function clickClaude() {
   const button = document.querySelector<HTMLButtonElement>("#workspace-box .tree > ul .open-claude");
   if (!button) throw new Error("no folder with a Claude button in the workspace tree");
   button.click();
-  for (let i = 0; i < 3; i++) await flush();
+  await settle();
 }
 
 async function openClaudeTabs(n: number) {
@@ -454,11 +488,16 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
   throw new Error(`unmocked ${cmd}`);
 }
 
+/** document's own execCommand before a test, if any (jsdom has none), restored after it. */
+let ownExecCommand: PropertyDescriptor | undefined;
+
 beforeEach(() => {
+  // jsdom has no execCommand; copying through it succeeds unless a test says otherwise.
+  ownExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
+  document.execCommand = vi.fn(() => true);
   // Fake timers for every test: they are discarded afterwards, so a debounced save
   // left over from one test's app instance cannot fire during the next test.
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] });
-  vi.resetModules();
   fakes.FakeTerminal.all = [];
   fakes.FakeTerminal.failOnce = false;
   fakes.FakeTerminal.hold = false;
@@ -637,6 +676,42 @@ afterEach(() => {
   // Spies (such as the layout getters a test stubs) do not restore themselves.
   vi.restoreAllMocks();
   vi.useRealTimers();
+  if (ownExecCommand) Object.defineProperty(document, "execCommand", ownExecCommand);
+  else delete (document as Partial<Document>).execCommand;
+});
+
+describe("settle", () => {
+  test("returns once a chain of promise hops has finished", async () => {
+    void (async () => {
+      for (let i = 0; i < 100; i++) await null;
+      document.body.dataset.done = "yes";
+    })();
+    await settle();
+    expect(document.body.dataset.done).toBe("yes");
+    delete document.body.dataset.done;
+  });
+
+  test("returns after two flushes when nothing happens", async () => {
+    const advance = vi.spyOn(vi, "advanceTimersByTimeAsync");
+    await settle();
+    expect(advance).toHaveBeenCalledTimes(2);
+  });
+
+  test("throws for a runaway chain that keeps changing the page", async () => {
+    let running = true;
+    // Message events are not faked, so the chain runs on through every flush.
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => {
+      if (!running) return;
+      document.body.dataset.step = String(Number(document.body.dataset.step ?? 0) + 1);
+      channel.port2.postMessage(null);
+    };
+    channel.port2.postMessage(null);
+    await expect(settle()).rejects.toThrow("did not go quiet after 50 flushes");
+    running = false;
+    channel.port1.close();
+    delete document.body.dataset.step;
+  });
 });
 
 describe("tabs", () => {
@@ -680,7 +755,7 @@ describe("tabs", () => {
     const root = document.querySelector<HTMLButtonElement>("#workspace-box .tree .row.root + .open-claude")!;
     expect(root.title).toBe("Open Claude in ~");
     root.click();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "~" });
   });
 
@@ -992,7 +1067,7 @@ describe("tab icons", () => {
     turn();
     storedSettings = { ...DEFAULTS };
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     tabs()[0].click();
     await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
     expect(sounds.played).toEqual([]);
@@ -1122,11 +1197,11 @@ describe("tab icons", () => {
     terms()[0].element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     expect(sounds.primed).toBe(0);
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     const select = document.querySelector<HTMLSelectElement>("#settings select[name=finishSound]")!;
     select.value = "chime";
     select.dispatchEvent(new Event("change", { bubbles: true }));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     tabs()[0].dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     terms()[0].element.dispatchEvent(new KeyboardEvent("keydown", { key: "a", bubbles: true }));
     expect(sounds.primed).toBe(2);
@@ -1377,7 +1452,7 @@ describe("input", () => {
       const up = new MouseEvent("mouseup", { bubbles: true, cancelable: true, button: 1, shiftKey });
       el.dispatchEvent(down);
       el.dispatchEvent(up);
-      for (let i = 0; i < 6; i++) await flush();
+      await settle();
       return [down.defaultPrevented, up.defaultPrevented];
     }
 
@@ -1435,7 +1510,7 @@ describe("input", () => {
     /** Lets go of the left button over the first terminal, after a selection or not. */
     async function release() {
       terms()[0].element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 0 }));
-      for (let i = 0; i < 6; i++) await flush();
+      await settle();
     }
 
     test("selecting text copies it, and the selection stays", async () => {
@@ -1493,7 +1568,8 @@ describe("input", () => {
       document.execCommand = copy;
       terms()[0].selected = "some output";
       terms()[0].element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, button: 2 }));
-      for (let i = 0; i < 6; i++) await flush();
+      await settle();
+      await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
       expect(copy).not.toHaveBeenCalled();
     });
   });
@@ -1504,7 +1580,7 @@ describe("input", () => {
     async function rightClick(shiftKey = false) {
       const menu = new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2, shiftKey });
       terms()[0].element.dispatchEvent(menu);
-      for (let i = 0; i < 6; i++) await flush();
+      await settle();
       return menu.defaultPrevented;
     }
 
@@ -1598,7 +1674,8 @@ describe("input", () => {
       terms()[0].element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }));
       dispose!();
       dispose = null;
-      for (let i = 0; i < 6; i++) await flush();
+      await settle();
+      await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
       expect(callsOf("clipboard_text")).toHaveLength(1);
       expect(typed()).toEqual([]);
     });
@@ -1676,7 +1753,7 @@ describe("new terminal dialog", () => {
     field("name")!.value = "agent";
     field("cwd")!.value = "~/src/misag";
     dialog().close("ok");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(tabNames()).toEqual(["agent"]);
     expect(spawns()[0]).toMatchObject({ kind: "terminal", cwd: "~/src/misag" });
   });
@@ -1688,7 +1765,7 @@ describe("new terminal dialog", () => {
     field("name")!.value = "agent";
     field("cwd")!.value = "/srv/app";
     dialog().close("ok");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(tabNames()).toEqual(["agent"]);
     expect(spawns()[0]).toMatchObject({ kind: "claude", cwd: "/srv/app", fallbackToHome: false });
     // The next opening starts at Terminal again.
@@ -1703,7 +1780,7 @@ describe("new terminal dialog", () => {
     await flush();
     await clickTerminal(true);
     dialog().close();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_spawn")).toHaveLength(1);
   });
 });
@@ -1787,7 +1864,7 @@ describe("saving tabs", () => {
     await clickTerminal(true);
     field("name")!.value = "dev";
     dialog().close("ok");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     liveCwds = { 1: "/home/me/src", 2: "/home/me" };
     // Like the backend, which only reports terminal tabs it was asked about.
     openClaudes = { 1: "6fa459ea-ee8a-4ca4-894e-db77e160355e", 2: SESSION };
@@ -1978,12 +2055,12 @@ describe("settings", () => {
   const disabled = () => page().querySelector("fieldset")!.disabled;
   async function openSettings() {
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
   }
   async function change(name: string, value: boolean) {
     setting(name).checked = value;
     setting(name).dispatchEvent(new Event("change", { bubbles: true }));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
   }
   const settingsTabX = () => tabs().at(-1)!.querySelector<HTMLButtonElement>(".x")!;
 
@@ -2059,7 +2136,7 @@ describe("settings", () => {
     async function choose(value: "true" | "false") {
       select().value = value;
       select().dispatchEvent(new Event("change", { bubbles: true }));
-      for (let i = 0; i < 3; i++) await flush();
+      await settle();
     }
     await startApp();
     await openSettings();
@@ -2084,7 +2161,7 @@ describe("settings", () => {
     const select = page().querySelector<HTMLSelectElement>("select[name=disableAutoMemory]")!;
     select.value = "true";
     select.dispatchEvent(new Event("change", { bubbles: true }));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(storedSettings).toEqual({ ...DEFAULTS, skipPermissions: true, disableAutoMemory: true });
     await change("skipPermissions", false);
     expect(storedSettings).toEqual({ ...DEFAULTS, disableAutoMemory: true });
@@ -2096,7 +2173,7 @@ describe("settings", () => {
     async function size(value: string) {
       field().value = value;
       field().dispatchEvent(new Event("change", { bubbles: true }));
-      for (let i = 0; i < 3; i++) await flush();
+      await settle();
     }
     storedSettings = { ...DEFAULTS, fontSize: 16 };
     await startApp();
@@ -2121,7 +2198,7 @@ describe("settings", () => {
     const field = setting("fontSize");
     field.value = "40";
     field.dispatchEvent(new Event("change", { bubbles: true }));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("settings_save")).toHaveLength(0);
     expect(pageError().textContent).toContain("8 to 32");
     expect(field.value).toBe("14");
@@ -2133,7 +2210,7 @@ describe("settings", () => {
     async function choose(value: string) {
       select().value = value;
       select().dispatchEvent(new Event("change", { bubbles: true }));
-      for (let i = 0; i < 3; i++) await flush();
+      await settle();
     }
     await startApp();
     await openSettings();
@@ -2158,7 +2235,7 @@ describe("settings", () => {
     const select = page().querySelector<HTMLSelectElement>("select[name=finishSound]")!;
     select.value = "pop";
     select.dispatchEvent(new Event("change", { bubbles: true }));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(sounds.played).toEqual([]);
     expect(select.value).toBe("off");
   });
@@ -2170,7 +2247,7 @@ describe("settings", () => {
     select.append(new Option("Siren", "siren"));
     select.value = "siren";
     select.dispatchEvent(new Event("change", { bubbles: true }));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("settings_save").every((c) => (c.args.settings as Settings).finishSound === "off")).toBe(true);
     expect(sounds.played).toEqual([]);
   });
@@ -2253,7 +2330,7 @@ describe("settings", () => {
     // The restart picks up the current setting.
     spawns()[0].onExit.onmessage(0);
     terms()[0].onData!("\r");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(tabs()[0].title).not.toContain("--dangerously-skip-permissions");
   });
 
@@ -2277,9 +2354,6 @@ describe("file tree", () => {
   const pageButton = (sel: string) => document.querySelector<HTMLButtonElement>(`#workspace-settings ${sel}`)!;
   const pageError = () => document.querySelector<HTMLElement>("#workspace-settings .error")!;
   const folderField = () => document.querySelector<HTMLInputElement>("#workspace-settings input[name=workspace]")!;
-  const settle = async () => {
-    for (let i = 0; i < 6; i++) await flush();
-  };
   const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
 
   beforeEach(() => {
@@ -2378,7 +2452,6 @@ describe("file tree", () => {
     expect(pageError().textContent).toContain("/gone is not a folder");
     expect(rows()).toEqual(["~", "notes"]);
 
-    vi.resetModules();
     storedSettings = { ...DEFAULTS, workspace: "/vanished" };
     await startApp();
     await settle();
@@ -2561,11 +2634,9 @@ describe("file tree", () => {
     const box = () => document.querySelector("#workspace-box")!;
     button(".toggle").click();
     expect(box().classList.contains("collapsed")).toBe(true);
-    // A fresh app instance on a fresh page.
-    vi.resetModules();
+    // A fresh app on a fresh page.
     await startApp();
     expect(box().classList.contains("collapsed")).toBe(true);
-    vi.resetModules();
     localStorage.clear();
     await startApp();
     expect(box().classList.contains("collapsed")).toBe(false);
@@ -2589,8 +2660,7 @@ describe("switching and layout", () => {
     document.querySelector<HTMLButtonElement>("#toggle-sidebar")!.click();
     expect(collapsed()).toBe(true);
 
-    // A fresh app instance on a fresh page.
-    vi.resetModules();
+    // A fresh app on a fresh page.
     document.body.className = "";
     await startApp();
     expect(collapsed()).toBe(true);
@@ -2635,7 +2705,7 @@ describe("new tab directory", () => {
     liveCwds = { 1: "/home/me/x" };
     await clickTerminal(true);
     dialog().close("ok");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(spawns()[1].cwd).toBe("/home/me/x");
   });
 });
@@ -2835,7 +2905,7 @@ describe("failures", () => {
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     started(7);
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 7 }]);
   });
 
@@ -2849,7 +2919,7 @@ describe("failures", () => {
     expect(spawns()).toHaveLength(2);
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     started(8);
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 8 }]);
   });
 
@@ -2862,7 +2932,7 @@ describe("failures", () => {
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     const before = terms()[0].written.length;
     failed("no pty");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_kill")).toHaveLength(0);
     expect(terms()[0].written).toHaveLength(before);
     expect(error).toHaveBeenCalledWith("misag: could not start the process of a closed tab", "no pty");
@@ -2878,7 +2948,7 @@ describe("failures", () => {
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     failing.add("pty_kill");
     started(7);
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 7 }]);
     expect(error).toHaveBeenCalledWith("misag: could not kill process 7 of a closed tab", "pty_kill failed");
     error.mockRestore();
@@ -2890,7 +2960,7 @@ describe("failures", () => {
     await startApp();
     await clickClaude();
     started(7);
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_kill")).toHaveLength(0);
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 7 }]);
@@ -2907,7 +2977,7 @@ describe("failures", () => {
     await startApp();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     started(9);
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(noticeText()).not.toContain("no longer exists");
     expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 9 }]);
   });
@@ -2920,7 +2990,7 @@ describe("terminal views", () => {
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     terms()[0].loading!.resolve();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_spawn")).toHaveLength(0);
     expect(tabs()).toHaveLength(0);
   });
@@ -2933,7 +3003,7 @@ describe("terminal views", () => {
     await clickClaude();
     tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
     terms()[1].loading!.reject(new Error("no wasm"));
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(tabs()).toHaveLength(1);
     expect(terms()[0].destroyed).toBe(false);
     expect(noticeText()).not.toContain("could not be opened");
@@ -2958,7 +3028,7 @@ describe("terminal views", () => {
     await startApp();
     await clickClaude();
     terms()[0].loading!.resolve();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(terms()[0].focused).toBeGreaterThan(0);
   });
 
@@ -3029,7 +3099,7 @@ describe("terminal views", () => {
   test("a terminal fills its pane, rather than keeping the height of the rows it started with", async () => {
     await startApp();
     await clickClaude();
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(terms()[0].element.style.height).toBe("");
   });
 
@@ -3052,7 +3122,7 @@ describe("terminal views", () => {
       throw new Error("callback failed");
     });
     terms()[0].onData!("\r");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(callsOf("pty_spawn")).toHaveLength(2);
     expect(tabs()[0].classList.contains("exited")).toBe(false);
     error.mockRestore();
@@ -3249,7 +3319,7 @@ describe("edge cases", () => {
     await clickTerminal(true);
     field("cwd")!.value = "/typo";
     dialog().close("ok");
-    for (let i = 0; i < 3; i++) await flush();
+    await settle();
     expect(spawns().map((s) => [s.cwd, s.fallbackToHome])).toEqual([["/typo", false]]);
     expect(tabs()[0].classList.contains("exited")).toBe(true);
   });
@@ -3301,9 +3371,6 @@ describe("flows", () => {
     [...page().querySelectorAll<HTMLElement>("li")].find(
       (li) => (li.querySelector<HTMLInputElement>("input.name")?.value ?? li.querySelector(".name")?.textContent) === name,
     )!;
-  const settle = async () => {
-    for (let i = 0; i < 5; i++) await flush();
-  };
   async function openFlows() {
     box().querySelector<HTMLButtonElement>(".configure")!.click();
     await settle();
@@ -3419,7 +3486,6 @@ describe("flows", () => {
     box().querySelector<HTMLButtonElement>(".toggle")!.click();
     expect(box().classList.contains("collapsed")).toBe(true);
     expect(document.querySelector("#workspace-box")!.classList.contains("collapsed")).toBe(false);
-    vi.resetModules();
     await startApp();
     expect(box().classList.contains("collapsed")).toBe(true);
   });
@@ -3602,9 +3668,6 @@ describe("flow editor", () => {
     nodes: [START, step("p", "prompt", "P", ["pass", "fail"], "do it"), step("e", "end", "E", [])],
     edges: [{ from: "start", output: "next", to: "p" }, { from: "p", output: "pass", to: "e" }, { from: "p", output: "fail", to: "p" }],
   });
-  const settle = async () => {
-    for (let i = 0; i < 6; i++) await flush();
-  };
   const editor = () => document.querySelector<HTMLElement>(".page.flow-editor.active")!;
   const editors = () => [...document.querySelectorAll<HTMLElement>(".page.flow-editor")];
   const nodes = () => [...editor().querySelectorAll<HTMLElement>(".drawflow-node")];
@@ -4175,9 +4238,6 @@ describe("flow editor", () => {
 });
 
 describe("flow runs", () => {
-  const settle = async () => {
-    for (let i = 0; i < 6; i++) await flush();
-  };
   const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
   const box = () => document.querySelector<HTMLElement>("#flows-box")!;
   const flowRow = (name: string) => [...box().querySelectorAll<HTMLElement>(".flows > li")].find((li) => li.querySelector(".name")!.textContent === name)!;
@@ -4849,9 +4909,6 @@ describe("flow runs", () => {
 });
 
 describe("flow runs and Claude's state", () => {
-  const settle = async () => {
-    for (let i = 0; i < 6; i++) await flush();
-  };
   const box = () => document.querySelector<HTMLElement>("#flows-box")!;
   const boxError = () => box().querySelector<HTMLElement>(".error")!;
   const output = () => document.querySelector<HTMLButtonElement>(".page.flow-editor.active .run-bar button.output")!;
@@ -5038,9 +5095,6 @@ describe("flow runs and Claude's state", () => {
 });
 
 describe("session history", () => {
-  const settle = async () => {
-    for (let i = 0; i < 6; i++) await flush();
-  };
   const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
   const box = () => document.querySelector<HTMLElement>("#history-box")!;
   const rows = () => [...box().querySelectorAll<HTMLElement>(".sessions > li")];
@@ -5340,7 +5394,7 @@ describe("tab order", () => {
     await startApp();
     for (let i = 0; i < 2; i++) await clickTerminal();
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
-    for (let i = 0; i < 6; i++) await flush();
+    await settle();
     drag(0, 290);
     expect(tabNames()).toEqual(["shell 2", "shell 1", "Settings"]);
   });
@@ -5388,7 +5442,7 @@ describe("tab order", () => {
     mouse(document, "mousemove", 20);
     expect(document.body.classList.contains("dragging-tab")).toBe(true);
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
-    for (let i = 0; i < 6; i++) await flush();
+    await settle();
     mouse(document, "mousemove", 190);
     expect(document.body.classList.contains("dragging-tab")).toBe(false);
     expect(tabNames()).toEqual(["shell 1", "shell 2", "Settings"]);
@@ -5452,8 +5506,7 @@ describe("toolbox order", () => {
     expect(order()).toEqual(["history-box", "flows-box", "workspace-box"]);
     // Let go, it settles into its place.
     expect(document.querySelector<HTMLElement>("#workspace-box")!.style.transform).toBe("");
-    // A fresh app instance on a fresh page.
-    vi.resetModules();
+    // A fresh app on a fresh page.
     await startApp();
     expect(order()).toEqual(["history-box", "flows-box", "workspace-box"]);
   });
@@ -5467,7 +5520,6 @@ describe("toolbox order", () => {
     keyOn("workspace-box", "ArrowDown");
     expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
     expect(document.activeElement).toBe(header("workspace-box"));
-    vi.resetModules();
     await startApp();
     expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
   });
@@ -5477,11 +5529,10 @@ describe("toolbox order", () => {
     drag("history-box", 10);
     header("flows-box").click();
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
-    for (let i = 0; i < 6; i++) await flush();
+    await settle();
     document.querySelector<HTMLButtonElement>("#settings .reset-sidebar")!.click();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
     expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(false);
-    vi.resetModules();
     await startApp();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
     expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(false);
@@ -5513,7 +5564,6 @@ describe("toolbox order", () => {
     localStorage.setItem("misag.toolboxOrder", JSON.stringify(["flows-box", "gone-box"]));
     await startApp();
     expect(order()).toEqual(["flows-box", "workspace-box", "history-box"]);
-    vi.resetModules();
     localStorage.setItem("misag.toolboxOrder", "not json");
     await startApp();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
@@ -5552,7 +5602,6 @@ describe("sidebar width", () => {
     drag(320);
     expect(width()).toBe("320px");
     expect(document.body.classList.contains("resizing-sidebar")).toBe(false);
-    vi.resetModules();
     await startApp();
     expect(width()).toBe("320px");
   });
@@ -5661,7 +5710,6 @@ describe("sidebar width", () => {
     expect(width()).toBe("160px");
     resizer().dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     expect(width()).toBe("240px");
-    vi.resetModules();
     await startApp();
     expect(width()).toBe("240px");
   });
@@ -5671,7 +5719,6 @@ describe("sidebar width", () => {
     drag(400);
     document.querySelector<HTMLButtonElement>("#settings .reset-sidebar")!.click();
     expect(width()).toBe("240px");
-    vi.resetModules();
     await startApp();
     expect(width()).toBe("240px");
   });
@@ -5689,9 +5736,6 @@ describe("sidebar width", () => {
 });
 
 describe("dropping files on the window", () => {
-  const settle = async () => {
-    for (let i = 0; i < 6; i++) await flush();
-  };
   const typed = () => callsOf("pty_write").map((c) => new TextDecoder().decode(new Uint8Array(c.args.data as number[])));
   const dropFiles = async (paths: string[]) => {
     drop.emit!({ type: "drop", paths });
@@ -5786,6 +5830,9 @@ describe("startup and dispose", () => {
   ])("importing main.ts on %s starts nothing and renders nothing", async (_, setUp) => {
     setUp();
     const before = document.body.innerHTML;
+    // Reset the registry so the import below evaluates main.ts again: the static boot
+    // import at the top already evaluated it once.
+    vi.resetModules();
     await import("./main");
     await flush();
     expect(vi.getTimerCount()).toBe(0);
@@ -5827,8 +5874,7 @@ describe("startup and dispose", () => {
 
   test("the Tauri listeners are removed even when they are added after dispose", async () => {
     loadPage();
-    const main = await import("./main");
-    main.boot()();
+    boot()();
     await flush();
     expect(win.unlistened).toBe(1);
     expect(drop.unlistened).toBe(1);
@@ -5839,10 +5885,10 @@ describe("startup and dispose", () => {
     let release!: () => void;
     settingsLoadGate = new Promise((r) => (release = r));
     loadPage();
-    const main = await import("./main");
-    main.boot()();
+    boot()();
     release();
-    for (let i = 0; i < 5; i++) await flush();
+    await settle();
+    await vi.advanceTimersByTimeAsync(HISTORY_POLL_MS);
     expect(callsOf("pty_spawn")).toEqual([]);
     expect(callsOf("fs_list")).toEqual([]);
     expect(tabs()).toEqual([]);
@@ -5870,7 +5916,7 @@ describe("startup and dispose", () => {
     dispose!();
     dispose = null;
     release();
-    for (let i = 0; i < 5; i++) await flush();
+    await settle();
     expect(sounds.played).toEqual([]);
     expect(calls.slice(before)).toEqual([]);
     expect(document.querySelector("#tabs")!.innerHTML).toBe(bar);
@@ -5879,8 +5925,7 @@ describe("startup and dispose", () => {
   test("a boot that throws partway stops what it started, so the page can boot again", async () => {
     loadPage();
     document.querySelector("#flows-box")!.remove();
-    const main = await import("./main");
-    expect(() => main.boot()).toThrow("misag: missing element #flows-box");
+    expect(() => boot()).toThrow("misag: missing element #flows-box");
     expect(resizeDisconnects).toBe(1);
     const width = document.querySelector<HTMLElement>("#sidebar")!.style.getPropertyValue("--sidebar-width");
     Object.defineProperty(window, "innerWidth", { value: 300, configurable: true, writable: true });
@@ -5896,8 +5941,7 @@ describe("startup and dispose", () => {
 
   test("booting twice without dispose throws, and booting again after dispose works", async () => {
     await startApp();
-    const main = await import("./main");
-    expect(() => main.boot()).toThrow("misag: boot called twice");
+    expect(() => boot()).toThrow("misag: boot called twice");
     await startApp();
     await clickTerminal();
     expect(tabNames()).toEqual(["shell 1"]);
