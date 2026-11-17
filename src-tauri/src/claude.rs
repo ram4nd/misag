@@ -51,8 +51,7 @@ pub const WRAPPER_DIR: &str = "bin";
 pub const CLI_DIR: &str = "cli";
 /// Claude Code's cap on Stop-hook continuations in a row (8 by default). Tabs get
 /// it raised above what a flow run can need (each step's prompt up to
-/// `runs::MAX_RUN_STEPS`, then the closing message), with room to spare, so a run
-/// is not cut short; it applies to the user's own Stop hooks in those tabs too.
+/// `runs::MAX_RUN_STEPS`), with room to spare, so a run is not cut short; it applies to the user's own Stop hooks in those tabs too.
 pub const STOP_CAP_ENV: &str = "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP";
 pub const STOP_CAP: u32 = 60;
 /// Hook context longer than this reaches Claude only as a preview, so a longer
@@ -470,9 +469,10 @@ enum Outcome {
     Stopped(Option<String>),
     /// Recorded that a session ended, so its tab waits on no background tasks.
     Ended,
-    /// Handled the person's prompt (see `runs::on_prompt`). It prints nothing, as
-    /// a UserPromptSubmit hook's output is added to Claude's context.
-    Prompted,
+    /// Handled the person's prompt (see `runs::on_prompt`), with the hook output
+    /// that adds a finished flow's note to Claude's context, if one is owed. It
+    /// prints nothing else, as a UserPromptSubmit hook's output reaches Claude.
+    Prompted(Option<String>),
 }
 
 /// The hook output that has Claude go on with `prompt`. Context rather than a
@@ -480,12 +480,16 @@ enum Outcome {
 /// limit on continuations applies); but context past `MAX_CONTEXT` would reach
 /// Claude only as a preview, so a longer prompt is a block reason.
 fn continuation(prompt: &str) -> String {
-    let output = if prompt.chars().count() > MAX_CONTEXT {
-        serde_json::json!({ "decision": "block", "reason": prompt })
+    if prompt.chars().count() > MAX_CONTEXT {
+        serde_json::json!({ "decision": "block", "reason": prompt }).to_string()
     } else {
-        serde_json::json!({ "hookSpecificOutput": { "hookEventName": "Stop", "additionalContext": prompt } })
-    };
-    output.to_string()
+        context("Stop", prompt)
+    }
+}
+
+/// The hook output that adds `text` to Claude's context at hook event `event`.
+fn context(event: &str, text: &str) -> String {
+    serde_json::json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } }).to_string()
 }
 
 /// After Claude ended a turn, records whether it waits on background tasks, then
@@ -526,15 +530,19 @@ fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
     db::record_background(&conn, tab_id, &event.session_id, false)
 }
 
-/// Tells the tab's flow run, if any, that the person sent a prompt.
-/// If it cannot, a run waiting at a manual prompt waits for the person instead,
-/// as it would never see Claude's answer.
-fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
-    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(()) };
+/// Tells the tab's flow run, if any, that the person sent a prompt; returns the
+/// hook output that adds a finished flow's note to Claude's context, if one is
+/// owed. If it cannot, a run waiting at a manual prompt waits for the person
+/// instead, as it would never see Claude's answer.
+fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
+    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
     let told = serde_json::from_str::<PromptSubmit>(input)
         .map_err(|e| format!("bad hook payload: {e}"))
         .and_then(|event| crate::runs::on_prompt(&mut conn, tab_id, &event.prompt));
-    let Err(e) = told else { return Ok(()) };
+    let e = match told {
+        Ok(note) => return Ok(note.map(|note| context("UserPromptSubmit", &note))),
+        Err(e) => e,
+    };
     let why = format!("misag could not record your prompt ({e}), so Claude's answer will not move the run on. Pick an output to go on.");
     match crate::runs::prompt_unseen(&mut conn, tab_id, &why) {
         Ok(()) => Err(e),
@@ -545,7 +553,8 @@ fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
 /// Reads one hook payload from `input`: a SessionStart is recorded for `tab_id`,
 /// with the Claude process that sent it, a Stop records the background tasks and
 /// moves the tab's flow run on, a SessionEnd forgets the background tasks, and a
-/// UserPromptSubmit tells a run waiting at a manual prompt that the person sent it.
+/// UserPromptSubmit tells a run waiting at a manual prompt that the person sent it
+/// (and hands Claude a finished flow's note, if one is owed).
 fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<Outcome, String> {
     let (Some(tab_id), Some(db_path)) = (tab_id, db_path) else {
         return Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}"));
@@ -560,7 +569,7 @@ fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, cl
             .map(Outcome::Stopped)
             .map_err(|e| format!("could not move the flow run on: {e}")),
         Some("UserPromptSubmit") => prompted(&payload, tab_id, db_path)
-            .map(|()| Outcome::Prompted)
+            .map(Outcome::Prompted)
             .map_err(|e| format!("could not tell the flow run about the prompt: {e}")),
         Some("SessionEnd") => ended(&payload, tab_id, db_path)
             .map(|()| Outcome::Ended)
@@ -691,8 +700,8 @@ pub fn run_hook() -> i32 {
             tab_id.as_ref(),
             &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
         ),
-        Ok(Outcome::Recorded | Outcome::Stopped(None) | Outcome::Ended | Outcome::Prompted) => {}
-        Ok(Outcome::Stopped(Some(output))) => println!("{output}"),
+        Ok(Outcome::Recorded | Outcome::Stopped(None) | Outcome::Ended | Outcome::Prompted(None)) => {}
+        Ok(Outcome::Stopped(Some(output)) | Outcome::Prompted(Some(output))) => println!("{output}"),
     }
     0
 }
@@ -1172,7 +1181,7 @@ mod tests {
         crate::runs::on_stop(&mut conn, &tid("tab-1"), Some("Ready")).unwrap();
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit","prompt":"Fix it"}}"#);
         // Nothing is printed: a UserPromptSubmit hook's output would reach Claude.
-        assert_eq!(hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap(), Outcome::Prompted);
+        assert_eq!(hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap(), Outcome::Prompted(None));
         assert_eq!(crate::runs::active(&conn).unwrap()[0].status, crate::runs::Status::Running);
     }
 

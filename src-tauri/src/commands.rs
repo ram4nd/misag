@@ -777,9 +777,8 @@ pub fn flow_resume(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<St
     Ok(db.resume_run(run_id, &step_id)?)
 }
 
-/// Stops the run; returns what to tell Claude, for the page to send if Claude is idle (see `runs::stop`).
 #[tauri::command(async)]
-pub fn flow_stop(db: State<'_, Db>, run_id: i64) -> Result<Option<String>, CommandError> {
+pub fn flow_stop(db: State<'_, Db>, run_id: i64) -> Result<(), CommandError> {
     Ok(db.stop_run(run_id)?)
 }
 

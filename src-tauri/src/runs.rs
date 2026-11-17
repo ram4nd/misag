@@ -3,8 +3,9 @@
 //! A run starts at the flow's Start step and moves along outputs. It first briefs
 //! Claude (the run's rules and Start's base info) and waits at Start for Claude's
 //! reply, "Ready", which takes the first step (see `on_stop`); a flow that leads
-//! straight to its end skips that. A prompt step
-//! sends its text to Claude; when Claude ends its turn, the Stop hook
+//! straight to its end skips that. A briefing with no reply within
+//! `BRIEFING_TIMEOUT_SECS` (Claude was interrupted, or crashed) waits for the
+//! person (see `active`). A prompt step sends its text to Claude; when Claude ends its turn, the Stop hook
 //! (`misag --claude-hook`, a separate process) reads the `FLOW: <output>` line
 //! Claude ended with and moves on, handing Claude the next prompt as hook context.
 //! A pause waits for the person, who goes on by its one output (▶ in the Flows
@@ -12,12 +13,13 @@
 //! Start's base info after a clear) into Claude's input without sending it
 //! (`prefill_text`, `prefilled`); the person's own prompt, reported by the
 //! UserPromptSubmit hook (`on_prompt`), has the step run, and Claude's answer
-//! moves it on by its one output, with no `FLOW:` line. ▶ skips it. A reply the runner cannot follow waits too: the
-//! person picks an output in the editor's run bar (and can do so for a running
-//! step too, if Claude was interrupted) or has Claude go on with the step. A pick or Continue names the step it was made for, so one that
-//! arrives after the run moved on is refused. An output with no next step, or an
-//! End step, ends the run, and the run then tells Claude the flow is finished
-//! (see `closing`), as does stopping it.
+//! moves it on by its one output, with no `FLOW:` line. ▶ skips it. A reply the
+//! runner cannot follow waits too: the person picks an output in the editor's run
+//! bar (and can do so for a running step too, if Claude was interrupted) or has
+//! Claude go on with the step. A pick or Continue names the step it was made for,
+//! so one that arrives after the run moved on is refused. An output with no next
+//! step, or an End step, ends the run; that, or stopping it, has Claude told the
+//! flow is finished with the person's next prompt (see `owe_closing`).
 //!
 //! A flow whose Start clears begins in the tab's new conversation: its run holds
 //! the tab at Start while the app types `/clear`, the SessionStart hook reports the
@@ -45,6 +47,11 @@ pub const MAX_RUN_STEPS: i64 = 50;
 /// person: the app's own 30 seconds (`CLEAR_TIMEOUT_MS` in src/main.ts, after which
 /// it stops the run, saying why), and a little more, so its stop comes first.
 pub const CLEAR_TIMEOUT_SECS: i64 = 35;
+
+/// How long a run waits at Start for Claude's reply to its briefing, which asks
+/// only for "Ready", before it waits for the person: Claude was interrupted (which
+/// runs no Stop hook) or failed.
+pub const BRIEFING_TIMEOUT_SECS: i64 = 120;
 
 /// Its active statuses are mirrored by `RunStatus` in src/flows.ts.
 #[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,13 +340,21 @@ fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
     Ok(earlier + i64::from(run.node_id == step))
 }
 
-/// What run `run` tells Claude as it ends: that the flow is finished, if Claude has
-/// the run's rules (not after a clear, or while the run clears at its start).
-fn closing(conn: &Connection, run: &Stored) -> Result<Option<String>, String> {
-    if !run.briefed || run.clear.is_some() {
-        return Ok(None);
-    }
-    Ok(Some(flows::closing_text(&flow_name(conn, run.id)?)))
+/// Whether an ending run owes Claude the note that its flow is finished: Claude has
+/// the run's rules (`briefed`; not after a clear, or while the run clears at its start).
+const OWES_CLOSING: &str = "briefed = 1 AND clear IS NULL";
+
+/// Has run `run_id`, ending, tell Claude the flow is finished with the person's
+/// next prompt (see `on_prompt`), if it owes that (`OWES_CLOSING`); call it before
+/// `set`, which drops the run's clear. Nothing is typed and no turn is spent:
+/// stopping must not send into a turn or a permission prompt.
+fn owe_closing(conn: &Connection, run_id: i64) -> Result<(), String> {
+    conn.execute(&format!("UPDATE flow_runs SET closing = 1 WHERE id = ?1 AND {OWES_CLOSING}"), [run_id]).map(drop).map_err(sql)
+}
+
+/// Drops the note owed to Claude in tab `tab_id` that a flow is finished.
+fn drop_closing(conn: &Connection, tab_id: &TabId) -> Result<(), String> {
+    conn.execute("UPDATE flow_runs SET closing = 0 WHERE tab_id = ?1 AND closing = 1", [tab_id.as_str()]).map(drop).map_err(sql)
 }
 
 /// The name of run `run_id`'s flow, for Claude.
@@ -386,7 +401,7 @@ fn first_turn(tx: &Transaction, run_id: i64, graph: &Graph, start: &Node) -> Res
 
 /// Moves the run from `from` along `output` to the step it leads to, if any, with
 /// the run's step count at `steps`; returns the prompt to send when that is a
-/// prompt step. The run instead waits at `from` for the person when going on
+/// prompt step (a run that ends sends nothing; see `owe_closing`). The run instead waits at `from` for the person when going on
 /// would pass `MAX_RUN_STEPS` (into a prompt step) or, for `By::Flow` only, when
 /// the next step has already run its `max_runs`.
 fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by: By) -> Result<Option<String>, String> {
@@ -409,14 +424,14 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
     }
     left(tx, run.id, &from.id, output)?;
     // Done: Claude, if it has the run's rules, is told it no longer needs to end
-    // its replies with a FLOW line.
-    let finish = |at: &str| -> Result<Option<String>, String> {
-        set(tx, run.id, at, Status::Done, steps, None)?;
-        closing(tx, run)
+    // its replies with a FLOW line, with the person's next prompt.
+    let finish = |at: &str| -> Result<(), String> {
+        owe_closing(tx, run.id)?;
+        set(tx, run.id, at, Status::Done, steps, None)
     };
     let Some(next) = next else {
         // The output leads nowhere: the flow is done.
-        return finish(&from.id);
+        return finish(&from.id).map(|()| None);
     };
     match next.kind {
         Kind::Prompt => {
@@ -429,7 +444,7 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
             owe_prefill(tx, run.id, &run.graph, next, run.briefed)?;
             Ok(None)
         }
-        Kind::End | Kind::Start => finish(&next.id),
+        Kind::End | Kind::Start => finish(&next.id).map(|()| None),
     }
 }
 
@@ -452,6 +467,8 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
         return Err(format!("the flow is not ready to run: {}", problems.join(" ")));
     }
     let start = graph.nodes.iter().find(|n| n.kind == Kind::Start).ok_or("the flow has no Start step")?.clone();
+    // The new run's briefing supersedes an earlier run's note that it is finished.
+    drop_closing(&tx, tab_id)?;
     let now = now();
     let clear = flows::clears(&graph);
     let inserted = tx.execute(
@@ -672,32 +689,43 @@ pub fn prefilled(conn: &mut Connection, run_id: i64, step_id: &str, token: i64) 
 /// a run waiting at a manual prompt runs it, so Claude's answer moves it on (see
 /// `on_stop`). Claude has Start's base info if the prompt carried it. A slash
 /// command is not a prompt to Claude, and prompts at any other step change nothing.
-pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<(), String> {
+/// Returns what to add to Claude's context with the prompt: that a flow which ran
+/// in the tab is finished, owed since it ended (see `owe_closing`).
+pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<Option<String>, String> {
     if prompt.trim_start().starts_with('/') {
-        return Ok(());
+        return Ok(None);
     }
     // Every prompt in every tab comes here: look before taking the write lock.
     let waiting = conn
         .query_row(
-            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status IN ('manual', 'attention')",
+            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status IN ('manual', 'attention')
+             UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
             [tab_id.as_str()],
             |_| Ok(()),
         )
         .optional()
         .map_err(sql)?;
     if waiting.is_none() {
-        return Ok(());
+        return Ok(None);
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-    let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(()) };
-    let node = run.node()?;
-    if !awaits_prompt(&run, node) {
-        return Ok(());
+    // A finished run's note goes along with this prompt, once (a tab owes at most
+    // one, as a new run drops it).
+    let finished: Option<i64> = tx
+        .query_row("UPDATE flow_runs SET closing = 0 WHERE tab_id = ?1 AND closing = 1 RETURNING id", [tab_id.as_str()], |r| r.get(0))
+        .optional()
+        .map_err(sql)?;
+    let closing = finished.map(|run| flow_name(&tx, run)).transpose()?.map(|name| flows::closing_text(&name));
+    if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
+        let node = run.node()?;
+        if awaits_prompt(&run, node) {
+            // The prompt may carry Start's base info, but never the run's rules: after a
+            // clear, the next prompt step still briefs Claude again.
+            set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
+        }
     }
-    // The prompt may carry Start's base info, but never the run's rules: after a
-    // clear, the next prompt step still briefs Claude again.
-    set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
-    tx.commit().map_err(sql)
+    tx.commit().map_err(sql)?;
+    Ok(closing)
 }
 
 /// The UserPromptSubmit hook could not record the person's prompt in tab `tab_id`:
@@ -780,13 +808,15 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Strin
 }
 
 /// Claude in tab `tab_id` cleared its conversation: a run waiting for that clear
-/// can take its first step (see `cleared`); a running step will get no reply, so
+/// can send its briefing (see `cleared`); a running step will get no reply, so
 /// its run waits for the person, saying `why` (see `pause_tab`). Either way, the
-/// run's next prompt carries its rules and Start's base info again.
+/// run's next prompt carries its rules and Start's base info again. A finished
+/// run's note is dropped, as Claude no longer has the flow's rules.
 pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     tx.execute(&format!("UPDATE flow_runs SET briefed = 0 WHERE tab_id = ?1 AND status IN {ACTIVE}"), [tab_id.as_str()])
         .map_err(sql)?;
+    drop_closing(&tx, tab_id)?;
     let changed = tx
         .execute(
             "UPDATE flow_runs SET clear = 'done', updated_at = ?2 WHERE tab_id = ?1 AND status = 'running' AND clear = 'pending'",
@@ -811,7 +841,9 @@ pub fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
 fn pause(conn: &Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     answer_lost(conn, tab_id.as_str(), why)?;
     conn.execute(
-        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', briefing = 0, updated_at = ?3 WHERE tab_id = ?1 AND status = 'running' AND clear IS NULL",
+        // Claude may not have read a briefing it was given: the first step carries it again.
+        "UPDATE flow_runs SET status = 'attention', note = ?2, resume = 'prompt', briefed = CASE WHEN briefing = 1 THEN 0 ELSE briefed END,
+         briefing = 0, updated_at = ?3 WHERE tab_id = ?1 AND status = 'running' AND clear IS NULL",
         params![tab_id.as_str(), why, now()],
     )
     .map(drop)
@@ -839,7 +871,7 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
     };
     for tab in tabs {
         if open_tabs.iter().any(|open| open.as_str() == tab) {
-            // The app that would have taken the first step after the clear is gone.
+            // The app that would have sent the briefing after the clear is gone.
             tx.execute(
                 "UPDATE flow_runs SET status = 'attention', note = ?2, resume = NULL, clear = NULL, updated_at = ?3
                  WHERE tab_id = ?1 AND status = 'running' AND clear IS NOT NULL",
@@ -872,31 +904,41 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
     tx.commit().map_err(sql)
 }
 
-/// Stops run `run_id`; returns what to tell Claude (see `closing`), for the app to
-/// send if Claude is idle.
-pub fn stop(conn: &Connection, run_id: i64) -> Result<Option<String>, String> {
-    let Some(run) = active_run(conn, "id = ?1", &run_id)? else { return Err(format!("there is no active run {run_id}")) };
-    conn.execute(
-        &format!("UPDATE flow_runs SET status = 'stopped', updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
-        params![run_id, now()],
-    )
-    .map_err(sql)?;
-    closing(conn, &run)
+/// Stops run `run_id`, which has Claude told the flow is finished with the
+/// person's next prompt (see `owe_closing`). A run whose steps cannot be read can
+/// still be stopped.
+pub fn stop(conn: &Connection, run_id: i64) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            &format!("UPDATE flow_runs SET status = 'stopped', closing = ({OWES_CLOSING}), updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
+            params![run_id, now()],
+        )
+        .map_err(sql)?;
+    if changed != 1 {
+        return Err(format!("there is no active run {run_id}"));
+    }
+    Ok(())
 }
 
-/// How many of `graph`'s steps (all but Start and End) run `run` has left, each
-/// counted once, so loops do not add to it; and how many steps there are.
+/// How many of `graph`'s steps (all but Start and End, and steps Start cannot
+/// reach, which never run) run `run` has finished, each counted once, so loops do
+/// not add to it; and how many steps there are. Branches the run did not take
+/// stay unfinished, so a run may end short of the total.
 fn progress(conn: &Connection, run: i64, graph: &Graph) -> Result<(i64, i64), String> {
-    let step = |n: &&Node| !matches!(n.kind, Kind::Start | Kind::End);
+    let Some(start) = graph.nodes.iter().find(|n| n.kind == Kind::Start) else { return Ok((0, 0)) };
+    let reached = flows::reachable(graph, start);
     let mut stmt = conn.prepare_cached("SELECT DISTINCT node_id FROM flow_run_events WHERE run_id = ?1").map_err(sql)?;
     let left = stmt
         .query_map([run], |r| r.get::<_, String>(0))
         .map_err(sql)?
         .collect::<Result<HashSet<_>, _>>()
         .map_err(sql)?;
-    let total = graph.nodes.iter().filter(step).count();
-    let done = graph.nodes.iter().filter(step).filter(|n| left.contains(&n.id)).count();
-    Ok((i64::try_from(done).unwrap_or(i64::MAX), i64::try_from(total).unwrap_or(i64::MAX)))
+    let (done, total) = graph
+        .nodes
+        .iter()
+        .filter(|n| !matches!(n.kind, Kind::Start | Kind::End) && reached.contains(n.id.as_str()))
+        .fold((0, 0), |(done, total), n| (done + i64::from(left.contains(&n.id)), total + 1));
+    Ok((done, total))
 }
 
 /// Every active run, oldest first. A run still at Start `CLEAR_TIMEOUT_SECS` after
@@ -910,6 +952,17 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
             "Claude did not clear the conversation within 30 seconds. Pick an output to go on without clearing, or stop the run and press ▶ again.",
             now(),
             CLEAR_TIMEOUT_SECS
+        ],
+    )
+    .map_err(sql)?;
+    // Claude may not have read the briefing: the first step carries it again.
+    conn.execute(
+        "UPDATE flow_runs SET status = 'attention', note = ?1, resume = NULL, briefing = 0, briefed = 0, updated_at = ?2
+         WHERE status = 'running' AND briefing = 1 AND updated_at <= ?2 - ?3",
+        params![
+            "Claude did not reply to the flow's briefing within 2 minutes (it may have been interrupted). Pick an output to go on; the first step briefs Claude again.",
+            now(),
+            BRIEFING_TIMEOUT_SECS
         ],
     )
     .map_err(sql)?;
@@ -945,8 +998,12 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
         .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume, clear, prefill, briefing)| {
             // A run that cannot be read is still listed, saying why, so it can be stopped.
             let graph = parse_graph(&graph);
+            // Only shown, so a failure to count leaves the run listed, and stoppable.
             let (done, total) = match &graph {
-                Ok(graph) => progress(conn, id, graph)?,
+                Ok(graph) => progress(conn, id, graph).unwrap_or_else(|e| {
+                    eprintln!("misag: could not count the steps run {id} has done: {e}");
+                    (0, 0)
+                }),
                 Err(_) => (0, 0),
             };
             let node = graph.and_then(|graph| {
@@ -1051,7 +1108,7 @@ mod tests {
         assert_eq!(started.prompt, Some(flows::briefing_text(&g, "F")));
         let run = only_run(&conn);
         assert_eq!((run.step_id.as_str(), run.status, run.steps), ("start", Status::Running, 0));
-        // Whatever Claude replies, the first step follows, without the base info it has.
+        // "Ready" takes the first step, without the base info Claude has.
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Ready")).unwrap(), prompt_of(&g, "p"));
         assert_eq!(only_run(&conn).steps, 1);
     }
@@ -1139,16 +1196,40 @@ mod tests {
     }
 
     #[test]
-    fn stopping_a_briefed_run_tells_claude_the_flow_is_finished() {
+    fn a_stopped_briefed_run_tells_claude_with_the_person_s_next_prompt() {
         let (_db, mut conn, flow) = setup("runs-stop-closing", &runnable());
         let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-        assert_eq!(stop(&conn, run).unwrap(), finished());
+        stop(&conn, run).unwrap();
+        assert!(stop(&conn, run).unwrap_err().contains("no active run"));
+        // A slash command is not a message to Claude, so it does not carry it.
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "/model").unwrap(), None);
+        assert_eq!(on_prompt(&mut conn, &tab("t2"), "Hi").unwrap(), None, "another tab");
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), finished());
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "And now?").unwrap(), None, "once");
+        // Claude got the briefing even if it has yet to reply.
+        let (_db, mut conn, flow) = setup("runs-stop-briefing", &runnable());
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        stop(&conn, run).unwrap();
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), finished());
         // A run still clearing never briefed Claude.
         let mut g = runnable();
         g.nodes[0].clear = true;
         let (_db, mut conn, flow) = setup("runs-stop-clearing", &g);
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
-        assert_eq!(stop(&conn, run).unwrap(), None);
+        stop(&conn, run).unwrap();
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), None);
+    }
+
+    #[test]
+    fn a_new_run_or_a_clear_drops_the_finished_flow_s_note() {
+        let (_db, mut conn, flow) = setup("runs-closing-dropped", &runnable());
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        stop(&conn, run).unwrap();
+        // The new run's briefing supersedes it.
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        stop(&conn, run).unwrap();
+        clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), None);
     }
 
     #[test]
@@ -1158,24 +1239,50 @@ mod tests {
         clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
         assert_eq!(pick(&mut conn, run, "pass").unwrap(), None);
         assert!(active(&conn).unwrap().is_empty());
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), None);
     }
 
     #[test]
-    fn the_end_of_a_run_tells_claude_the_flow_is_finished() {
+    fn the_end_of_a_run_tells_claude_with_the_person_s_next_prompt_and_costs_no_turn() {
         let g = runnable();
         let (_db, mut conn, flow) = setup("runs-closing", &g);
         begin(&mut conn, flow, &tab("t1")).unwrap();
-        // "pass" leads to the End step.
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap(), Some(flows::closing_text("F")));
+        // "pass" leads to the End step: Claude is not made to reply again.
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap(), None);
         assert!(active(&conn).unwrap().is_empty());
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), finished());
         // So does an output that leads nowhere, and the person's pick.
         let g = graph(vec![node("p", Kind::Prompt, &["done"])], vec![edge("start", "next", "p")]);
         let (_db, mut conn, flow) = setup("runs-closing-nowhere", &g);
         let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-        assert_eq!(pick(&mut conn, run, "done").unwrap(), Some(flows::closing_text("F")));
+        assert_eq!(pick(&mut conn, run, "done").unwrap(), None);
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), finished());
     }
 
-    /// What a run sends Claude as it ends.
+    #[test]
+    fn a_briefing_with_no_reply_waits_for_the_person_and_the_first_step_briefs_again() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-briefing-timeout", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        assert!(only_run(&conn).briefing);
+        // As if Claude was interrupted (no Stop) long enough ago.
+        conn.execute("UPDATE flow_runs SET updated_at = updated_at - ?1", [BRIEFING_TIMEOUT_SECS + 1]).unwrap();
+        let waiting = only_run(&conn);
+        assert_eq!((waiting.status, waiting.briefing, waiting.outputs.clone()), (Status::Attention, false, vec!["next".to_string()]));
+        assert!(waiting.note.as_deref().unwrap().contains("briefing"), "{:?}", waiting.note);
+        assert_eq!(pick(&mut conn, run, "next").unwrap(), Some(flows::first_prompt_text(&g, "F", &g.nodes[1])));
+    }
+
+    #[test]
+    fn a_failed_stop_hook_during_the_briefing_has_the_first_step_brief_again() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-briefing-pause", &g);
+        let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        pause_tab(&mut conn, &tab("t1"), "The Stop hook failed.").unwrap();
+        assert_eq!(pick(&mut conn, run, "next").unwrap(), Some(flows::first_prompt_text(&g, "F", &g.nodes[1])));
+    }
+
+    /// What Claude is told with the person's next prompt once a run has ended.
     fn finished() -> Option<String> {
         Some(flows::closing_text("F"))
     }
@@ -1295,8 +1402,14 @@ mod tests {
     #[test]
     fn a_run_counts_its_finished_steps_once_each_out_of_the_flow_s_steps() {
         // Start → pause m → prompt p (fail loops to p, pass → End).
+        // Step u is not reachable from Start, so it never runs and is not counted.
         let g = graph(
-            vec![node("m", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["pass", "fail"]), node("end", Kind::End, &[])],
+            vec![
+                node("m", Kind::Pause, &["ok"]),
+                node("p", Kind::Prompt, &["pass", "fail"]),
+                node("end", Kind::End, &[]),
+                node("u", Kind::Prompt, &["done"]),
+            ],
             vec![edge("start", "next", "m"), edge("m", "ok", "p"), edge("p", "pass", "end"), edge("p", "fail", "p")],
         );
         let (_db, mut conn, flow) = setup("runs-progress", &g);
@@ -1333,7 +1446,7 @@ mod tests {
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Broken.\nFLOW: fail")).unwrap(), prompt_of(&g, "p"));
         assert_eq!(only_run(&conn).steps, 2);
         // pass leads to End, which finishes the run.
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("All good.\nFLOW: pass")).unwrap(), finished());
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("All good.\nFLOW: pass")).unwrap(), None, "a run that ends sends nothing");
         assert!(active(&conn).unwrap().is_empty());
         let status: String = conn.query_row("SELECT status FROM flow_runs", [], |r| r.get(0)).unwrap();
         assert_eq!(status, "done");
@@ -1348,7 +1461,7 @@ mod tests {
         let g = graph(vec![node("p", Kind::Prompt, &["done", "again"])], vec![edge("start", "next", "p"), edge("p", "again", "p")]);
         let (_db, mut conn, flow) = setup("runs-run-out", &g);
         begin(&mut conn, flow, &tab("t1")).unwrap();
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap(), finished());
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap(), None, "a run that ends sends nothing");
         assert!(active(&conn).unwrap().is_empty());
     }
 
@@ -1492,7 +1605,7 @@ mod tests {
         assert_eq!(paste(&mut conn, run).as_deref(), Some("Now ask about "), "Claude has the base info");
         on_prompt(&mut conn, &tab("t1"), "Now ask about it").unwrap();
         // The flow ends after the person's prompt is answered.
-        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Answer.")).unwrap(), finished());
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Answer.")).unwrap(), None, "a run that ends sends nothing");
         assert!(active(&conn).unwrap().is_empty());
     }
 
@@ -1641,7 +1754,7 @@ mod tests {
         begin(&mut conn, flow, &tab("t1")).unwrap();
         let run = only_run(&conn);
         assert_eq!(pick(&mut conn, run.id, "fail").unwrap(), prompt_of(&g, "p"));
-        assert_eq!(pick(&mut conn, run.id, "pass").unwrap(), finished());
+        assert_eq!(pick(&mut conn, run.id, "pass").unwrap(), None, "a run that ends sends nothing");
         assert!(active(&conn).unwrap().is_empty());
     }
 
@@ -1776,6 +1889,10 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert!(runs[0].note.as_deref().unwrap().contains("cannot be read"));
         assert!(runs[0].outputs.is_empty());
+        assert_eq!((runs[0].done, runs[0].total), (0, 0));
+        // It can still be stopped.
+        stop(&conn, runs[0].id).unwrap();
+        assert_eq!(active(&conn).unwrap().len(), 1);
     }
 
     #[test]
@@ -1789,7 +1906,7 @@ mod tests {
     #[test]
     fn misag_s_step_limit_stays_below_claude_code_s() {
         // A run's Stop-hook continuations in a row: each step's prompt (the first
-        // follows the briefing's reply) and the closing message, with room to spare.
+        // follows the briefing's reply), with room to spare.
         assert!(MAX_RUN_STEPS + 1 < i64::from(crate::claude::STOP_CAP));
     }
 
@@ -1818,7 +1935,7 @@ mod tests {
         assert!(!resumed.resumable);
         assert_eq!((resumed.status, resumed.note, resumed.step_id.as_str(), resumed.steps), (Status::Running, None, "p", run.steps));
         // Claude's reply moves it on as usual.
-        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: pass")).unwrap(), finished());
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: pass")).unwrap(), None, "a run that ends sends nothing");
         assert!(active(&conn).unwrap().is_empty());
         // Only a prompt step that needs attention is resumed.
         let (_db, mut conn, flow) = setup("runs-resume-manual", &manual_first());
@@ -1962,7 +2079,7 @@ mod tests {
         assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), None);
         assert_eq!(only_run(&conn).status, Status::Attention);
         assert_eq!(pick(&mut conn, run.id, "done").unwrap(), prompt_of(&g, "review"));
-        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: clean")).unwrap(), finished());
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: clean")).unwrap(), None, "a run that ends sends nothing");
         assert!(active(&conn).unwrap().is_empty());
     }
 

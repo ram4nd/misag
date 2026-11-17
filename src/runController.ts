@@ -306,9 +306,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     }
     flows.showBoxError(null);
     if (!started.clear) {
-      if (started.prompt !== null && !(await typePrompt(tab, started.prompt))) {
-        flows.showBoxError(`${notSent(tab)}. Start Claude there and pick an output to go on, or stop the run.`);
-      }
+      if (started.prompt !== null && !(await typePrompt(tab, started.prompt))) await briefingUnsent(tab, flow, started.runId);
       return;
     }
     await poll();
@@ -334,16 +332,22 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       // Stopped meanwhile: nothing to do.
       if (cleared.state === "gone") return;
       if (cleared.state === "ready") {
-        if (cleared.prompt !== null && !(await typePrompt(tab, cleared.prompt))) {
-          flows.showBoxError(`${notSent(tab)}. Start Claude there and pick an output to go on, or stop the run.`);
-        }
+        if (cleared.prompt !== null && !(await typePrompt(tab, cleared.prompt))) await briefingUnsent(tab, flow, started.runId);
         return;
       }
     }
     await stopStart(started.runId, `Claude did not clear the conversation in ${opts.label(tab)} within ${CLEAR_TIMEOUT_MS / 1000} seconds, so "${flow.name}" was stopped; press ▶ again when it is idle.`);
   }
 
-  /** Stops a run whose start could not go through its clear, saying why. */
+  /**
+   * Stops a run whose briefing could not be sent: the run waits for Claude's reply
+   * to it, which will not come, and nothing else moves it on.
+   */
+  function briefingUnsent(tab: T, flow: Flow, runId: number) {
+    return stopStart(runId, `${notSent(tab)}, so "${flow.name}" was stopped; start Claude there and press ▶ again.`);
+  }
+
+  /** Stops a run whose start could not go through its clear or send its briefing, saying why. */
   async function stopStart(runId: number, why: string) {
     try {
       await invoke("flow_stop", { runId });
@@ -371,12 +375,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
           await clearPaste(tab);
           return next;
         });
-        if (prompt !== null && !(await typePrompt(tab, prompt))) {
-          await poll();
-          // A run that finished only had its closing message for Claude.
-          const goesOn = runs.some((r) => r.id === run.id);
-          error = goesOn ? `${notSent(tab)}; start Claude there and go on again.` : `${notSent(tab)}; the run has finished.`;
-        }
+        if (prompt !== null && !(await typePrompt(tab, prompt))) error = `${notSent(tab)}; start Claude there and go on again.`;
       } catch (err) {
         console.error("misag: could not continue the run", err);
         error = `Could not go on: ${opts.errorText(err)}`;
@@ -388,14 +387,12 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
 
   async function stop(run: Run) {
     try {
-      const closing = await invoke<string | null>("flow_stop", { runId: run.id });
+      // Claude is told the flow is finished with the person's next prompt (the
+      // UserPromptSubmit hook), so nothing is typed into a turn or a permission prompt.
+      await invoke("flow_stop", { runId: run.id });
       flows.showBoxError(null);
       const tab = opts.tabs().find((t) => t.tabId === run.tabId);
-      if (tab) {
-        await withLock(tab, () => clearPaste(tab));
-        // Claude, briefed, is told the flow is finished; not in the middle of a turn.
-        if (closing !== null && !opts.busy(tab)) await typePrompt(tab, closing);
-      }
+      if (tab) await withLock(tab, () => clearPaste(tab));
     } catch (err) {
       console.error("misag: could not stop the run", err);
       flows.showBoxError(`Could not stop the run: ${opts.errorText(err)}`);

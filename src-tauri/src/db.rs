@@ -181,6 +181,12 @@ const MIGRATIONS: &[&str] = &[r#"
     -- 1 while a run waits at Start for Claude's reply to its briefing (see
     -- runs::on_stop): only that reply takes the first step.
     ALTER TABLE flow_runs ADD COLUMN briefing INTEGER NOT NULL DEFAULT 0 CHECK (briefing IN (0, 1));
+"#, r#"
+    -- 1 on a finished or stopped run whose Claude has yet to be told the flow is
+    -- finished, which comes with the person's next prompt (see runs::on_prompt).
+    ALTER TABLE flow_runs ADD COLUMN closing INTEGER NOT NULL DEFAULT 0 CHECK (closing IN (0, 1));
+    -- Every prompt in every tab looks for a note owed there.
+    CREATE INDEX flow_runs_closing ON flow_runs (tab_id) WHERE closing = 1;
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -945,7 +951,7 @@ impl Db {
         runs::resume(&mut self.conn(), run_id, step_id)
     }
 
-    pub fn stop_run(&self, run_id: i64) -> Result<Option<String>, String> {
+    pub fn stop_run(&self, run_id: i64) -> Result<(), String> {
         runs::stop(&self.conn(), run_id)
     }
 

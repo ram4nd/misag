@@ -185,14 +185,43 @@ fn hooks_and_layout_saves_can_run_at_the_same_time() {
 
 /// Runs the hook for a Stop event and returns what it printed for Claude.
 fn run_stop_hook(env: &[(&str, &str)], reply: &str) -> String {
-    let payload = serde_json::json!({
+    hook_output(env, serde_json::json!({
         "session_id": SESSION, "hook_event_name": "Stop", "stop_hook_active": false, "last_assistant_message": reply,
-    });
+    }))
+}
+
+/// Runs the hook for a UserPromptSubmit event and returns what it printed for Claude.
+fn run_prompt_hook(env: &[(&str, &str)], prompt: &str) -> String {
+    hook_output(env, serde_json::json!({ "session_id": SESSION, "hook_event_name": "UserPromptSubmit", "prompt": prompt }))
+}
+
+/// Runs the hook with `payload`, which must succeed, and returns what it printed.
+fn hook_output(env: &[(&str, &str)], payload: serde_json::Value) -> String {
     let mut child = start_hook(Path::new(env!("CARGO_BIN_EXE_misag")), env, &payload.to_string());
     let mut out = String::new();
     std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
     assert!(child.wait().unwrap().success());
     out
+}
+
+#[test]
+fn a_reply_to_the_briefing_that_does_more_waits_for_the_person() {
+    use misag_lib::{flows, runs};
+    let dir = temp_dir("hook-briefing-eager");
+    let (app, db_path) = app_db(&dir);
+    let graph: flows::Graph = serde_json::from_value(serde_json::json!({ "version": 1, "nodes": [
+        { "id": "start", "kind": "start", "title": "Start", "outputs": ["next"], "x": 0, "y": 0 },
+        { "id": "p", "kind": "prompt", "title": "Fix", "text": "Fix the tests.", "outputs": ["pass"], "x": 0, "y": 0 }
+    ], "edges": [{ "from": "start", "output": "next", "to": "p" }] }))
+    .unwrap();
+    let flow = app.create_flow("F").unwrap().id;
+    app.save_flow_graph(flow, &graph).unwrap();
+    let mut conn = db::connect_existing(&db_path).unwrap();
+    runs::start(&mut conn, flow, &TabId::parse("t1").unwrap()).unwrap();
+    let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
+    assert_eq!(run_stop_hook(&env, "Not ready: which repo?"), "");
+    let run = &runs::active(&conn).unwrap()[0];
+    assert_eq!((run.status, run.step_id.as_str()), (runs::Status::Attention, "start"));
 }
 
 #[test]
@@ -218,10 +247,14 @@ fn a_stop_moves_the_tabs_flow_run_on_and_sends_the_next_prompt() {
     let out: serde_json::Value = serde_json::from_str(&run_stop_hook(&env, "Still broken.\nFLOW: fail")).unwrap();
     assert_eq!(out["hookSpecificOutput"]["hookEventName"], "Stop");
     assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::prompt_text(&graph.nodes[1]));
-    // pass has no next step: the run ends, telling Claude the flow is finished.
-    let out: serde_json::Value = serde_json::from_str(&run_stop_hook(&env, "Fixed.\nFLOW: pass")).unwrap();
-    assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::closing_text("F"));
+    // pass has no next step: the run ends, and Claude is not made to reply again.
+    assert_eq!(run_stop_hook(&env, "Fixed.\nFLOW: pass"), "");
     assert!(runs::active(&conn).unwrap().is_empty());
+    // The person's next prompt tells Claude the flow is finished, as context.
+    let out: serde_json::Value = serde_json::from_str(&run_prompt_hook(&env, "Thanks")).unwrap();
+    assert_eq!(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
+    assert_eq!(out["hookSpecificOutput"]["additionalContext"], flows::closing_text("F"));
+    assert_eq!(run_prompt_hook(&env, "And now?"), "", "once");
     // A tab without a run, and a Stop that records no session, are left alone.
     assert_eq!(run_stop_hook(&[(claude::TAB_ENV, "t2"), (claude::DB_ENV, db_path.to_str().unwrap())], "FLOW: pass"), "");
     assert_eq!(stored_session(&db_path, "t1"), None, "a Stop is not a session start");

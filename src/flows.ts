@@ -18,7 +18,11 @@ export interface Run {
   note: string | null;
   outputs: string[];
   steps: number;
-  /** How many of the flow's steps (all but Start and End) are done, each once however often it ran, and how many there are. */
+  /**
+   * How many of the flow's steps (all but Start, End and steps Start cannot reach) are done, each once however
+   * often it ran, and how many there are; a run that skips a branch ends short of the total. Both 0 when the
+   * run's steps cannot be read.
+   */
   done: number;
   total: number;
   /** Whether Claude can be asked to go on with the step (a prompt step that needs attention). */
@@ -255,7 +259,7 @@ export function createFlows(opts: FlowsOptions): Flows {
         const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
         const run = mine ?? orphan;
         li.title = mine
-          ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}, ${mine.done} of ${mine.total} steps done${mine.note ? `. ${mine.note}` : ""}`
+          ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}${mine.total > 0 ? `, ${mine.done} of ${mine.total} steps done` : ""}${mine.note ? `. ${mine.note}` : ""}`
           : orphan
             ? `${flow.name}: running in a closed tab; ■ stops it`
             : `Edit ${flow.name}`;
@@ -275,7 +279,8 @@ export function createFlows(opts: FlowsOptions): Flows {
         if (attention) mark.classList.add("needs-attention");
         else if (flow.clear) mark.classList.add("clears");
         li.append(mark, nameSpan(flow));
-        if (run) {
+        // A run whose steps cannot be read has none to count.
+        if (run && run.total > 0) {
           const progress = document.createElement("span");
           progress.className = "progress";
           progress.textContent = `${run.done}/${run.total}`;

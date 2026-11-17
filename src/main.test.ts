@@ -262,8 +262,6 @@ let runPrompt: string | null;
 let runRefusal: string | null;
 /** Makes flow_prefill_text fail with it. */
 let prefillError: string | null;
-/** What flow_stop returns for Claude. */
-let stopClosing: string | null;
 /** Makes flow_prefilled fail with it. */
 let prefilledError: string | null;
 /** What flow_prefill_text returns, one per call; then null. */
@@ -424,7 +422,7 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
       return null;
     case "flow_stop":
       activeRuns = activeRuns.filter((r) => r.id !== args.runId);
-      return stopClosing;
+      return null;
     case "flow_stop_tab":
       activeRuns = activeRuns.filter((r) => r.tabId !== args.tabId);
       return null;
@@ -475,7 +473,6 @@ beforeEach(() => {
   runPrompt = null;
   runRefusal = null;
   prefills = [];
-  stopClosing = null;
   prefillError = null;
   prefilledError = null;
   clearStates = [];
@@ -4348,23 +4345,9 @@ describe("flow runs", () => {
     expect(box().querySelector(".error")!.textContent).toContain("Pasted");
   });
 
-  test("stopping a run tells an idle Claude the flow is finished", async () => {
-    stopClosing = "The flow is finished.";
+  test("stopping a run types nothing into Claude, whose next prompt is told the flow is finished", async () => {
     await boot();
     await openClaudeTabs(1);
-    activeRuns = [run({ tabId: spawns()[0].tabId })];
-    await poll();
-    flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
-    await settle();
-    await vi.advanceTimersByTimeAsync(200);
-    expect(typed()).toEqual(["\x1b[200~The flow is finished.\x1b[201~", "\r"]);
-  });
-
-  test("stopping a run while Claude works sends no closing into its turn", async () => {
-    stopClosing = "The flow is finished.";
-    await boot();
-    await openClaudeTabs(1);
-    terms()[0].onTitle!("◐ Fixing");
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
     flowRow("Deploy").querySelector<HTMLButtonElement>("button.stop-run")!.click();
@@ -4621,6 +4604,11 @@ describe("flow runs", () => {
     const progress = () => flowRow("Deploy").querySelector(".progress");
     expect(progress()?.textContent).toBe("1/3");
     expect(flowRow("Deploy").title).toContain("1 of 3 steps done");
+    // A run whose steps cannot be read has nothing to count.
+    activeRuns = [run({ tabId, done: 0, total: 0, note: "This run cannot be read" })];
+    await poll();
+    expect(progress()).toBeNull();
+    expect(flowRow("Deploy").title).not.toContain("steps done");
     activeRuns = [];
     await poll();
     expect(progress()).toBeNull();
@@ -4798,7 +4786,10 @@ describe("flow runs and Claude's state", () => {
     await settle();
     expect(callsOf("flow_start")).toHaveLength(1);
     expect(callsOf("pty_write")).toHaveLength(1);
+    // Nothing can move a run past an unsent briefing, so it is stopped.
     expect(boxError().textContent).toContain("was not sent");
+    expect(boxError().textContent).toContain("was stopped");
+    expect(callsOf("flow_stop").map((c) => c.args)).toEqual([{ runId: 5 }]);
   });
 
   test("Claude leaving before /clear is sent stops the run that would clear", async () => {

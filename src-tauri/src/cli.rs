@@ -101,7 +101,8 @@ Steps ("nodes"):
             rules (one step at a time, end each with "FLOW: <output>") and
             the base info, and waits for Claude to reply "Ready". After each
             /clear, the next step's prompt carries them again. When the run
-            ends or is stopped, Claude is told the flow is finished.
+            ends or is stopped, the person's next prompt to Claude tells it
+            the flow is finished (unless a /clear came first).
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
             and _, starting with a letter or digit, up to 24 characters); a
             pause or manual prompt has exactly one. "attention" is reserved:

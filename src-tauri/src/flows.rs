@@ -326,16 +326,18 @@ pub fn first_prompt_text(graph: &Graph, flow: &str, node: &Node) -> String {
 }
 
 /// Whether Claude's reply to a run's briefing only says it is ready, as asked, so
-/// it did not start on the job: a short reply with "ready" and no FLOW line.
+/// it did not start on the job or ask something: the reply's letters spell "ready",
+/// whatever the case, punctuation or markdown around them.
 pub fn says_ready(reply: &str) -> bool {
-    let reply = reply.trim();
-    reply.chars().count() <= 60 && reply.to_lowercase().contains("ready") && parse_marker(reply).is_none()
+    let letters: String = reply.chars().filter(|c| c.is_alphanumeric()).collect();
+    letters.eq_ignore_ascii_case("ready")
 }
 
-/// What a run tells Claude once it is done.
+/// What a run tells Claude once it is done, as context with the person's next
+/// prompt (see `runs::on_prompt`).
 pub fn closing_text(flow: &str) -> String {
     typeable(format!(
-        "The flow \"{flow}\" is finished. You no longer need to end your replies with a FLOW line; carry on as usual. Reply only with: OK"
+        "The flow \"{flow}\" is finished. You no longer need to end your replies with a FLOW line; carry on as usual."
     ))
 }
 
@@ -396,12 +398,8 @@ pub fn next_step<'g>(graph: &'g Graph, from: &str, output: &str) -> Option<&'g N
     graph.nodes.iter().find(|n| n.id == edge.to)
 }
 
-/// What keeps a stored graph from running, in the order the steps are listed.
-pub fn problems(graph: &Graph) -> Vec<String> {
-    let Some(start) = graph.nodes.iter().find(|n| n.kind == Kind::Start) else {
-        return vec!["The flow needs a Start step.".into()];
-    };
-    // Every step Start leads to, directly or not.
+/// The ids of `start` and every step it leads to, directly or not.
+pub fn reachable<'g>(graph: &'g Graph, start: &'g Node) -> HashSet<&'g str> {
     let mut reached = HashSet::from([start.id.as_str()]);
     let mut queue = vec![start.id.as_str()];
     while let Some(id) = queue.pop() {
@@ -411,6 +409,15 @@ pub fn problems(graph: &Graph) -> Vec<String> {
             }
         }
     }
+    reached
+}
+
+/// What keeps a stored graph from running, in the order the steps are listed.
+pub fn problems(graph: &Graph) -> Vec<String> {
+    let Some(start) = graph.nodes.iter().find(|n| n.kind == Kind::Start) else {
+        return vec!["The flow needs a Start step.".into()];
+    };
+    let reached = reachable(graph, start);
     let mut problems = Vec::new();
     // Steps Start cannot reach never run, so they are left alone.
     for node in graph.nodes.iter().filter(|n| reached.contains(n.id.as_str())) {
@@ -733,6 +740,18 @@ pub(crate) mod tests {
         let text = closing_text("Deploy");
         assert!(text.contains("\"Deploy\" is finished"), "{text}");
         assert!(text.contains("no longer need to end your replies with a FLOW line"), "{text}");
+        // It comes with the person's next prompt, which Claude answers.
+        assert!(!text.contains("Reply only"), "{text}");
+    }
+
+    #[test]
+    fn only_a_reply_of_ready_counts_as_ready() {
+        for reply in ["Ready", "Ready.", "**Ready.**", " ready!\n", "`Ready`"] {
+            assert!(says_ready(reply), "{reply:?}");
+        }
+        for reply in ["Not ready, which repo?", "Already on it.", "I'm ready", "Ready\nFLOW: attention", "Ready? Starting on the tests now.", ""] {
+            assert!(!says_ready(reply), "{reply:?}");
+        }
     }
 
     #[test]
