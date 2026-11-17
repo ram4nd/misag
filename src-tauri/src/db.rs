@@ -943,12 +943,16 @@ impl Db {
         runs::prefilled(&mut self.conn(), run_id, step_id, token)
     }
 
-    pub fn proceed_run(&self, run_id: i64, step_id: &str, output: &str) -> Result<Option<String>, String> {
+    pub fn proceed_run(&self, run_id: i64, step_id: &str, output: &str) -> Result<Option<runs::StepPrompt>, String> {
         runs::proceed(&mut self.conn(), run_id, step_id, output)
     }
 
-    pub fn resume_run(&self, run_id: i64, step_id: &str) -> Result<String, String> {
+    pub fn resume_run(&self, run_id: i64, step_id: &str) -> Result<runs::StepPrompt, String> {
         runs::resume(&mut self.conn(), run_id, step_id)
+    }
+
+    pub fn unsent_run(&self, run_id: i64, step_id: &str, briefs: bool, why: &str) -> Result<bool, String> {
+        runs::unsent(&mut self.conn(), run_id, step_id, briefs, why)
     }
 
     pub fn stop_run(&self, run_id: i64) -> Result<(), String> {

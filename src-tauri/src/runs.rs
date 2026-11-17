@@ -110,8 +110,8 @@ enum Resume {
     /// Claude still has the step in mind (it asked for a person, or its reply could
     /// not be followed): remind it to go on and how to end.
     Remind,
-    /// Claude no longer has the step in mind (the conversation was cleared): send
-    /// the step's prompt again.
+    /// Claude no longer has the step in mind (the conversation was cleared, or the
+    /// step's prompt could not be typed; see `unsent`): send the step's prompt again.
     Prompt,
 }
 
@@ -166,6 +166,19 @@ pub struct Started {
     /// What to send Claude, if the run does not clear: its briefing, or nothing for
     /// a flow that leads straight to its end.
     pub prompt: Option<String>,
+}
+
+/// A step's prompt for the app to type into the run's tab. Mirrored by `StepPrompt`
+/// in src/runController.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct StepPrompt {
+    /// The step the run is now at, which `unsent` names if the prompt cannot be typed.
+    pub step_id: String,
+    pub prompt: String,
+    /// Whether the prompt carries the run's rules and Start's base info (Claude
+    /// lacked them), which `unsent` then takes back.
+    pub briefs: bool,
 }
 
 /// How a run whose Start clears is getting on. Mirrored in src/main.ts.
@@ -305,7 +318,7 @@ fn set(tx: &Transaction, run: i64, node_id: &str, status: Status, steps: i64, no
 
 /// Makes the run wait at `node_id` for the person, saying why, and how Continue
 /// goes on from there (None: it cannot help, and the person picks an output).
-fn wait_for_person(tx: &Transaction, run: i64, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Result<Option<String>, String> {
+fn wait_for_person<T>(tx: &Transaction, run: i64, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Result<Option<T>, String> {
     set(tx, run, node_id, Status::Attention, steps, Some(why))?;
     tx.execute("UPDATE flow_runs SET resume = ?2 WHERE id = ?1", params![run, resume.map(Resume::as_str)])
         .map_err(sql)?;
@@ -365,12 +378,14 @@ fn flow_name(conn: &Connection, run_id: i64) -> Result<String, String> {
 
 /// The prompt of `node` for the run, led by the run's rules and Start's base info
 /// if Claude lacks them (after a clear), which it then has.
-fn prompt_for(tx: &Transaction, run: &Stored, node: &Node) -> Result<String, String> {
-    if run.briefed {
-        return Ok(flows::prompt_text(node));
-    }
-    tx.execute("UPDATE flow_runs SET briefed = 1 WHERE id = ?1", [run.id]).map_err(sql)?;
-    Ok(flows::first_prompt_text(&run.graph, &flow_name(tx, run.id)?, node))
+fn prompt_for(tx: &Transaction, run: &Stored, node: &Node) -> Result<StepPrompt, String> {
+    let prompt = if run.briefed {
+        flows::prompt_text(node)
+    } else {
+        tx.execute("UPDATE flow_runs SET briefed = 1 WHERE id = ?1", [run.id]).map_err(sql)?;
+        flows::first_prompt_text(&run.graph, &flow_name(tx, run.id)?, node)
+    };
+    Ok(StepPrompt { step_id: node.id.clone(), prompt, briefs: !run.briefed })
 }
 
 /// The run's first turn, from Start: its briefing (the run's rules and Start's base
@@ -392,7 +407,7 @@ fn first_turn(tx: &Transaction, run_id: i64, graph: &Graph, start: &Node) -> Res
             prefill: false,
             briefing: false,
         };
-        return go(tx, &run, start, flows::START_OUTPUT, 0, By::Flow);
+        return go(tx, &run, start, flows::START_OUTPUT, 0, By::Flow).map(texts);
     }
     set(tx, run_id, &start.id, Status::Running, 0, None)?;
     tx.execute("UPDATE flow_runs SET briefed = 1, briefing = 1 WHERE id = ?1", [run_id]).map_err(sql)?;
@@ -404,7 +419,7 @@ fn first_turn(tx: &Transaction, run_id: i64, graph: &Graph, start: &Node) -> Res
 /// prompt step (a run that ends sends nothing; see `owe_closing`). The run instead waits at `from` for the person when going on
 /// would pass `MAX_RUN_STEPS` (into a prompt step) or, for `By::Flow` only, when
 /// the next step has already run its `max_runs`.
-fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by: By) -> Result<Option<String>, String> {
+fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by: By) -> Result<Option<StepPrompt>, String> {
     let next = flows::next_step(&run.graph, &from.id, output);
     // Going on with `from` would only redo it and stop here again.
     let wait = |why: String| wait_for_person(tx, run.id, &from.id, steps, &why, None);
@@ -446,6 +461,11 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
         }
         Kind::End | Kind::Start => finish(&next.id).map(|()| None),
     }
+}
+
+/// The text of the prompt `go` returned, for where no step id goes along.
+fn texts(next: Option<StepPrompt>) -> Option<String> {
+    next.map(|n| n.prompt)
 }
 
 /// Starts flow `flow_id` in tab `tab_id`: with the briefing to send (see
@@ -576,7 +596,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
             Some(_) => go(&tx, &run, &node, flows::START_OUTPUT, 0, By::Flow)?,
         };
         tx.commit().map_err(sql)?;
-        return Ok(prompt);
+        return Ok(texts(prompt));
     }
     if node.kind == Kind::ManualPrompt {
         // Running only once the person sent their prompt (see `on_prompt`): this is
@@ -587,7 +607,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
         // The person stepped in, which restarts the count toward MAX_RUN_STEPS.
         let prompt = go(&tx, &run, &node, output, 0, By::Flow)?;
         tx.commit().map_err(sql)?;
-        return Ok(prompt);
+        return Ok(texts(prompt));
     }
     if run.status == Status::Attention {
         // The person may be chatting with Claude while the run waits. Only a reply
@@ -602,14 +622,14 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
         };
         let prompt = go(&tx, &run, &node, &output, run.steps, By::Flow)?;
         tx.commit().map_err(sql)?;
-        return Ok(prompt);
+        return Ok(texts(prompt));
     }
     let wait = |why: String| wait_for_person(&tx, run.id, &node.id, run.steps, &why, Some(Resume::Remind));
     let Some(reply) = reply else {
         // Its next reply would not be reported either.
-        let prompt = wait_for_person(&tx, run.id, &node.id, run.steps, NO_REPLY, None)?;
+        wait_for_person::<()>(&tx, run.id, &node.id, run.steps, NO_REPLY, None)?;
         tx.commit().map_err(sql)?;
-        return Ok(prompt);
+        return Ok(None);
     };
     let prompt = match flows::parse_marker(reply) {
         None => wait("Claude's reply did not end with a FLOW line, so the flow cannot tell how to go on.".into()),
@@ -621,7 +641,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
         Some(m) => go(&tx, &run, &node, &m, run.steps, By::Flow),
     }?;
     tx.commit().map_err(sql)?;
-    Ok(prompt)
+    Ok(texts(prompt))
 }
 
 /// The person picked `output` for `step_id`, the step they saw the run at; returns
@@ -631,7 +651,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
 /// `step_id` (a second click, or a pick from a page not yet redrawn), and while the
 /// run is still clearing the conversation before its first step. The person
 /// stepping in restarts the count toward `MAX_RUN_STEPS`.
-pub fn proceed(conn: &mut Connection, run_id: i64, step_id: &str, output: &str) -> Result<Option<String>, String> {
+pub fn proceed(conn: &mut Connection, run_id: i64, step_id: &str, output: &str) -> Result<Option<StepPrompt>, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
     run.at(step_id)?;
@@ -646,9 +666,9 @@ pub fn proceed(conn: &mut Connection, run_id: i64, step_id: &str, output: &str) 
     if !node.outputs.iter().any(|o| o == output) {
         return Err(format!("\"{}\" has no output {output:?}", node.name()));
     }
-    let prompt = go(&tx, &run, &node, output, 0, By::Person)?;
+    let next = go(&tx, &run, &node, output, 0, By::Person)?;
     tx.commit().map_err(sql)?;
-    Ok(prompt)
+    Ok(next)
 }
 
 /// Has the app put the manual prompt `node`'s text into Claude's input (see
@@ -806,7 +826,7 @@ fn refill(conn: &Connection, tab_id: &str) -> Result<(), String> {
 /// `flow_run_resumes`. Refused where that cannot help, as at a step limit, where the
 /// person picks an output instead, and if the run has moved on from `step_id` (see
 /// `proceed`).
-pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<String, String> {
+pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<StepPrompt, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
     run.at(step_id)?;
@@ -824,13 +844,35 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Strin
     )
     .map_err(sql)?;
     set(&tx, run.id, &node.id, Status::Running, run.steps, None)?;
-    let prompt = match how {
-        Resume::Remind => flows::resume_text(node),
-        // With the base info, if a clear took that too.
+    let next = match how {
+        Resume::Remind => StepPrompt { step_id: node.id.clone(), prompt: flows::resume_text(node), briefs: false },
+        // With the rules and base info, if Claude lacks them (after a clear, or an
+        // unsent prompt that carried them).
         Resume::Prompt => prompt_for(&tx, &run, node)?,
     };
     tx.commit().map_err(sql)?;
-    Ok(prompt)
+    Ok(next)
+}
+
+/// The prompt `proceed` or `resume` returned for step `step_id` could not be typed
+/// (Claude left the tab first): the run would wait for a reply that cannot come, so
+/// it waits for the person, saying `why`, and Continue sends the step's prompt again.
+/// If that prompt carried the run's rules (`briefs`), Claude never got them, so the
+/// one Continue sends carries them again; otherwise Claude, resumed in the tab,
+/// still has them. Returns whether the run now waits: one that has moved on or no
+/// longer runs the step (a Stop hook got there first) is left alone.
+pub fn unsent(conn: &mut Connection, run_id: i64, step_id: &str, briefs: bool, why: &str) -> Result<bool, String> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+    let Some(run) = active_run(&tx, "id = ?1", &run_id)? else { return Ok(false) };
+    if run.node_id != step_id || run.status != Status::Running {
+        return Ok(false);
+    }
+    wait_for_person::<()>(&tx, run.id, step_id, run.steps, why, Some(Resume::Prompt))?;
+    if briefs {
+        tx.execute("UPDATE flow_runs SET briefed = 0 WHERE id = ?1", [run.id]).map_err(sql)?;
+    }
+    tx.commit().map_err(sql)?;
+    Ok(true)
 }
 
 /// Claude in tab `tab_id` cleared its conversation: a run waiting for that clear
@@ -1099,13 +1141,13 @@ mod tests {
     /// `proceed` from the step the run is at.
     fn pick(conn: &mut Connection, run: i64, output: &str) -> Result<Option<String>, String> {
         let step = at(conn, run);
-        proceed(conn, run, &step, output)
+        proceed(conn, run, &step, output).map(|next| next.map(|n| n.prompt))
     }
 
     /// `resume` at the step the run is at.
     fn go_on(conn: &mut Connection, run: i64) -> Result<String, String> {
         let step = at(conn, run);
-        resume(conn, run, &step)
+        resume(conn, run, &step).map(|n| n.prompt)
     }
 
     fn only_run(conn: &Connection) -> Run {
@@ -2304,5 +2346,96 @@ mod tests {
 
     fn cleared_run_state(conn: &mut Connection, run: i64) -> Cleared {
         cleared(conn, run).unwrap()
+    }
+
+    #[test]
+    fn a_step_prompt_reaches_the_app_in_camel_case() {
+        let next = StepPrompt { step_id: "p".into(), prompt: "do p".into(), briefs: true };
+        assert_eq!(serde_json::to_value(&next).unwrap(), serde_json::json!({ "stepId": "p", "prompt": "do p", "briefs": true }));
+    }
+
+    #[test]
+    fn a_pick_names_the_prompt_step_the_run_went_on_to() {
+        let g = graph(
+            vec![node("a", Kind::Prompt, &["done"]), node("b", Kind::Prompt, &["done"])],
+            vec![edge("start", "next", "a"), edge("a", "done", "b")],
+        );
+        let (_db, mut conn, flow) = setup("runs-pick-step-id", &g);
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        let next = proceed(&mut conn, run, "a", "done").unwrap().unwrap();
+        assert_eq!(next, StepPrompt { step_id: "b".into(), prompt: prompt_of(&g, "b").unwrap(), briefs: false });
+    }
+
+    #[test]
+    fn an_unsent_step_prompt_waits_for_the_person_and_continue_sends_it_again_with_the_rules() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-unsent", &g);
+        let t = tab("t1");
+        let run = begin(&mut conn, flow, &t).unwrap().run_id;
+        // After a clear, the next prompt carries the run's rules.
+        clear_tab(&mut conn, &t, "cleared").unwrap();
+        let with_rules = flows::first_prompt_text(&g, "F", &g.nodes[1]);
+        let next = proceed(&mut conn, run, "p", "fail").unwrap().unwrap();
+        assert_eq!(next, StepPrompt { step_id: "p".into(), prompt: with_rules.clone(), briefs: true });
+        // Claude left the tab before it was typed.
+        assert!(unsent(&mut conn, run, &next.step_id, next.briefs, "Claude left.").unwrap());
+        let waiting = only_run(&conn);
+        assert_eq!((waiting.status, waiting.note.as_deref(), waiting.step_id.as_str()), (Status::Attention, Some("Claude left."), "p"));
+        assert!(waiting.resumable);
+        // Claude does not have the rules: ending now owes it no closing note.
+        assert!(!briefed(&conn, run));
+        let again = resume(&mut conn, run, "p").unwrap();
+        assert_eq!(again, StepPrompt { step_id: "p".into(), prompt: with_rules, briefs: true });
+        assert_eq!(only_run(&conn).status, Status::Running);
+    }
+
+    #[test]
+    fn an_unsent_prompt_without_the_rules_leaves_claude_briefed() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-unsent-briefed", &g);
+        let t = tab("t1");
+        let run = begin(&mut conn, flow, &t).unwrap().run_id;
+        // A pick's prompt, Claude having the rules from the briefing.
+        let next = proceed(&mut conn, run, "p", "fail").unwrap().unwrap();
+        assert!(!next.briefs);
+        assert!(unsent(&mut conn, run, &next.step_id, next.briefs, "Claude left.").unwrap());
+        assert!(briefed(&conn, run), "Claude, resumed, still has the rules");
+        let again = resume(&mut conn, run, "p").unwrap();
+        assert_eq!((again.prompt, again.briefs), (prompt_of(&g, "p").unwrap(), false));
+        // A reminder carries no rules either.
+        on_stop(&mut conn, &t, Some("Hmm.")).unwrap();
+        let reminder = resume(&mut conn, run, "p").unwrap();
+        assert!(!reminder.briefs);
+        assert!(unsent(&mut conn, run, "p", reminder.briefs, "Claude left.").unwrap());
+        assert!(briefed(&conn, run));
+        // So stopping the run still tells Claude the flow finished.
+        stop(&conn, run).unwrap();
+        assert_eq!(on_prompt(&mut conn, &t, "Thanks").unwrap(), finished());
+    }
+
+    #[test]
+    fn unsent_leaves_a_run_that_moved_on_alone() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-unsent-moved-on", &g);
+        let t = tab("t1");
+        let run = begin(&mut conn, flow, &t).unwrap().run_id;
+        // Another step than the one the prompt was for.
+        assert!(!unsent(&mut conn, run, "start", true, "x").unwrap());
+        assert_eq!((only_run(&conn).status, only_run(&conn).note), (Status::Running, None));
+        assert!(briefed(&conn, run));
+        // Not running any more: a Stop hook moved it already.
+        on_stop(&mut conn, &t, Some("Hmm.")).unwrap();
+        let before = only_run(&conn);
+        assert!(!unsent(&mut conn, run, "p", true, "x").unwrap());
+        assert_eq!(only_run(&conn).note, before.note);
+        assert!(go_on(&mut conn, run).unwrap().starts_with("Go on with the flow step"), "Continue still reminds Claude");
+        // Stopped: nothing to do.
+        stop(&conn, run).unwrap();
+        assert!(!unsent(&mut conn, run, "p", true, "x").unwrap());
+        assert!(active(&conn).unwrap().is_empty());
+    }
+
+    fn briefed(conn: &Connection, run: i64) -> bool {
+        conn.query_row("SELECT briefed FROM flow_runs WHERE id = ?1", [run], |r| r.get(0)).unwrap()
     }
 }

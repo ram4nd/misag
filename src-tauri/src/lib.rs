@@ -494,6 +494,7 @@ pub fn run() {
             commands::flow_prefilled,
             commands::flow_continue,
             commands::flow_resume,
+            commands::flow_unsent,
             commands::flow_stop,
             commands::flow_runs,
             commands::flow_stop_tab,

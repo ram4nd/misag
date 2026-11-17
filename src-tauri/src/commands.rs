@@ -767,14 +767,21 @@ pub fn flow_prefilled(db: State<'_, Db>, run_id: i64, step_id: String, token: i6
 }
 
 #[tauri::command(async)]
-pub fn flow_continue(db: State<'_, Db>, run_id: i64, step_id: String, output: String) -> Result<Option<String>, CommandError> {
+pub fn flow_continue(db: State<'_, Db>, run_id: i64, step_id: String, output: String) -> Result<Option<crate::runs::StepPrompt>, CommandError> {
     Ok(db.proceed_run(run_id, &step_id, &output)?)
 }
 
-/// Has Claude go on with the run's step that needs attention; returns the text to send.
+/// Has Claude go on with the run's step that needs attention; returns the prompt to type.
 #[tauri::command(async)]
-pub fn flow_resume(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<String, CommandError> {
+pub fn flow_resume(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<crate::runs::StepPrompt, CommandError> {
     Ok(db.resume_run(run_id, &step_id)?)
+}
+
+/// The prompt flow_continue or flow_resume returned could not be typed: the run waits for the person (see `runs::unsent`).
+/// Returns whether it does, false when the run had already moved on.
+#[tauri::command(async)]
+pub fn flow_unsent(db: State<'_, Db>, run_id: i64, step_id: String, briefs: bool, why: String) -> Result<bool, CommandError> {
+    Ok(db.unsent_run(run_id, &step_id, briefs, &why)?)
 }
 
 #[tauri::command(async)]

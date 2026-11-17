@@ -9,6 +9,14 @@ export interface Started {
   prompt: string | null;
 }
 
+/** Mirrors `runs::StepPrompt`: a step's prompt to type, and the step the run is now at. */
+export interface StepPrompt {
+  stepId: string;
+  prompt: string;
+  /** Whether the prompt carries the run's rules, which Claude lacks. */
+  briefs: boolean;
+}
+
 /** Mirrors `runs::Prefill`. */
 export interface Prefill {
   text: string;
@@ -182,7 +190,11 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       }
       opts.write(tab, encoder.encode(`\x1b[200~${text}\x1b[201~`));
       await new Promise((resolve) => setTimeout(resolve, PASTE_SUBMIT_MS));
-      if (!(await opts.live(tab))) return left();
+      if (!(await opts.live(tab))) {
+        // The paste may wait in the input of a Claude brought back (fg): cleared before the next prompt.
+        dirtyTabs.add(tab.tabId);
+        return left();
+      }
       opts.write(tab, encoder.encode("\r"));
       return true;
     });
@@ -373,9 +385,10 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
 
   /**
    * Moves the run on with `go`, typing the prompt it returns into the run's tab;
-   * resolves to why it could not, for the run bar it was picked in, or null.
+   * resolves to why it could not, for the run bar it was picked in, or null. A
+   * prompt that cannot be typed has the run wait at its step (see `typeStepPrompt`).
    */
-  async function goOn(run: Run, go: () => Promise<string | null>): Promise<string | null> {
+  async function goOn(run: Run, go: () => Promise<StepPrompt | null>): Promise<string | null> {
     const tab = opts.tabs().find((t) => t.tabId === run.tabId);
     let error: string | null = null;
     if (!tab || !(await opts.live(tab))) {
@@ -392,7 +405,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
           await clearPaste(tab);
           return next;
         });
-        if (prompt !== null && !(await typePrompt(tab, prompt))) error = `${notSent(tab)}; start Claude there and go on again.`;
+        if (prompt !== null) error = await typeStepPrompt(run, tab, prompt);
       } catch (err) {
         console.error("misag: could not continue the run", err);
         error = `Could not go on: ${opts.errorText(err)}`;
@@ -400,6 +413,30 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     }
     await poll();
     return error;
+  }
+
+  /**
+   * Types the step's prompt `next` that the run went on to into its tab. One that
+   * cannot be (Claude left the tab, or the write failed) has the run wait at the step
+   * for the person, as no reply to it can come, and Continue sends it again. Resolves
+   * to why that could not be done, for the run bar, or null: the run's note says why
+   * it waits, in the run bar and the Flows box.
+   */
+  async function typeStepPrompt(run: Run, tab: T, next: StepPrompt): Promise<string | null> {
+    let why = "Claude left the run's tab before this step's prompt was sent; start Claude there and press Continue to send it again.";
+    try {
+      if (await typePrompt(tab, next.prompt)) return null;
+    } catch (err) {
+      console.error("misag: could not type the step's prompt", err);
+      why = `This step's prompt could not be typed into the run's tab (${opts.errorText(err)}); press Continue to send it again.`;
+    }
+    try {
+      const waits = await invoke<boolean>("flow_unsent", { runId: run.id, stepId: next.stepId, briefs: next.briefs, why });
+      return waits ? null : "The step's prompt was not sent, and the run had already moved on.";
+    } catch (err) {
+      console.error("misag: could not make the run wait for the person", err);
+      return `The step's prompt was not sent, and the run could not be made to wait (${opts.errorText(err)}): pick an output to go on, or stop it with ■.`;
+    }
   }
 
   /**
@@ -458,8 +495,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     stop,
     // The step the run was shown at goes along, so a pick that arrives after the run
     // moved on (a second click, a page not yet redrawn) is refused, not applied there.
-    proceed: (run, output) => goOn(run, () => invoke<string | null>("flow_continue", { runId: run.id, stepId: run.stepId, output })),
-    resume: (run) => goOn(run, () => invoke<string>("flow_resume", { runId: run.id, stepId: run.stepId })),
+    proceed: (run, output) => goOn(run, () => invoke<StepPrompt | null>("flow_continue", { runId: run.id, stepId: run.stepId, output })),
+    resume: (run) => goOn(run, () => invoke<StepPrompt>("flow_resume", { runId: run.id, stepId: run.stepId })),
     poll,
     show,
     forgetTab(tab) {

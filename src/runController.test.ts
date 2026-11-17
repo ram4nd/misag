@@ -4,14 +4,24 @@ const backend = vi.hoisted(() => ({
   /** What flow_start returns. */
   started: { runId: 7, clear: false, prompt: "Review the diff" as string | null },
   calls: [] as string[],
+  /** The arguments of each flow_unsent call. */
+  unsent: [] as unknown[],
+  /** What flow_unsent returns, or the error it fails with. */
+  unsentReply: true as boolean | Error,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async (cmd: string) => {
+  invoke: vi.fn(async (cmd: string, args?: unknown) => {
     backend.calls.push(cmd);
+    if (cmd === "flow_unsent") {
+      backend.unsent.push(args);
+      if (backend.unsentReply instanceof Error) throw backend.unsentReply;
+      return backend.unsentReply;
+    }
     if (cmd === "flow_start") return backend.started;
     if (cmd === "flow_runs") return [];
-    if (cmd === "flow_continue") return "Fix what the review found";
+    if (cmd === "flow_continue") return { stepId: "fix", prompt: "Fix what the review found", briefs: true };
+    if (cmd === "flow_resume") return { stepId: "s", prompt: "Go on with the step", briefs: false };
     if (cmd === "flow_cleared") return { state: "gone" };
     return null;
   }),
@@ -32,6 +42,7 @@ let runs: RunController<Tab>;
 let busy: boolean;
 let background: boolean;
 let live: () => Promise<boolean>;
+let write: (text: string) => void;
 /** Called as a flow takes or releases the tab's lock. */
 let onLock: () => void;
 const tab: Tab = { tabId: "t1" };
@@ -43,8 +54,11 @@ beforeEach(() => {
   busy = false;
   background = false;
   live = async () => true;
+  write = (text) => typed.push(text);
   onLock = () => {};
   backend.calls = [];
+  backend.unsent = [];
+  backend.unsentReply = true;
   backend.started = { runId: 7, clear: false, prompt: "Review the diff" };
   runs = createRunController<Tab>({
     flows: { showRuns: () => {}, showBoxError: () => {}, reload: async () => {} },
@@ -55,7 +69,7 @@ beforeEach(() => {
     busy: () => busy,
     waitsInBackground: () => background,
     live: (_t) => live(),
-    write: (_t, data) => typed.push(decoder.decode(data)),
+    write: (_t, data) => write(decoder.decode(data)),
     editors: () => [],
     markWaiting: () => {},
     lockChanged: (_t, locked) => {
@@ -67,6 +81,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 const flow = { id: 1, name: "Review", unconfirmed: false } as Flow;
@@ -194,6 +209,87 @@ describe("going on from a step", () => {
     expect(await done).toBeNull();
     expect(backend.calls).toContain("flow_continue");
     expect(typed).toEqual(["\x1b[200~Fix what the review found\x1b[201~", "\r"]);
+  });
+
+  const left = "Claude left the run's tab before this step's prompt was sent; start Claude there and press Continue to send it again.";
+
+  /** Claude runs for the first `n` checks, then has left the tab. */
+  function leavesAfter(n: number) {
+    let checks = 0;
+    live = async () => ++checks <= n;
+  }
+
+  test("a step prompt Claude left the tab before makes the run wait at the new step for Continue", async () => {
+    // Claude runs when the pick is checked, and has left by the time the prompt is typed.
+    leavesAfter(1);
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    // The run's note says so, in the run bar and the Flows box.
+    expect(await picked).toBeNull();
+    expect(backend.unsent).toEqual([{ runId: 7, stepId: "fix", briefs: true, why: left }]);
+    expect(typed).toEqual([]);
+  });
+
+  test("Continue's prompt Claude left the tab before names the step flow_resume gave", async () => {
+    leavesAfter(1);
+    const resumed = runs.resume({ ...run, status: "attention" } as Run);
+    await vi.runAllTimersAsync();
+    expect(await resumed).toBeNull();
+    expect(backend.calls).toContain("flow_resume");
+    expect(backend.unsent).toEqual([{ runId: 7, stepId: "s", briefs: false, why: left }]);
+  });
+
+  test("a prompt that could not be typed at all makes the run wait as well", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    write = (text) => {
+      if (text.startsWith("\x1b[200~")) throw new Error("the pty is gone");
+      typed.push(text);
+    };
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBeNull();
+    expect(backend.unsent).toEqual([
+      {
+        runId: 7,
+        stepId: "fix",
+        briefs: true,
+        why: "This step's prompt could not be typed into the run's tab (Error: the pty is gone); press Continue to send it again.",
+      },
+    ]);
+    expect(runs.locked(tab)).toBe(false);
+  });
+
+  test("a run that could not be made to wait says so", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    leavesAfter(1);
+    backend.unsentReply = new Error("database is locked");
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe(
+      "The step's prompt was not sent, and the run could not be made to wait (Error: database is locked): pick an output to go on, or stop it with ■.",
+    );
+  });
+
+  test("a run that moved on meanwhile is not said to wait", async () => {
+    leavesAfter(1);
+    backend.unsentReply = false;
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe("The step's prompt was not sent, and the run had already moved on.");
+  });
+
+  test("a paste Claude left before its Enter is cleared before the next prompt", async () => {
+    leavesAfter(2);
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBeNull();
+    expect(typed).toEqual(["\x1b[200~Fix what the review found\x1b[201~"]);
+    typed = [];
+    live = async () => true;
+    const resumed = runs.resume({ ...run, status: "attention" } as Run);
+    await vi.runAllTimersAsync();
+    expect(await resumed).toBeNull();
+    expect(typed).toEqual(["\x03", "\x1b[200~Go on with the step\x1b[201~", "\r"]);
   });
 });
 

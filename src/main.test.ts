@@ -403,7 +403,7 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
     case "flow_continue":
     case "flow_resume":
       if (runRefusal) throw { code: "failed", message: runRefusal };
-      return runPrompt;
+      return runPrompt === null ? null : { stepId: "p", prompt: runPrompt, briefs: false };
     case "flow_runs":
       return activeRuns;
     case "flow_import_file": {
