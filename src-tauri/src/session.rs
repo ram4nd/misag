@@ -94,19 +94,26 @@ impl Session {
         let exited = self.exited.clone();
         #[cfg(unix)]
         {
-            let pid = self.pid?;
+            let Some(pid) = self.pid else {
+                eprintln!("misag: a session has no pid, so its process groups cannot be killed");
+                return None;
+            };
             // The foreground job may sit in its own process group under job control.
             let foreground = lock(&self.master).process_group_leader();
             Some(std::thread::spawn(move || {
                 if exited.wait(grace) {
                     return;
                 }
-                // SAFETY: plain syscalls. The child is not reaped yet (`exited` is false),
-                // so its pid, and therefore its process group, still exist.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    if let Some(fg) = foreground.filter(|&fg| fg > 0 && fg != pid as libc::pid_t) {
-                        libc::kill(-fg, libc::SIGKILL);
+                // SAFETY (the kills below): plain syscalls. The child is not reaped yet
+                // (`exited` is false), so its pid, and therefore its process group, still exist.
+                let groups = [Some(pid as libc::pid_t), foreground.filter(|&fg| fg > 0 && fg != pid as libc::pid_t)];
+                for group in groups.into_iter().flatten() {
+                    if unsafe { libc::kill(-group, libc::SIGKILL) } == -1 {
+                        let e = std::io::Error::last_os_error();
+                        // The group may have ended in the meantime.
+                        if e.raw_os_error() != Some(libc::ESRCH) {
+                            eprintln!("misag: killing process group {group} failed: {e}");
+                        }
                     }
                 }
             }))
@@ -425,6 +432,7 @@ impl Sessions {
         });
 
         let map = self.map.clone();
+        let grace = self.kill_grace;
         std::thread::spawn(move || {
             let mut buf = [0u8; 16 * 1024];
             let mut detached = false;
@@ -453,8 +461,14 @@ impl Sessions {
                     }
                 }
             }
+            // As a closed tab is: hung up, then its process groups killed after the
+            // grace period, so its jobs go too. Gone from the map already if the tab
+            // was closed meanwhile, which killed it the same way.
             if detached {
-                let _ = child.kill();
+                let session = lock(&map).remove(&id);
+                if let Some(s) = session {
+                    s.kill(grace);
+                }
             }
             let code = match child.wait() {
                 Ok(status) => status.exit_code() as i32,
@@ -1279,6 +1293,33 @@ mod unix_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(start.elapsed() < Duration::from_secs(5), "sleep 60 should have been killed");
+        assert!(exited.try_recv().is_err(), "nobody is listening, so no exit is reported");
+    }
+
+    #[test]
+    fn a_session_whose_frontend_is_gone_loses_its_jobs_too() {
+        let s = sessions();
+        let (tx, exited) = mpsc::channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        // The shell ignores the hang-up, so only killing its process group ends its job.
+        let req = SpawnRequest { launch: Launch::Command("trap '' HUP; sleep 60 & echo bg:$!; wait".into()), ..req() };
+        let on_data = move |b: &[u8]| {
+            lock(&sink).extend_from_slice(b);
+            false
+        };
+        let id = s.spawn(req, on_data, move |code| tx.send(code).unwrap()).unwrap();
+        let start = Instant::now();
+        while s.write(id, vec![]).is_ok() {
+            assert!(start.elapsed() < TIMEOUT, "session was not cleaned up");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = String::from_utf8_lossy(&lock(&seen)).into_owned();
+        let job: u32 = text.split("bg:").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        while Sessions::process_name(job).is_some() {
+            assert!(start.elapsed() < TIMEOUT, "the job {job} outlived its tab");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(exited.try_recv().is_err(), "nobody is listening, so no exit is reported");
     }
 
