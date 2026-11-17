@@ -318,8 +318,11 @@ pub struct SpawnPlan {
     pub fell_back_to_home: bool,
     pub tracked: bool,
     pub skips_permissions: bool,
-    /// The saved Claude session of a terminal tab, typed at its prompt once the
-    /// shell shows it (it reads it as if the user had typed it), or why not.
+    /// The saved Claude session of a terminal tab, or why it cannot be reopened.
+    /// `pty_spawn` queues `claude --resume` to be typed at the shell's prompt once the
+    /// shell shows it (the shell reads it as if the user had typed it); if the
+    /// prompt does not show in time it is not typed at all (see
+    /// `Sessions::type_at_prompt`), and the tab's `on_resume` channel says so.
     pub resume: Option<Resume>,
 }
 
@@ -360,20 +363,39 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, dirs: &TabDirs) -> Res
     Ok(SpawnPlan { request, fell_back_to_home, tracked, skips_permissions, resume })
 }
 
-/// What became of a terminal tab's saved Claude session. Mirrored by
-/// `ResumeReport` in src/ipcTypes.ts.
+/// What became of a terminal tab's saved Claude session: in `Spawned` (`Queued`,
+/// `NoConversation` or `Failed`), then, after `Queued`, once more on the tab's
+/// `on_resume` channel (`Typed` or `Failed`). Mirrored by `ResumeReport` in
+/// src/ipcTypes.ts.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ResumeReport {
-    /// `claude --resume` is typed at the prompt once the shell shows it.
+    /// `claude --resume` will be typed at the prompt once the shell shows it; nothing
+    /// is typed yet.
+    Queued,
+    /// `claude --resume` was typed at the prompt.
     Typed,
     /// Claude saved no conversation for it.
     NoConversation,
-    /// It could not be resumed now; it may still be later.
+    /// It could not be resumed now (or, after `Queued`, the shell did not show its
+    /// prompt in time, the tab closed, or the input was refused); it may still be later.
     Failed { message: String },
 }
 
-/// Starts a tab's process; see `plan_spawn`.
+impl ResumeReport {
+    /// The report of a queued `claude --resume`, from `Sessions::type_at_prompt`'s outcome.
+    pub fn typed(outcome: Result<(), String>) -> Self {
+        match outcome {
+            Ok(()) => Self::Typed,
+            Err(message) => Self::Failed { message },
+        }
+    }
+}
+
+/// Starts a tab's process; see `plan_spawn`. A terminal tab's saved Claude session
+/// is queued to be typed at its prompt, so this does not wait for the shell;
+/// `on_resume` gets what became of it (see `ResumeReport`).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command(async)]
 pub fn pty_spawn(
     state: State<'_, Sessions>,
@@ -383,6 +405,7 @@ pub fn pty_spawn(
     request: TabLaunch,
     on_data: Channel<Response>,
     on_exit: Channel<i32>,
+    on_resume: Channel<ResumeReport>,
 ) -> Result<Spawned, CommandError> {
     let plan = plan_spawn(&request, &exe, &db, &TabDirs::of(&wrapper))?;
     let started_at = crate::db::unix_secs(SystemTime::now());
@@ -397,8 +420,12 @@ pub fn pty_spawn(
     )?;
     let SpawnPlan { fell_back_to_home, tracked, skips_permissions, resume, .. } = plan;
     let resume = resume.map(|resume| match resume {
-        Resume::Session(session) => match state.type_at_prompt(id, resume_input(&session).into_bytes()) {
-            Ok(()) => ResumeReport::Typed,
+        Resume::Session(session) => match state.type_at_prompt(id, resume_input(&session).into_bytes(), move |outcome| {
+            if on_resume.send(ResumeReport::typed(outcome)).is_err() {
+                eprintln!("misag: session {id}: what became of its resumed Claude session was not delivered");
+            }
+        }) {
+            Ok(()) => ResumeReport::Queued,
             Err(e) => ResumeReport::Failed { message: format!("could not type the command: {e}") },
         },
         Resume::NoConversation => ResumeReport::NoConversation,
@@ -1208,9 +1235,17 @@ mod tests {
 
     #[test]
     fn resume_reports_have_one_shape() {
+        assert_eq!(serde_json::to_value(ResumeReport::Queued).unwrap(), serde_json::json!({ "state": "queued" }));
         assert_eq!(serde_json::to_value(ResumeReport::Typed).unwrap(), serde_json::json!({ "state": "typed" }));
         let failed = ResumeReport::Failed { message: "x".into() };
         assert_eq!(serde_json::to_value(failed).unwrap(), serde_json::json!({ "state": "failed", "message": "x" }));
+    }
+
+    #[test]
+    fn a_queued_resume_reports_whether_it_was_typed() {
+        assert_eq!(ResumeReport::typed(Ok(())), ResumeReport::Typed);
+        let failed = ResumeReport::typed(Err("its shell did not show its prompt within 15 s".into()));
+        assert_eq!(failed, ResumeReport::Failed { message: "its shell did not show its prompt within 15 s".into() });
     }
 
     #[test]

@@ -48,7 +48,10 @@ export interface Session {
    * saved with the tab so a restore reopens it. A check that cannot tell keeps it.
    */
   claudeOpen: string | null;
-  /** Until when (ms) a resumed Claude may still be starting, so a shell without it does not mean it quit. */
+  /**
+   * Until when (ms) a resumed Claude may still be starting, so a shell without it does not mean it quit:
+   * Infinity while its `claude --resume` waits for the shell's prompt, and after a resume that failed.
+   */
   resumingUntil: number;
   /** A `claude` seen in the foreground that never reported, and since when (ms). */
   untracked?: { pid: number; since: number };

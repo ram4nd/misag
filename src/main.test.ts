@@ -186,6 +186,7 @@ type SpawnCall = {
   command: string | null;
   claudeSession: string | null;
   onExit: Channel<number>;
+  onResume: Channel<ResumeState>;
 };
 type Layout = {
   tabs: {
@@ -207,6 +208,7 @@ const CLEAR_POLL_MS = 250;
 const CLEAR_TIMEOUT_MS = 30_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SESSION = "0f8fad5b-d9cb-469f-a165-70867728950e";
+const OTHER_SESSION = "6fa459ea-ee8a-4ca4-894e-db77e160355e";
 const LOG = "/home/me/.local/share/io.github.ram4nd.misag/hook.log";
 
 let calls: Call[];
@@ -223,8 +225,11 @@ let skippingClaudes: Set<number>;
 let backgroundTabs: Record<string, number>;
 /** claude_open_sessions waits for this, so a test can hold a check back. */
 let claudeCheckGate: Promise<void>;
+type ResumeState = { state: "queued" } | { state: "typed" } | { state: "noConversation" } | { state: "failed"; message: string };
 /** What pty_spawn reports about a terminal tab's saved Claude session. */
-let resumeReport: { state: "typed" } | { state: "noConversation" } | { state: "failed"; message: string };
+let resumeReport: ResumeState;
+/** What pty_spawn's onResume gets before pty_spawn answers, as when the prompt shows at once. */
+let earlyResume: ResumeState | null;
 let failing: Set<string>;
 let storeReport: {
   store: { state: "saving" } | { state: "recovered"; notice: string } | { state: "notSaving"; reason: string };
@@ -305,9 +310,9 @@ const terms = () => fakes.FakeTerminal.all;
 const tabs = () => [...document.querySelectorAll<HTMLElement>("#tabs .tab")];
 const tabNames = () => tabs().map((t) => t.querySelector(".name")?.textContent);
 const callsOf = (cmd: string) => calls.filter((c) => c.cmd === cmd);
-// pty_spawn takes `{ request, onData, onExit }`; flatten it for assertions.
+// pty_spawn takes `{ request, onData, onExit, onResume }`; flatten it for assertions.
 const spawnCall = (args: Record<string, unknown>) =>
-  ({ ...(args.request as object), onExit: args.onExit }) as SpawnCall;
+  ({ ...(args.request as object), onExit: args.onExit, onResume: args.onResume }) as SpawnCall;
 const spawns = () => callsOf("pty_spawn").map((c) => spawnCall(c.args));
 const dialog = () => document.querySelector<HTMLDialogElement>("#spawn-dialog")!;
 const field = (name: string) =>
@@ -516,7 +521,8 @@ beforeEach(() => {
   skippingClaudes = new Set();
   backgroundTabs = {};
   claudeCheckGate = Promise.resolve();
-  resumeReport = { state: "typed" };
+  resumeReport = { state: "queued" };
+  earlyResume = null;
   failing = new Set();
   drop.fails = false;
   drop.unlistened = 0;
@@ -582,6 +588,7 @@ beforeEach(() => {
       const tracked = call.kind === "claude" && storeReport.store.state !== "notSaving";
       const skipsPermissions = call.kind === "claude" && storedSettings.skipPermissions === true;
       const resume = call.kind === "terminal" && call.claudeSession ? resumeReport : null;
+      if (resume && earlyResume) call.onResume.onmessage(earlyResume);
       return Promise.resolve(id).then((id) => ({ id, fellBackToHome: missing, tracked, skipsPermissions, startedAt: 1000, resume }));
     }
     if (cmd === "plugin:path|resolve_directory") return "/home/me";
@@ -1950,12 +1957,65 @@ describe("saving tabs", () => {
     test("is kept while the resumed Claude starts, and dropped once it is gone", async () => {
       savedLayout = restoredShell();
       await startApp();
+      spawns()[0].onResume.onmessage({ state: "typed" });
       // Claude has not reported yet: the shell alone is no reason to forget it.
       await win.closeRequested!();
       expect(savedSession()).toBe(SESSION);
       now += 61_000;
       await win.closeRequested!();
       expect(savedSession()).toBeNull();
+    });
+
+    test("is kept while its resume waits for the shell's prompt, however long that takes", async () => {
+      savedLayout = restoredShell();
+      await startApp();
+      now += 61_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+      spawns()[0].onResume.onmessage({ state: "typed" });
+      now += 59_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+      now += 2_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBeNull();
+    });
+
+    test("a resume that was never typed is kept for next time, and a notice says why", async () => {
+      savedLayout = restoredShell();
+      await startApp();
+      expect(noticeText()).not.toContain("could not be reopened");
+      spawns()[0].onResume.onmessage({ state: "failed", message: "its shell did not show its prompt within 15 s" });
+      expect(noticeText()).toContain(
+        "Claude could not be reopened in “shell” (its shell did not show its prompt within 15 s); the next start tries again.",
+      );
+      // The shell alone in the tab does not drop it.
+      now += 61_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBe(SESSION);
+      // A Claude started there takes over.
+      openClaudes = { 1: OTHER_SESSION };
+      await win.closeRequested!();
+      expect(savedSession()).toBe(OTHER_SESSION);
+    });
+
+    test("what became of a resume before pty_spawn answered stands", async () => {
+      earlyResume = { state: "typed" };
+      savedLayout = restoredShell();
+      await startApp();
+      now += 61_000;
+      await win.closeRequested!();
+      expect(savedSession()).toBeNull();
+    });
+
+    test("a resume of an earlier start is not reported for the tab's restart", async () => {
+      savedLayout = restoredShell();
+      await startApp();
+      spawns()[0].onExit.onmessage(0);
+      terms()[0].onData!("\r");
+      await flush();
+      spawns()[0].onResume.onmessage({ state: "failed", message: "the tab closed before its shell showed its prompt" });
+      expect(noticeText()).not.toContain("could not be reopened");
     });
 
     test("is kept when the check cannot tell, or the tab never started", async () => {
@@ -2005,7 +2065,6 @@ describe("saving tabs", () => {
       await startApp();
       expect(noticeText()).toContain("Claude could not be reopened in “shell” (could not type the command)");
       now += 61_000;
-      claudeStates = { 1: { state: "unknown" } };
       await win.closeRequested!();
       expect(savedSession()).toBe(SESSION);
     });

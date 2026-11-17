@@ -14,8 +14,8 @@ use std::time::Duration;
 /// Unix; on Windows their console closing) before they are killed.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
-/// How long `type_at_prompt` waits for the shell's prompt before typing anyway.
-#[cfg(unix)]
+/// How long `Sessions::type_at_prompt` waits for the shell's prompt by default before
+/// giving up, typing nothing.
 pub const PROMPT_WAIT: Duration = Duration::from_secs(15);
 
 /// How many bytes of input may wait for a session's program to read them. Far
@@ -59,6 +59,9 @@ struct Session {
     input: Sender<Vec<u8>>,
     /// Bytes sent to `input` whose write to the PTY has not finished (see `INPUT_LIMIT`).
     queued: Arc<AtomicUsize>,
+    /// While a command waits for the shell's prompt (`Sessions::type_at_prompt`):
+    /// the person's input held back to follow it, counted in `queued` (see `write`).
+    held: Mutex<Option<Vec<Vec<u8>>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
     /// Set once the child has been reaped, so SIGKILL never hits a reused pid.
@@ -91,9 +94,8 @@ impl ExitFlag {
 }
 
 impl Session {
-    /// Queues input; see `Sessions::write`.
-    fn send(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
-        let len = data.len();
+    /// Counts `len` bytes into `queued`, or refuses them; see `Sessions::write`.
+    fn reserve(&self, len: usize) -> Result<(), String> {
         // Added up front, so writers at once cannot all slip under the limit, and judged
         // by the count before this write, so a large write is refused only on a full queue.
         let before = self.queued.fetch_add(len, Ordering::Relaxed);
@@ -103,25 +105,94 @@ impl Session {
                 "its program is not reading input ({before} bytes are still waiting); interrupt it or close the tab"
             ));
         }
+        Ok(())
+    }
+
+    /// Hands input `reserve` counted to the writer thread.
+    fn push(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        let len = data.len();
         self.input.send(data).map_err(|_| {
             self.queued.fetch_sub(len, Ordering::Relaxed);
             format!("session {id} is closed")
         })
     }
 
-    /// Whether the shell's line editor (readline, zle, fish's) is reading, which it
-    /// does only at its prompt, with the terminal out of canonical (line) mode. A
-    /// `read` in the shell's startup files keeps that mode on.
+    /// Queues input, ahead of any held back (see `write`).
+    fn send(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        self.reserve(data.len())?;
+        self.push(id, data)
+    }
+
+    /// Queues the person's input; see `Sessions::write`. While a command waits for
+    /// the shell's prompt (`Sessions::type_at_prompt`), input is held back to follow
+    /// it, so keys typed ahead during startup do not run into it, unless it is meant
+    /// for what reads the terminal now: in canonical mode a write with a key that
+    /// ends or interrupts the line (the answer to a startup question, or Ctrl+C on
+    /// a slow profile), sent with what was held before it; otherwise anything typed
+    /// into a program the profile started in the foreground (tmux, a picker, a
+    /// passphrase prompt). So keys typed ahead without Enter wait for the command, and
+    /// a line typed ahead runs before it, whole.
+    fn write(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        let mut held = lock(&self.held);
+        let Some(waiting) = held.as_mut() else { return self.send(id, data) };
+        self.reserve(data.len())?;
+        #[cfg(unix)]
+        let now = self.terminal().map_or(true, |t| t.is_none_or(|t| t.takes_now(&data)));
+        #[cfg(windows)]
+        let now = true;
+        waiting.push(data);
+        if now {
+            self.push_all(id, std::mem::take(waiting))?;
+        }
+        Ok(())
+    }
+
+    /// Ends the wait of `Sessions::type_at_prompt`: queues `typed` (its command, or
+    /// None when it gave up), then the input held back meanwhile. Fails when
+    /// `typed` is refused or the session is closed.
     #[cfg(unix)]
-    fn at_prompt(&self) -> bool {
+    fn release(&self, id: u32, typed: Option<Vec<u8>>) -> Result<(), String> {
+        let mut held = lock(&self.held);
+        let waiting = held.take().unwrap_or_default();
+        let typed = typed.map_or(Ok(()), |data| self.send(id, data));
+        let rest = self.push_all(id, waiting);
+        typed.and(rest)
+    }
+
+    /// Pushes input `reserve` already counted, in order; once one is refused (the
+    /// session closed), the rest are uncounted too.
+    fn push_all(&self, id: u32, all: Vec<Vec<u8>>) -> Result<(), String> {
+        let mut result = Ok(());
+        for data in all {
+            if result.is_err() {
+                self.queued.fetch_sub(data.len(), Ordering::Relaxed);
+            } else {
+                result = self.push(id, data);
+            }
+        }
+        result
+    }
+
+    /// The terminal's mode and foreground process group; None when the session
+    /// has no terminal any more (it is closing).
+    #[cfg(unix)]
+    fn terminal(&self) -> Result<Option<Terminal>, String> {
         let master = lock(&self.master);
-        let Some(fd) = master.as_ref().and_then(|m| m.as_raw_fd()) else { return true };
+        let Some(master) = master.as_ref() else { return Ok(None) };
+        let fd = master.as_raw_fd().ok_or("the PTY has no descriptor")?;
         // SAFETY: a plain-data struct the kernel fills, for a descriptor the locked master keeps open.
         let mut t: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
-            return true;
+            return Err(format!("cannot read the terminal's mode: {}", std::io::Error::last_os_error()));
         }
-        t.c_lflag & libc::ICANON == 0
+        // SAFETY: plain syscall on the same descriptor. The shell leads a session of its
+        // own, so its process group's id is its pid.
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        let shell_foreground = foreground > 0 && self.pid.is_some_and(|pid| pid as libc::pid_t == foreground);
+        // Disabled keys read as 0 on Linux and 0xff on macOS.
+        let keys = [libc::VINTR, libc::VQUIT, libc::VSUSP, libc::VEOF, libc::VEOL].map(|k| t.c_cc[k]);
+        let line_keys = b"\r\n".iter().copied().chain(keys.into_iter().filter(|&k| k != 0 && k != 0xff)).collect();
+        Ok(Some(Terminal { canonical: t.c_lflag & libc::ICANON != 0, shell_foreground, line_keys }))
     }
 
     /// Hangs the child up, then kills what is left of it after `grace`: on Unix
@@ -159,6 +230,84 @@ impl Session {
             let _ = exited;
             let job = self.job.clone()?;
             Some(std::thread::spawn(move || job.end_within(grace)))
+        }
+    }
+}
+
+/// How often `type_at_prompt` looks whether the shell shows its prompt.
+#[cfg(unix)]
+const PROMPT_POLL: Duration = Duration::from_millis(20);
+
+/// `type_at_prompt`'s wait: types `data` once the shell shows its prompt, and
+/// returns what became of it. Sends the held-back input after it, or on its own
+/// when giving up.
+#[cfg(unix)]
+fn type_when_at_prompt(session: &std::sync::Weak<Session>, id: u32, data: Vec<u8>, wait: Duration) -> Result<(), String> {
+    let closed = || "the tab closed before its shell showed its prompt".to_string();
+    let start = std::time::Instant::now();
+    loop {
+        // Gone from the map and dropped: closed, with the held input.
+        let Some(s) = session.upgrade() else { return Err(closed()) };
+        let gave_up = match s.terminal() {
+            Ok(Some(t)) if t.at_prompt() => return s.release(id, Some(data)),
+            Ok(Some(_)) if start.elapsed() >= wait => {
+                eprintln!("misag: session {id}: its shell did not show its prompt within {wait:?}, so the command waiting for it is not typed");
+                format!("its shell did not show its prompt within {} s", wait.as_secs_f32())
+            }
+            Ok(Some(_)) => {
+                drop(s);
+                std::thread::sleep(PROMPT_POLL);
+                continue;
+            }
+            // Its terminal went with the child (Windows only, so far): the tab is closing.
+            Ok(None) => closed(),
+            Err(e) => {
+                eprintln!("misag: session {id}: cannot tell whether its shell shows its prompt, so the command waiting for it is not typed: {e}");
+                format!("cannot tell whether its shell shows its prompt: {e}")
+            }
+        };
+        if let Err(e) = s.release(id, None) {
+            eprintln!("misag: session {id}: {e}");
+        }
+        return Err(gave_up);
+    }
+}
+
+/// What `Session::terminal` reads from a session's terminal.
+#[cfg(unix)]
+struct Terminal {
+    /// In canonical (line) mode: the kernel collects a line before a program reads it.
+    canonical: bool,
+    /// The shell's own process group, not a job it started, is in the foreground.
+    shell_foreground: bool,
+    /// The keys that end or interrupt a line in canonical mode (Enter, Ctrl+C,
+    /// Ctrl+D and the like, as the terminal sets them).
+    line_keys: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl Terminal {
+    /// Whether the shell shows its prompt: its line editor (readline, zle, fish's)
+    /// reads only there, with the terminal out of canonical (line) mode, and the
+    /// shell's own process group in the foreground. So neither a `read` in its
+    /// startup files (canonical mode) nor a program they start, which job control
+    /// puts in a process group of its own (tmux or zellij attaching, a curses
+    /// passphrase prompt, an fzf picker, all in raw mode), counts. Not told apart: a
+    /// raw-mode read in the shell itself (zsh's `read -k`, bash's `read -n 1`), and
+    /// a program the profile runs without job control (in the shell's process
+    /// group) or `exec`s in the shell's place (`exec tmux`) that sets raw mode. A shell without a line editor, such as dash,
+    /// stays in canonical mode, so never counts.
+    fn at_prompt(&self) -> bool {
+        !self.canonical && self.shell_foreground
+    }
+
+    /// Whether the person's `data` goes to the terminal at once while a command
+    /// waits for the prompt, rather than after it (see `Session::write`).
+    fn takes_now(&self, data: &[u8]) -> bool {
+        if self.canonical {
+            data.iter().any(|b| self.line_keys.contains(b))
+        } else {
+            !self.shell_foreground
         }
     }
 }
@@ -406,6 +555,9 @@ pub struct Sessions {
     /// misag's own binary, which runs `Launch::Program` under non-POSIX shells.
     trampoline: Option<String>,
     kill_grace: Duration,
+    /// See `type_at_prompt`; Windows types at once.
+    #[cfg_attr(windows, allow(dead_code))]
+    prompt_wait: Duration,
     /// Inherited variables removed from every tab (see `launcher_vars`).
     strip_env: Vec<&'static str>,
     next_id: AtomicU32,
@@ -468,6 +620,7 @@ impl Sessions {
             shell: shell.into(),
             trampoline: None,
             kill_grace,
+            prompt_wait: PROMPT_WAIT,
             strip_env: launcher_vars(std::env::var_os("CLAUDECODE").is_some()),
             next_id: AtomicU32::new(0),
             map: Arc::default(),
@@ -477,6 +630,12 @@ impl Sessions {
     /// Lets `Launch::Program` work under non-POSIX shells by running `exe --exec`.
     pub fn with_trampoline(mut self, exe: String) -> Self {
         self.trampoline = Some(exe);
+        self
+    }
+
+    /// How long `type_at_prompt` waits for the shell's prompt (`PROMPT_WAIT` by default).
+    pub fn with_prompt_wait(mut self, wait: Duration) -> Self {
+        self.prompt_wait = wait;
         self
     }
 
@@ -595,6 +754,7 @@ impl Sessions {
                 master: Mutex::new(Some(pair.master)),
                 input,
                 queued: queued.clone(),
+                held: Mutex::default(),
                 killer: Mutex::new(child.clone_killer()),
                 pid: child.process_id(),
                 exited: exited.clone(),
@@ -749,40 +909,55 @@ impl Sessions {
 
     /// Queues input for the session; never blocks on the PTY. Fails while at least
     /// `INPUT_LIMIT` bytes wait for the program to read them; a write of any size is
-    /// taken below that, so the queue can go past the limit by one write.
+    /// taken below that, so the queue can go past the limit by one write. While
+    /// `type_at_prompt` waits, input may be held back to follow its command (see
+    /// `Session::write`); held input counts towards the limit too.
     pub fn write(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
-        self.get(id)?.send(id, data)
+        self.get(id)?.write(id, data)
     }
 
-    /// Types `data` at a login shell's prompt once the shell shows it, so a question
-    /// its startup files ask does not take it as the answer; after `PROMPT_WAIT`
-    /// it is typed anyway (a shell without a line editor, such as dash, never
-    /// leaves canonical mode). Returns at once.
+    /// Types `data` at a login shell's prompt once the shell shows it (see
+    /// `Terminal::at_prompt`), so neither a question its startup files ask nor a
+    /// program they start (tmux, a picker) takes it. Returns at once, with the
+    /// typing queued; `on_outcome` is called once it is typed, or with why it never
+    /// will be: the prompt did not show within the prompt wait (`PROMPT_WAIT` unless
+    /// `with_prompt_wait` changed it; a shell without a line editor, such as dash,
+    /// never shows one this can tell, so nothing is typed in it), the tab closed, or
+    /// the input was refused. Nothing is typed blind. Meanwhile what the person types
+    /// is held back to follow `data` (see `Session::write`), and sent as it was once
+    /// the wait ends either way. Fails, typing nothing, when the session is gone, a
+    /// command already waits for its prompt, or the waiting thread cannot start.
     #[cfg(unix)]
-    pub fn type_at_prompt(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
-        // Weak, so a closed tab is not kept open while this waits.
-        let s = Arc::downgrade(&self.get(id)?);
-        std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            while let Some(session) = s.upgrade() {
-                if session.at_prompt() || start.elapsed() >= PROMPT_WAIT {
-                    if let Err(e) = session.send(id, data) {
-                        eprintln!("misag: could not type at the prompt of session {id}: {e}");
-                    }
-                    return;
-                }
-                drop(session);
-                std::thread::sleep(Duration::from_millis(20));
+    pub fn type_at_prompt(&self, id: u32, data: Vec<u8>, on_outcome: impl FnOnce(Result<(), String>) + Send + 'static) -> Result<(), String> {
+        let session = self.get(id)?;
+        {
+            let mut held = lock(&session.held);
+            if held.is_some() {
+                return Err(format!("a command already waits for the prompt of session {id}"));
             }
+            *held = Some(Vec::new());
+        }
+        // Weak, so a closed tab is not kept open while this waits.
+        let weak = Arc::downgrade(&session);
+        let wait = self.prompt_wait;
+        let spawned = std::thread::Builder::new().name(format!("session {id} prompt")).spawn(move || {
+            on_outcome(type_when_at_prompt(&weak, id, data, wait));
         });
+        if let Err(e) = spawned {
+            // Sends what was typed meanwhile; fails only once the session is closed.
+            let _ = session.release(id, None);
+            return Err(format!("cannot start a thread to wait for its prompt: {e}"));
+        }
         Ok(())
     }
 
-    /// The same on Windows, where it is typed at once: PowerShell has no terminal
-    /// mode that tells its prompt apart.
+    /// The same on Windows, where it is typed at once (`on_outcome` is called before
+    /// this returns): PowerShell has no terminal mode that tells its prompt apart.
     #[cfg(windows)]
-    pub fn type_at_prompt(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
-        self.write(id, data)
+    pub fn type_at_prompt(&self, id: u32, data: Vec<u8>, on_outcome: impl FnOnce(Result<(), String>) + Send + 'static) -> Result<(), String> {
+        self.write(id, data)?;
+        on_outcome(Ok(()));
+        Ok(())
     }
 
     /// Like `spawn`, clamps 0 columns or rows to 1, which programs cannot draw in.
@@ -1618,25 +1793,115 @@ mod unix_tests {
         assert!(s.write(p.id, b"x".to_vec()).is_err(), "the session is gone");
     }
 
-    /// Types a resume command the way `pty_spawn` does.
-    fn type_resume(s: &Sessions, id: u32, data: &[u8]) {
-        s.type_at_prompt(id, data.to_vec()).unwrap();
+    /// What became of a command typed at the prompt (see `type_resume`).
+    type Outcome = Receiver<Result<(), String>>;
+
+    /// Types a resume command the way `pty_spawn` does; the receiver gets its outcome.
+    fn type_resume(s: &Sessions, id: u32, data: &[u8]) -> Outcome {
+        let (tx, rx) = mpsc::channel();
+        s.type_at_prompt(id, data.to_vec(), move |outcome| {
+            let _ = tx.send(outcome);
+        })
+        .unwrap();
+        rx
+    }
+
+    /// A bash login shell whose `.bash_profile` is `profile`, in a home of its own.
+    fn login_bash(s: &Sessions, name: &str, profile: &str) -> Probe {
+        let home = crate::test_support::temp_dir(name);
+        std::fs::write(home.join(".bash_profile"), profile).unwrap();
+        let env = vec![("HOME".to_string(), home.to_string_lossy().into_owned())];
+        spawn_with(s, Launch::LoginShell, Some(home.to_str().unwrap()), env)
     }
 
     #[test]
     fn typed_input_waits_for_the_prompt_past_a_startup_question() {
-        let home = crate::test_support::temp_dir("startup-question");
-        std::fs::write(home.join(".bash_profile"), "read -p 'update? ' answer; echo \"answer=[$answer]\"\n").unwrap();
         let s = Sessions::new("/bin/bash", Duration::from_millis(300));
-        let env = vec![("HOME".to_string(), home.to_string_lossy().into_owned())];
-        let p = spawn_with(&s, Launch::LoginShell, Some(home.to_str().unwrap()), env);
-        type_resume(&s, p.id, b"echo resumed-$((1+1))\r");
+        let p = login_bash(&s, "startup-question", "read -p 'update? ' answer; echo \"answer=[$answer]\"\n");
+        let outcome = type_resume(&s, p.id, b"echo resumed-$((1+1))\r");
         p.wait_for("update? ");
         std::thread::sleep(Duration::from_millis(300));
         s.write(p.id, b"n\r".to_vec()).unwrap();
         p.wait_for("answer=[");
         p.wait_for("resumed-2");
         assert!(p.text().contains("answer=[n]"), "output: {:?}", p.text());
+        assert_eq!(outcome.recv_timeout(TIMEOUT), Ok(Ok(())));
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn a_prompt_that_never_comes_types_nothing_and_says_so() {
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300)).with_prompt_wait(Duration::from_millis(500));
+        let p = login_bash(&s, "unanswered-question", "read -p 'update? ' answer; echo \"answer=[$answer]\"\n");
+        let outcome = type_resume(&s, p.id, b"echo resumed-$((1+1))\r");
+        p.wait_for("update? ");
+        let failed = outcome.recv_timeout(TIMEOUT).expect("no outcome");
+        assert!(failed.as_ref().is_err_and(|e| e.contains("did not show its prompt")), "{failed:?}");
+        s.write(p.id, b"n\r".to_vec()).unwrap();
+        p.wait_for("answer=[n]");
+        s.write(p.id, b"echo done-$((2+2))\r".to_vec()).unwrap();
+        p.wait_for("done-4");
+        assert!(!p.text().contains("resumed"), "typed anyway: {:?}", p.text());
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn a_raw_mode_program_in_the_foreground_is_not_the_prompt() {
+        // Started from the profile under job control, so in its own process group, as
+        // tmux or a picker would be: it reads raw input for a second and shows what it got.
+        let profile = "set -m\nsh -c 'stty raw -echo min 0 time 10; got=$(dd bs=200 count=1 2>/dev/null); stty sane; echo \"child-got=[$got]\"'\n";
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300));
+        let p = login_bash(&s, "raw-child", profile);
+        let outcome = type_resume(&s, p.id, b"echo resumed-$((1+1))\r");
+        p.wait_for("child-got=[");
+        p.wait_for("resumed-2");
+        assert!(p.text().contains("child-got=[]"), "output: {:?}", p.text());
+        assert_eq!(outcome.recv_timeout(TIMEOUT), Ok(Ok(())));
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn closing_the_tab_while_waiting_for_the_prompt_ends_the_wait() {
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300));
+        let p = login_bash(&s, "closed-waiting", "read -p 'update? ' answer\n");
+        let outcome = type_resume(&s, p.id, b"echo resumed\r");
+        p.wait_for("update? ");
+        s.kill(p.id);
+        // Well within the 15 s prompt wait.
+        let closed = outcome.recv_timeout(Duration::from_secs(2)).expect("still waiting");
+        assert!(closed.as_ref().is_err_and(|e| e.contains("closed")), "{closed:?}");
+        p.exit_code();
+        assert!(!p.text().contains("resumed"), "typed anyway: {:?}", p.text());
+    }
+
+    #[test]
+    fn keys_held_back_for_the_prompt_count_towards_the_input_limit() {
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300));
+        let p = login_bash(&s, "held-limit", "read -p 'update? ' answer\n");
+        let _outcome = type_resume(&s, p.id, b"echo resumed\r");
+        p.wait_for("update? ");
+        s.write(p.id, vec![b'x'; INPUT_LIMIT]).unwrap();
+        assert!(s.write(p.id, b"y".to_vec()).is_err(), "held input is not counted");
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn keys_typed_while_waiting_for_the_prompt_follow_the_command() {
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300));
+        let p = login_bash(&s, "typed-ahead", "echo starting; sleep 1\n");
+        let outcome = type_resume(&s, p.id, b"echo resumed-$((1+1))\r");
+        p.wait_for("starting");
+        s.write(p.id, b"echo typed-$((2+1))".to_vec()).unwrap();
+        assert_eq!(outcome.recv_timeout(TIMEOUT), Ok(Ok(())));
+        s.write(p.id, b"\r".to_vec()).unwrap();
+        p.wait_for("typed-3");
+        let text = p.text();
+        let resumed = text.find("resumed-2").unwrap_or_else(|| panic!("not resumed: {text:?}"));
+        assert!(resumed < text.find("typed-3").unwrap(), "typed ahead of the command: {text:?}");
         s.kill(p.id);
         p.exit_code();
     }

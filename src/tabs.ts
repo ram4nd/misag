@@ -198,6 +198,15 @@ export function createTabs(opts: TabsOptions): Tabs {
     const onExit = new Channel<number>();
     onExit.onmessage = (code) =>
       markExited(s, code === 0 ? "process exited" : `process exited with code ${code}`);
+    // What became of a queued `claude --resume`, which may come before pty_spawn answers.
+    let resumed = false;
+    const onResume = new Channel<ResumeReport>();
+    onResume.onmessage = (report) => {
+      if (s.closing || s.starts !== startNo) return;
+      resumed = true;
+      showResume(s, report);
+      opts.scheduleSave();
+    };
 
     const request: TabLaunch = {
       ...s.run,
@@ -208,7 +217,7 @@ export function createTabs(opts: TabsOptions): Tabs {
       fallbackToHome,
     };
     try {
-      const started = await invoke<Spawned>("pty_spawn", { request, onData, onExit });
+      const started = await invoke<Spawned>("pty_spawn", { request, onData, onExit, onResume });
       // Closed while it started, so close() had no id to kill, and its notices are gone.
       if (s.closing) {
         invoke("pty_kill", { id: started.id }).catch((err) =>
@@ -228,7 +237,7 @@ export function createTabs(opts: TabsOptions): Tabs {
       if (s.run.kind === "terminal") {
         // Handed over once; from now on saves follow whatever Claude session is open in the tab.
         s.run = { ...s.run, claudeSession: null };
-        if (started.resume) showResume(s, started.resume);
+        if (started.resume && !(started.resume.state === "queued" && resumed)) showResume(s, started.resume);
       }
       if (started.skipsPermissions !== s.skipsPermissions) {
         s.skipsPermissions = started.skipsPermissions;
@@ -242,17 +251,25 @@ export function createTabs(opts: TabsOptions): Tabs {
     opts.scheduleSave();
   }
 
-  /** Follows up a terminal tab's saved Claude session, which its start tried to reopen. */
+  /**
+   * Follows up a terminal tab's saved Claude session, which its start tried to
+   * reopen: pty_spawn's report, then, for a queued one, its onResume's.
+   */
   function showResume(s: Session, resume: ResumeReport) {
     const topic = tabTopic(s, "resume");
-    if (resume.state === "typed") {
+    if (resume.state === "queued") {
+      // Not typed until the shell shows its prompt, so the shell alone does not mean Claude quit.
+      s.resumingUntil = Infinity;
+      notices.set(topic, null);
+    } else if (resume.state === "typed") {
       s.resumingUntil = Date.now() + HOOK_REPORT_DELAY_MS;
       notices.set(topic, null);
     } else if (resume.state === "noConversation") {
       s.claudeOpen = null;
       notices.set(topic, `Claude was open in “${s.name}”, but it saved no conversation there, so it was not reopened.`);
     } else {
-      // Kept, so the next start tries again.
+      // Kept until a Claude opens in the tab (or its shell exits), so the next start tries again.
+      s.resumingUntil = Infinity;
       notices.set(topic, `Claude could not be reopened in “${s.name}” (${resume.message}); the next start tries again.`);
     }
   }

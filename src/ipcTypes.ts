@@ -40,8 +40,12 @@ export interface Spawned {
   resume: ResumeReport | null;
 }
 
-/** Mirrors `commands::ResumeReport` in src-tauri/src/commands.rs. */
-export type ResumeReport = { state: "typed" } | { state: "noConversation" } | { state: "failed"; message: string };
+/** Mirrors `commands::ResumeReport` in src-tauri/src/commands.rs: pty_spawn gives queued, noConversation or failed, then a queued one gets typed or failed on its onResume channel. */
+export type ResumeReport =
+  | { state: "queued" }
+  | { state: "typed" }
+  | { state: "noConversation" }
+  | { state: "failed"; message: string };
 
 /** Mirrors `commands::ClaudeState` in src-tauri/src/commands.rs. */
 export type ClaudeState =
