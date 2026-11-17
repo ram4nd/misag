@@ -12,6 +12,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (cmd === "flow_start") return backend.started;
     if (cmd === "flow_runs") return [];
     if (cmd === "flow_continue") return "Fix what the review found";
+    if (cmd === "flow_cleared") return { state: "gone" };
     return null;
   }),
 }));
@@ -28,12 +29,21 @@ const decoder = new TextDecoder();
 let typed: string[];
 let locks: boolean[];
 let runs: RunController<Tab>;
+let busy: boolean;
+let background: boolean;
+let live: () => Promise<boolean>;
+/** Called as a flow takes or releases the tab's lock. */
+let onLock: () => void;
 const tab: Tab = { tabId: "t1" };
 
 beforeEach(() => {
   vi.useFakeTimers();
   typed = [];
   locks = [];
+  busy = false;
+  background = false;
+  live = async () => true;
+  onLock = () => {};
   backend.calls = [];
   backend.started = { runId: 7, clear: false, prompt: "Review the diff" };
   runs = createRunController<Tab>({
@@ -42,12 +52,16 @@ beforeEach(() => {
     tabs: () => [tab],
     active: () => tab,
     label: () => "tab 1",
-    busy: () => false,
-    live: async () => true,
+    busy: () => busy,
+    waitsInBackground: () => background,
+    live: (_t) => live(),
     write: (_t, data) => typed.push(decoder.decode(data)),
     editors: () => [],
     markWaiting: () => {},
-    lockChanged: (_t, locked) => locks.push(locked),
+    lockChanged: (_t, locked) => {
+      locks.push(locked);
+      onLock();
+    },
   });
 });
 
@@ -93,5 +107,114 @@ describe("a flow sending a prompt", () => {
     expect(await done).toBeNull();
     expect(typed).toEqual(["\x03", "\x1b[200~Fix what the review found\x1b[201~", "\r"]);
     expect(runs.locked(tab)).toBe(false);
+  });
+});
+
+describe("going on from a step", () => {
+  const run = { id: 7, tabId: "t1", stepId: "s", flowId: 1, status: "running" } as unknown as Run;
+  const working = "Claude is working in tab 1; interrupt it (Esc) or wait for its reply, then go on, or stop the run with ■.";
+  const waiting =
+    "Claude in tab 1 is waiting on background tasks, which wake it for another turn; go on once they finish, or stop the run with ■.";
+
+  test("going on while Claude is busy types nothing and says why", async () => {
+    busy = true;
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe(working);
+    const resumed = runs.resume(run);
+    await vi.runAllTimersAsync();
+    expect(await resumed).toBe(working);
+    expect(backend.calls).not.toContain("flow_continue");
+    expect(backend.calls).not.toContain("flow_resume");
+    expect(backend.calls).toContain("flow_runs");
+    expect(typed).toEqual([]);
+    expect(locks).toEqual([]);
+  });
+
+  test("a waiting run is refused too while Claude is busy", async () => {
+    busy = true;
+    const picked = runs.proceed({ ...run, status: "manual" }, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe(working);
+    expect(backend.calls).not.toContain("flow_continue");
+    expect(typed).toEqual([]);
+  });
+
+  test("going on while Claude waits on background tasks types nothing and says why", async () => {
+    background = true;
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe(waiting);
+    expect(backend.calls).not.toContain("flow_continue");
+    expect(backend.calls).toContain("flow_runs");
+    expect(typed).toEqual([]);
+  });
+
+  test("Claude not running wins over Claude busy", async () => {
+    busy = true;
+    live = async () => false;
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe("Claude is not running in tab 1; start it there first, or stop the run.");
+  });
+
+  test("Claude starting to work while the pick waits for its check is refused", async () => {
+    live = async () => {
+      // Claude's title updates while the check is under way.
+      busy = true;
+      return true;
+    };
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe(working);
+    expect(backend.calls).not.toContain("flow_continue");
+    expect(typed).toEqual([]);
+  });
+
+  test("Claude starting to work as the pick takes the tab's lock is refused", async () => {
+    onLock = () => {
+      busy = true;
+    };
+    const picked = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await picked).toBe(working);
+    expect(backend.calls).not.toContain("flow_continue");
+    expect(typed).toEqual([]);
+    expect(locks).toEqual([true, false]);
+  });
+
+  test("goes on once Claude is idle again", async () => {
+    busy = true;
+    const refused = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    await refused;
+    busy = false;
+    const done = runs.proceed(run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await done).toBeNull();
+    expect(backend.calls).toContain("flow_continue");
+    expect(typed).toEqual(["\x1b[200~Fix what the review found\x1b[201~", "\r"]);
+  });
+});
+
+describe("starting a flow", () => {
+  test("is refused while Claude waits on background tasks, as their turn would be taken for the briefing's reply", async () => {
+    background = true;
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(backend.calls).not.toContain("flow_start");
+    expect(typed).toEqual([]);
+  });
+
+  test("one that clears still starts while Claude waits on background tasks", async () => {
+    background = true;
+    backend.started = { runId: 7, clear: true, prompt: null };
+    const done = runs.start({ ...flow, clear: true });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(backend.calls).toContain("flow_start");
+    expect(typed).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
+    await vi.runAllTimersAsync();
+    await done;
   });
 });

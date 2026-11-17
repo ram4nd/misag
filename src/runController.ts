@@ -58,6 +58,11 @@ export interface RunControllerOptions<T extends RunTab> {
   /** Whether Claude is working in the tab. */
   busy(tab: T): boolean;
   /**
+   * Whether Claude in the tab is idle but waiting on background tasks, which wake it
+   * for another turn when they finish.
+   */
+  waitsInBackground(tab: T): boolean;
+  /**
    * Whether Claude runs in the tab right now, so a prompt typed there goes to Claude
    * and not to a shell.
    */
@@ -291,6 +296,14 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       flows.showBoxError(`Claude is working in ${opts.label(tab)}, so "${flow.name}" was not started; press ▶ again when it is idle.`);
       return;
     }
+    if (!flow.clear && opts.waitsInBackground(tab)) {
+      // The turn the tasks wake Claude for would be taken for its reply to the briefing.
+      // A flow that clears first still starts: /clear ends the conversation they belong to.
+      flows.showBoxError(
+        `Claude in ${opts.label(tab)} is waiting on background tasks, so "${flow.name}" was not started; press ▶ again once they finish.`,
+      );
+      return;
+    }
     let started: Started;
     try {
       // The run starts from the stored flow, so the editor's latest change goes first;
@@ -367,9 +380,13 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     let error: string | null = null;
     if (!tab || !(await opts.live(tab))) {
       error = `Claude is not running in ${tab ? opts.label(tab) : "the run's tab"}; start it there first, or stop the run.`;
-    } else {
+    } else if ((error = stillWorking(tab)) === null) {
       try {
         const prompt = await withLock(tab, async () => {
+          // Claude's state comes from its terminal title, which may have changed while
+          // this waited for the check above or for the lock.
+          error = stillWorking(tab);
+          if (error !== null) return null;
           const next = await go();
           // Gone on from a manual prompt: its unsent draft is no longer for anything.
           await clearPaste(tab);
@@ -383,6 +400,22 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     }
     await poll();
     return error;
+  }
+
+  /**
+   * Why the run in `tab` cannot go on yet, or null: the end of the turn Claude is in,
+   * or of the one its background tasks wake it for, would be taken for its reply to the
+   * next step, and a prompt typed now would wait behind it. Esc reports no reply, so a
+   * pick once Claude is idle goes on as it should.
+   */
+  function stillWorking(tab: T): string | null {
+    if (opts.busy(tab)) {
+      return `Claude is working in ${opts.label(tab)}; interrupt it (Esc) or wait for its reply, then go on, or stop the run with ■.`;
+    }
+    if (opts.waitsInBackground(tab)) {
+      return `Claude in ${opts.label(tab)} is waiting on background tasks, which wake it for another turn; go on once they finish, or stop the run with ■.`;
+    }
+    return null;
   }
 
   async function stop(run: Run) {

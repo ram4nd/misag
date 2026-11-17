@@ -1766,6 +1766,7 @@ const runs = createRunController<Session>({
   label: tabLabel,
   // Claude waiting on background tasks takes /clear, and they may never end.
   busy: claudeWorking,
+  waitsInBackground,
   live: claudeLive,
   write,
   *editors() {

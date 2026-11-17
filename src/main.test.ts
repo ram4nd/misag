@@ -4191,6 +4191,18 @@ describe("flow runs", () => {
     expect(box().querySelector(".error")!.textContent).toContain("working");
   });
 
+  test("a flow that does not clear does not start while Claude waits on background tasks, as the turn they wake it for would be taken for the briefing's reply", async () => {
+    runPrompt = "The briefing.";
+    await boot();
+    await openClaudeTabs(1);
+    backgroundTabs = { [spawns()[0].tabId]: Date.now() };
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await play("Deploy");
+    expect(callsOf("flow_start")).toHaveLength(0);
+    expect(typed()).toEqual([]);
+    expect(box().querySelector(".error")!.textContent).toContain("waiting on background tasks");
+  });
+
   test("a flow that clears still starts while Claude only waits on background tasks, as Claude is idle", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
     await boot();
@@ -4750,6 +4762,26 @@ describe("flow runs and Claude's state", () => {
     await settle();
     expect(callsOf("flow_continue")).toHaveLength(1);
     expect(runError().hidden).toBe(true);
+  });
+
+  test("a run does not go on while Claude waits on background tasks, which wake it for another turn", async () => {
+    runPrompt = "Next.";
+    await boot();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId })];
+    backgroundTabs = { [tabId]: Date.now() };
+    await poll();
+    await open();
+    output().click();
+    await settle();
+    expect(callsOf("flow_continue")).toHaveLength(0);
+    expect(runError().textContent).toContain("waiting on background tasks");
+    backgroundTabs = {};
+    await poll();
+    output().click();
+    await settle();
+    expect(callsOf("flow_continue")).toHaveLength(1);
   });
 
   test("a prompt's Enter is held back if Claude left a terminal tab while it was pasted", async () => {

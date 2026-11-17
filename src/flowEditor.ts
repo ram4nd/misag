@@ -462,7 +462,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       b.title = awaitsPrompt(shown)
         ? `Skip without sending your prompt: go on as "${output}"`
         : shown.status === "running"
-          ? `Claude is still on this step; go on as "${output}" anyway`
+          ? `For when Claude was interrupted (Esc) and no reply will come: go on as "${output}"`
           : `Go on as "${output}"`;
       b.onclick = () => once(() => opts.onContinue(shown, output));
       return b;
