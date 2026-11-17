@@ -8,7 +8,7 @@ import tauriConfig from "../src-tauri/tauri.conf.json?raw";
 import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
 
 // wterm needs WASM and real layout, so the tests drive a stand-in that
-// records writes and exposes the callbacks main.ts assigns.
+// records writes and exposes the callbacks tabs.ts and terminalView.ts assign.
 const fakes = vi.hoisted(() => {
   type Used = "cols" | "rows" | "element" | "onData" | "onBinary" | "onTitle" | "onResize" | "write" | "fit" | "focus" | "destroy" | "setRenderingPaused" | "bridge" | "getSelectionText";
   class FakeTerminal implements Pick<WTerm, Used> {
@@ -146,6 +146,8 @@ const picker = vi.hoisted(() => ({
   /** The answer to a yes/no question, and the questions asked. */
   answer: false,
   asked: [] as string[],
+  /** Makes asking fail, as a dialog that cannot open would. */
+  askFails: false,
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: async (options: { defaultPath?: string }) => {
@@ -155,6 +157,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   },
   ask: async (message: string) => {
     picker.asked.push(message);
+    if (picker.askFails) throw new Error("no portal");
     return picker.answer;
   },
 }));
@@ -195,9 +198,9 @@ type Layout = {
   active: number;
 };
 
-/** How often main.ts checks tab directories; mirrors TAB_POLL_MS there. */
+/** How often the app checks tab directories; mirrors TAB_POLL_MS in tabPoller.ts. */
 const TAB_POLL_MS = 2_000;
-/** How often main.ts asks whether Claude has cleared, and for how long; mirrors CLEAR_POLL_MS and CLEAR_TIMEOUT_MS there. */
+/** How often the app asks whether Claude has cleared, and for how long; mirrors CLEAR_POLL_MS and CLEAR_TIMEOUT_MS in runController.ts. */
 const CLEAR_POLL_MS = 250;
 const CLEAR_TIMEOUT_MS = 30_000;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -504,6 +507,7 @@ beforeEach(() => {
   picker.fails = false;
   picker.calls = [];
   picker.answer = false;
+  picker.askFails = false;
   importRefusal = null;
   flowPicked = true;
   primarySelection = null;
@@ -955,7 +959,7 @@ describe("tab icons", () => {
 
   /**
    * The finish sound plays on the first tab check that starts at least
-   * FINISH_SETTLE_MS (mirrors main.ts) after Claude went idle, so it waits up to a
+   * FINISH_SETTLE_MS (mirrors tabState.ts) after Claude went idle, so it waits up to a
    * check interval longer; tab checks run every TAB_POLL_MS from boot.
    */
   const FINISH_SETTLE_MS = 1_000;
@@ -1573,6 +1577,30 @@ describe("input", () => {
       picker.answer = true;
       await rightClick();
       expect(typed()).toEqual(["rm -rf build\rmake\r"]);
+    });
+
+    test("a paste dialog that cannot open types nothing and says so", async () => {
+      clipboard = "rm -rf build\nmake\n";
+      picker.askFails = true;
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      await startApp();
+      await clickClaude();
+      await rightClick();
+      expect(typed()).toEqual([]);
+      expect(noticeText()).toContain("Could not paste the clipboard: no portal.");
+      expect(error).toHaveBeenCalledWith("misag: could not ask before pasting the clipboard", expect.any(Error));
+    });
+
+    test("a paste still reading the clipboard at dispose types nothing", async () => {
+      clipboard = "ls";
+      await startApp();
+      await clickClaude();
+      terms()[0].element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, button: 2 }));
+      dispose!();
+      dispose = null;
+      for (let i = 0; i < 6; i++) await flush();
+      expect(callsOf("clipboard_text")).toHaveLength(1);
+      expect(typed()).toEqual([]);
     });
 
     test("more than one line in brackets is pasted without asking, as the program will not run it", async () => {
@@ -5819,6 +5847,51 @@ describe("startup and dispose", () => {
     expect(callsOf("fs_list")).toEqual([]);
     expect(tabs()).toEqual([]);
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("a tab check in flight at dispose changes nothing once it returns", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    await startApp();
+    await clickClaude();
+    await clickTerminal();
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    // The held check would confirm the Claude tab's finish and show Claude in the terminal tab.
+    terms()[0].onTitle!("◐ Claude Code");
+    terms()[0].onTitle!("✳ Claude Code");
+    await vi.advanceTimersByTimeAsync(1_000);
+    let release!: () => void;
+    claudeCheckGate = new Promise((r) => (release = r));
+    openClaudes[2] = SESSION;
+    const checks = callsOf("claude_open_sessions").length;
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    expect(callsOf("claude_open_sessions").length).toBe(checks + 1);
+    const bar = document.querySelector("#tabs")!.innerHTML;
+    const before = calls.length;
+    dispose!();
+    dispose = null;
+    release();
+    for (let i = 0; i < 5; i++) await flush();
+    expect(sounds.played).toEqual([]);
+    expect(calls.slice(before)).toEqual([]);
+    expect(document.querySelector("#tabs")!.innerHTML).toBe(bar);
+  });
+
+  test("a boot that throws partway stops what it started, so the page can boot again", async () => {
+    loadPage();
+    document.querySelector("#flows-box")!.remove();
+    const main = await import("./main");
+    expect(() => main.boot()).toThrow("misag: missing element #flows-box");
+    expect(resizeDisconnects).toBe(1);
+    const width = document.querySelector<HTMLElement>("#sidebar")!.style.getPropertyValue("--sidebar-width");
+    Object.defineProperty(window, "innerWidth", { value: 300, configurable: true, writable: true });
+    window.dispatchEvent(new Event("resize"));
+    Object.defineProperty(window, "innerWidth", { value: 1024, configurable: true, writable: true });
+    expect(document.querySelector<HTMLElement>("#sidebar")!.style.getPropertyValue("--sidebar-width")).toBe(width);
+    await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    await startApp();
+    await clickTerminal();
+    expect(tabNames()).toEqual(["shell 1"]);
   });
 
   test("booting twice without dispose throws, and booting again after dispose works", async () => {

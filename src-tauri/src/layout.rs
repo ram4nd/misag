@@ -1,5 +1,5 @@
 //! The open tabs, as saved between runs (stored by `db`). Mirrored by `Layout`
-//! and `LayoutTab` in src/main.ts; `src-tauri/tests/fixtures/layout.json` is a
+//! and `LayoutTab` in src/ipcTypes.ts; `src-tauri/tests/fixtures/layout.json` is a
 //! shared example both sides parse.
 
 use crate::claude::SessionId;

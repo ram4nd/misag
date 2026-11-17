@@ -628,7 +628,7 @@ fn last_hook_failure(log: &Path) -> std::io::Result<Option<HookFailure>> {
     }))
 }
 
-/// The last failure the session hook logged. Mirrored by `HookProblem` in src/main.ts.
+/// The last failure the session hook logged. Mirrored by `HookProblem` in src/ipcTypes.ts.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HookProblem {

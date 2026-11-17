@@ -40,7 +40,7 @@ impl AppExe {
 }
 
 /// What a tab runs once started: unlike `layout::TabKind`, a Claude tab always has
-/// its session. Mirrored by `RunningKind` in src/main.ts.
+/// its session. Mirrored by `RunningKind` in src/ipcTypes.ts.
 #[derive(Deserialize, Debug, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase", rename_all_fields = "camelCase")]
 pub enum RunningKind {
@@ -54,7 +54,7 @@ pub enum RunningKind {
     Claude { claude_session: SessionId },
 }
 
-/// What the frontend asks a tab to run. Mirrored by `TabLaunch` in src/main.ts.
+/// What the frontend asks a tab to run. Mirrored by `TabLaunch` in src/ipcTypes.ts.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TabLaunch {
@@ -69,7 +69,7 @@ pub struct TabLaunch {
     pub kind: RunningKind,
 }
 
-/// A started tab. Mirrored by `Spawned` in src/main.ts.
+/// A started tab. Mirrored by `Spawned` in src/ipcTypes.ts.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Spawned {
@@ -360,7 +360,7 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, dirs: &TabDirs) -> Res
 }
 
 /// What became of a terminal tab's saved Claude session. Mirrored by
-/// `ResumeReport` in src/main.ts.
+/// `ResumeReport` in src/ipcTypes.ts.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ResumeReport {
@@ -438,7 +438,7 @@ pub struct TabSession {
 
 /// Whether a terminal tab has a Claude session open, and whether that Claude runs
 /// tools without asking (see `settings::skips_permissions`). Mirrored by
-/// `ClaudeState` in src/main.ts.
+/// `ClaudeState` in src/ipcTypes.ts.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ClaudeState {
@@ -859,7 +859,7 @@ pub fn layout_save(db: State<'_, Db>, layout: Layout) -> Result<(), CommandError
     Ok(db.save_layout(layout)?)
 }
 
-/// Saving state for the UI. Mirrored by `StoreReport` in src/main.ts.
+/// Saving state for the UI. Mirrored by `StoreReport` in src/ipcTypes.ts.
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreReport {

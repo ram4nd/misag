@@ -1,5 +1,5 @@
 //! User settings, edited on the settings tab and stored by `db` in the `settings`
-//! table. Mirrored by `Settings` in src/main.ts.
+//! table. Mirrored by `Settings` in src/ipcTypes.ts.
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};

@@ -166,7 +166,7 @@ impl Clear {
     }
 }
 
-/// A run just started. Mirrored by `Started` in src/main.ts.
+/// A run just started. Mirrored by `Started` in src/runController.ts.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Started {
@@ -191,7 +191,7 @@ pub struct StepPrompt {
     pub briefs: bool,
 }
 
-/// How a run whose Start clears is getting on. Mirrored in src/main.ts.
+/// How a run whose Start clears is getting on. Mirrored by `Cleared` in src/runController.ts.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum Cleared {

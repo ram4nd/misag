@@ -1,4 +1,4 @@
-//! Directory listings for the sidebar's file tree. Mirrored by `Listing` in src/main.ts.
+//! Directory listings for the sidebar's file tree. Mirrored by `Listing` in src/tree.ts.
 
 use serde::Serialize;
 

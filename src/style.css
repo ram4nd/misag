@@ -93,7 +93,7 @@ body.dragging-tab, body.dragging-tab * { cursor: grabbing !important; }
   border-right: 1px solid var(--press); transition: width .15s ease;
 }
 body.sidebar-collapsed #sidebar { width: 0; border-right: 0; }
-/* The sidebar's edge, a few px wide over its border, dragged to resize it (see main.ts). */
+/* The sidebar's edge, a few px wide over its border, dragged to resize it (see sidebar.ts). */
 #sidebar-resizer { flex: none; width: 6px; margin: 0 -3px; position: relative; z-index: 3; cursor: col-resize; }
 #sidebar-resizer:hover, #sidebar-resizer:focus-visible, body.resizing-sidebar #sidebar-resizer { background: var(--accent); outline: none; }
 body.sidebar-collapsed #sidebar-resizer { display: none; }

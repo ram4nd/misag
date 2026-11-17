@@ -58,7 +58,7 @@ export interface RunControllerOptions<T extends RunTab> {
   flows: Pick<Flows, "showRuns" | "showBoxError" | "reload">;
   errorText(err: unknown): string;
   /** The open tabs, in tab-bar order. */
-  tabs(): T[];
+  tabs(): readonly T[];
   /** The tab selected last. */
   active(): T | null;
   /** The tab's name, for messages. */

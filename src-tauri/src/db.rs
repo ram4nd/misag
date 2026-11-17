@@ -521,7 +521,7 @@ fn sql(e: rusqlite::Error) -> String {
     format!("database error: {e}")
 }
 
-/// Whether tabs are being saved, for the UI. Mirrored by `StoreStatus` in src/main.ts.
+/// Whether tabs are being saved, for the UI. Mirrored by `StoreStatus` in src/ipcTypes.ts.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum StoreStatus {
