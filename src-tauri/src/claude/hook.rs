@@ -1,7 +1,7 @@
 //! The hook itself: reads Claude's payload and records the session, moves the
 //! tab's flow run on, or forgets its background tasks.
 
-use super::hook_log::log_failure;
+use super::hook_log::{self, log_failure, note_working};
 use super::{SessionId, DB_ENV, HOOK_FLAG, PID_ENV, TAB_ENV};
 use crate::db::{self, SessionReport};
 use crate::layout::TabId;
@@ -166,7 +166,7 @@ fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>
 /// background tasks, which end with it.
 fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
     let event: SessionEnd = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
-    let Some(conn) = db::connect_if_current(db_path)? else { return Ok(()) };
+    let conn = db::connect_existing(db_path)?;
     db::record_background(&conn, tab_id, &event.session_id, false)
 }
 
@@ -175,7 +175,7 @@ fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
 /// owed. If it cannot, a run waiting at a manual prompt waits for the person
 /// instead, as it would never see Claude's answer.
 fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
-    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
+    let mut conn = db::connect_existing(db_path)?;
     let told = serde_json::from_str::<PromptSubmit>(input)
         .map_err(|e| format!("bad hook payload: {e}"))
         .and_then(|event| crate::runs::on_prompt(&mut conn, tab_id, &event.prompt));
@@ -241,8 +241,16 @@ pub fn run_hook() -> i32 {
             tab_id.as_ref(),
             &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
         ),
-        Ok(Outcome::Recorded | Outcome::Stopped(None) | Outcome::Ended | Outcome::Prompted(None)) => {}
-        Ok(Outcome::Stopped(Some(output)) | Outcome::Prompted(Some(output))) => println!("{output}"),
+        Ok(outcome) => {
+            // Whatever the event, the hook works again for this tab, unless it logged a
+            // failure along the way (such as background tasks it could not record).
+            if !hook_log::failed() {
+                note_working(db_path.as_deref(), tab_id.as_ref());
+            }
+            if let Outcome::Stopped(Some(output)) | Outcome::Prompted(Some(output)) = outcome {
+                println!("{output}");
+            }
+        }
     }
     0
 }

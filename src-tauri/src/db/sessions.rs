@@ -10,18 +10,6 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 impl Db {
-    /// When the hook last reported a session (unix seconds), for `tab_id` or for any tab.
-    pub fn latest_report_at(&self, tab_id: Option<&TabId>) -> Result<Option<u64>, String> {
-        self.conn()
-            .query_row(
-                "SELECT MAX(updated_at) FROM claude_sessions WHERE ?1 IS NULL OR tab_id = ?1",
-                [tab_id.map(TabId::as_str)],
-                |r| r.get::<_, Option<i64>>(0),
-            )
-            .map(|at| at.map(|at| u64::try_from(at).unwrap_or(0)))
-            .map_err(sql)
-    }
-
     /// The transcript the hook last reported for `session`, if any. Two tabs can be
     /// in the same session (`/resume` of it in both); the newest report wins.
     pub fn transcript_for(&self, session: &SessionId) -> Result<Option<PathBuf>, String> {
@@ -320,17 +308,6 @@ mod tests {
         assert_eq!(db.background_tabs().unwrap().into_keys().collect::<Vec<_>>(), ["t"]);
         record_background(&conn, &tid("t"), S1, false).unwrap();
         assert!(db.background_tabs().unwrap().is_empty());
-    }
-
-    #[test]
-    fn finds_the_latest_report_per_tab_or_overall() {
-        let path = temp_db("latest-report");
-        let db = Db::open(path.clone()).unwrap();
-        assert_eq!(db.latest_report_at(None).unwrap(), None);
-        record_claude_session(&connect_existing(&path).unwrap(), &report(&tid("a"), &sid(S1))).unwrap();
-        assert!(db.latest_report_at(Some(&tid("a"))).unwrap().is_some());
-        assert!(db.latest_report_at(None).unwrap().is_some());
-        assert_eq!(db.latest_report_at(Some(&tid("b"))).unwrap(), None);
     }
 
     #[test]

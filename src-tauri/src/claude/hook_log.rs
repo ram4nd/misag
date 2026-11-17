@@ -4,8 +4,9 @@
 use crate::db::{unix_secs, Db};
 use crate::layout::TabId;
 use serde::Serialize;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 /// Hook failures are appended here, next to the database, since Claude does not
@@ -13,26 +14,60 @@ use std::time::SystemTime;
 pub const HOOK_LOG: &str = "hook.log";
 const HOOK_LOG_LIMIT: u64 = 256 * 1024;
 /// Messages are cut to this many characters, so every entry fits in the tail
-/// `last_hook_failure` reads.
+/// `unresolved_failures` reads.
 const HOOK_MESSAGE_LIMIT: usize = 1000;
 /// Longer than any entry (up to 4 bytes per character, plus the time, a tab id of
 /// at most 128 bytes and separators), so the newest entry is always read whole.
 const HOOK_LOG_TAIL: u64 = 4 * HOOK_MESSAGE_LIMIT as u64 + 256;
 /// Written in place of the tab id when the hook does not know its tab.
 const NO_TAB: &str = "-";
+/// The message of an entry that says the hook worked again for its tab, after
+/// failures logged before it (see `note_working`).
+const WORKING: &str = "(the hook works again)";
 
-/// Appends a failure to the hook log next to the database, starting the log over
-/// once it grows past `HOOK_LOG_LIMIT`. Best effort: logging must not fail the hook,
-/// so a log that cannot be written is only reported on stderr. Each entry is one
-/// line, `<unix time> <tab id or -> <message>`, parsed by `last_hook_failure`.
+/// Whether this process logged a failure (see `failed`).
+static FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Whether this process logged a failure, so the hook does not then say it works.
+pub(super) fn failed() -> bool {
+    FAILED.load(Ordering::Relaxed)
+}
+
+/// Appends a failure to the hook log next to the database (see `append`).
 pub(super) fn log_failure(db_path: Option<&Path>, tab_id: Option<&TabId>, message: &str) {
-    use std::io::Write;
+    FAILED.store(true, Ordering::Relaxed);
     let mut message = message.replace(['\r', '\n'], " | ");
     if let Some((cut, _)) = message.char_indices().nth(HOOK_MESSAGE_LIMIT) {
         message.truncate(cut);
         message.push('…');
     }
     let _ = writeln!(std::io::stderr(), "misag: {message}");
+    append(db_path, tab_id, &message);
+}
+
+/// After the hook did its work for `tab_id`, logging no failure, says so in the
+/// log if failures for that tab (or for no tab) are logged without that since, so
+/// the app stops showing them. Nothing is written otherwise, so a working hook
+/// leaves the log alone.
+pub(super) fn note_working(db_path: Option<&Path>, tab_id: Option<&TabId>) {
+    let (Some(db_path), Some(tab_id)) = (db_path, tab_id) else { return };
+    let Some(log) = db_path.parent().map(|dir| dir.join(HOOK_LOG)) else { return };
+    match unresolved_failures(&log) {
+        Ok(failures) if failures.iter().any(|f| f.tab_id.as_ref().is_none_or(|t| t == tab_id)) => {
+            append(Some(db_path), Some(tab_id), WORKING);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "misag: could not read {}: {e}", log.display());
+        }
+    }
+}
+
+/// Appends an entry to the hook log next to the database, starting the log over
+/// once it grows past `HOOK_LOG_LIMIT`. Best effort: logging must not fail the hook,
+/// so a log that cannot be written is only reported on stderr. Each entry is one
+/// line, `<unix time> <tab id or -> <message>`, parsed by `unresolved_failures`.
+fn append(db_path: Option<&Path>, tab_id: Option<&TabId>, message: &str) {
     let Some(log) = db_path.and_then(Path::parent).map(|dir| dir.join(HOOK_LOG)) else { return };
     let file = crate::open_capped_log(&log, HOOK_LOG_LIMIT);
     let tab = tab_id.map_or(NO_TAB, TabId::as_str);
@@ -53,13 +88,16 @@ struct HookFailure {
     message: String,
 }
 
-/// The newest entry in the hook log at `log`; None if there is no log. Only the
-/// end of the file is read, and when that cuts into an entry, the partial first
-/// line is dropped.
-fn last_hook_failure(log: &Path) -> std::io::Result<Option<HookFailure>> {
+/// The failures in the hook log at `log` that no later entry says the hook works
+/// again for, newest first: one for a tab is resolved by a later `WORKING` entry
+/// for that tab, one for no tab by any. Empty if there is no log. Only the end of
+/// the file is read, and when that cuts into an entry, the partial first line is
+/// dropped. The order of the entries decides, not their times, which are whole
+/// seconds.
+fn unresolved_failures(log: &Path) -> std::io::Result<Vec<HookFailure>> {
     let mut file = match std::fs::File::open(log) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     let start = file.metadata()?.len().saturating_sub(HOOK_LOG_TAIL);
@@ -68,7 +106,7 @@ fn last_hook_failure(log: &Path) -> std::io::Result<Option<HookFailure>> {
     file.read_to_end(&mut bytes)?;
     let text = String::from_utf8_lossy(&bytes);
     let complete = if start > 0 { text.split_once('\n').map_or("", |(_, rest)| rest) } else { &text };
-    Ok(complete.lines().rev().find_map(|line| {
+    let entries = complete.lines().rev().filter_map(|line| {
         let (time, rest) = line.split_once(' ')?;
         let (tab, message) = rest.split_once(' ')?;
         let tab_id = match tab {
@@ -76,7 +114,16 @@ fn last_hook_failure(log: &Path) -> std::io::Result<Option<HookFailure>> {
             tab => Some(TabId::parse(tab).ok()?),
         };
         Some(HookFailure { at: time.parse().ok()?, tab_id, message: message.to_owned() })
-    }))
+    });
+    let (mut working, mut unresolved) = (Vec::new(), Vec::new());
+    for entry in entries {
+        if entry.message == WORKING {
+            working.extend(entry.tab_id);
+        } else if entry.tab_id.as_ref().map_or(working.is_empty(), |tab| !working.contains(tab)) {
+            unresolved.push(entry);
+        }
+    }
+    Ok(unresolved)
 }
 
 /// The last failure the session hook logged. Mirrored by `HookProblem` in src/ipcTypes.ts.
@@ -91,24 +138,19 @@ pub struct HookProblem {
     pub log: String,
 }
 
-/// The last failure the session hook logged during this run, unless the tab it
-/// failed for (or, when it did not know its tab, any tab) has reported a session
-/// since, which means the hook works again.
+/// The newest failure the session hook logged during this run that the hook has
+/// not since worked for its tab (or, when it did not know its tab, for any tab)
+/// after (see `note_working`).
 pub fn hook_problem(db: &Db) -> Option<HookProblem> {
     let log = db.hook_path()?.parent()?.join(HOOK_LOG);
     let shown = log.display().to_string();
     let opened = unix_secs(db.opened());
-    let failure = match last_hook_failure(&log) {
-        Ok(failure) => failure?,
+    let failure = match unresolved_failures(&log) {
+        Ok(failures) => failures.into_iter().next()?,
         Err(e) => return Some(HookProblem { at: opened, message: format!("cannot read the log: {e}"), log: shown }),
     };
     if failure.at < opened {
         return None;
-    }
-    match db.latest_report_at(failure.tab_id.as_ref()) {
-        Ok(Some(reported)) if reported > failure.at => return None,
-        Ok(_) => {}
-        Err(e) => eprintln!("misag: could not check the latest session report: {e}"),
     }
     let message = match &failure.tab_id {
         Some(tab) => format!("tab {tab}: {}", failure.message),
@@ -120,11 +162,8 @@ pub fn hook_problem(db: &Db) -> Option<HookProblem> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::test_util::id;
     use crate::db::test_util::{temp_db, tid};
-    use crate::db;
     use std::fs;
-    use std::io::Write;
     use std::path::PathBuf;
 
     fn log_of(db_path: &Path) -> PathBuf {
@@ -217,34 +256,42 @@ mod tests {
     }
 
     #[test]
-    fn only_the_failing_tabs_later_report_clears_its_problem() {
+    fn a_tab_s_later_working_hook_clears_its_problem_within_the_same_second() {
         let path = temp_db("hook-recovered");
         let db = Db::open(path.clone()).unwrap();
-        let opened = unix_secs(db.opened());
-        // Explicit times instead of waiting for the clock: entries and reports `at` seconds after opening.
-        let fail = |at: u64, tab: &str| {
-            let line = format!("{} {tab} failure\n", opened + at);
-            fs::OpenOptions::new().create(true).append(true).open(log_of(&path)).unwrap().write_all(line.as_bytes()).unwrap();
-        };
-        let conn = db::connect_existing(&path).unwrap();
-        let session = id();
-        let report = |at: u64, tab: &str| {
-            let tab = tid(tab);
-            db::record_claude_session(&conn, &db::test_util::report(&tab, &session)).unwrap();
-            conn.execute("UPDATE claude_sessions SET updated_at = ?1 WHERE tab_id = ?2", rusqlite::params![(opened + at) as i64, tab.as_str()])
-                .unwrap();
-        };
-        fail(1, "a");
-        report(2, "b");
-        assert!(hook_problem(&db).is_some(), "another tab working says nothing about tab a");
-        report(2, "a");
-        assert_eq!(hook_problem(&db), None, "the hook worked for tab a after the failure");
+        let message = || hook_problem(&db).map(|p| p.message);
+        // All within a second or so: the order of the entries decides, not their times.
+        log_failure(Some(&path), Some(&tid("a")), "a failed");
+        note_working(Some(&path), Some(&tid("b")));
+        assert_eq!(message().as_deref(), Some("tab a: a failed"), "another tab working says nothing about tab a");
+        note_working(Some(&path), Some(&tid("a")));
+        assert_eq!(message(), None, "the hook worked for tab a after the failure, whichever event it ran for");
 
-        // A failure that did not know its tab is cleared by any later report.
-        fail(3, "-");
-        assert!(hook_problem(&db).is_some());
-        report(4, "b");
-        assert_eq!(hook_problem(&db), None);
+        // Of two failing tabs, the one that still fails is shown.
+        log_failure(Some(&path), Some(&tid("a")), "a failed again");
+        log_failure(Some(&path), Some(&tid("b")), "b failed");
+        note_working(Some(&path), Some(&tid("b")));
+        assert_eq!(message().as_deref(), Some("tab a: a failed again"));
+        note_working(Some(&path), Some(&tid("a")));
+        assert_eq!(message(), None);
+
+        // A failure that did not know its tab is cleared by any tab's working hook.
+        log_failure(Some(&path), None, "no tab");
+        note_working(Some(&path), Some(&tid("c")));
+        assert_eq!(message(), None);
+    }
+
+    #[test]
+    fn a_working_hook_writes_nothing_when_there_is_nothing_to_clear() {
+        let path = temp_db("hook-working-quiet");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        note_working(Some(&path), Some(&tid("a")));
+        assert!(!log_of(&path).exists());
+        log_failure(Some(&path), Some(&tid("a")), "a failed");
+        note_working(Some(&path), Some(&tid("a")));
+        let before = fs::read_to_string(log_of(&path)).unwrap();
+        note_working(Some(&path), Some(&tid("a")));
+        assert_eq!(fs::read_to_string(log_of(&path)).unwrap(), before, "already cleared");
     }
 
     #[test]
