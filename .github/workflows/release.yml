@@ -30,34 +30,25 @@ jobs:
             args: '--bundles msi'
             os: Windows_x64
     runs-on: ${{ matrix.platform }}
+    # Well above a normal build and notarization, so a hung one does not hold a runner for hours.
+    timeout-minutes: 90
     env:
       # Only macOS builds from main or a version tag get the Apple signing secrets, so
       # a run of another branch cannot sign its code as ours. Not named SIGN: the
       # AppImage bundler GPG-signs when a variable of that name is set at all.
       MISAG_SIGN_MACOS: ${{ matrix.platform == 'macos-latest' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
+      # Without persisted credentials, so the job's write token is not left in .git/config
+      # for dependency code to read; the steps that need it are given it explicitly.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          version: 12
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      # Needs the checkout above, since it is a local action.
+      - uses: ./.github/actions/setup
         with:
-          node-version: lts/*
-          cache: pnpm
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+          # The AppImage bundler needs these.
+          extra-apt-packages: patchelf xdg-utils
 
       - name: Check that the tag matches the app's version
         if: github.ref_type == 'tag'
@@ -79,12 +70,16 @@ jobs:
       - run: pnpm build
 
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
 
-      # Signs with the Developer ID certificate and notarizes with Apple, so Gatekeeper
-      # opens the app without a warning. Handed to the build step only, after the
-      # tests, and never empty: a missing secret would quietly build an unsigned app.
-      - name: Apple signing credentials
+      # Fails the job when a signing secret is empty, as the app would then quietly build
+      # unsigned. The signing itself (Developer ID certificate, notarization with Apple,
+      # so Gatekeeper opens the app without a warning) happens in the signed build step.
+      # The secrets go only to that step's env, never $GITHUB_ENV, so other steps and the
+      # actions' post steps do not get them. The build that step runs still does: its
+      # Cargo build scripts, `pnpm build` and Vite plugins see them, so a compromised
+      # dependency could read them there (the bundler needs them in its environment).
+      - name: Check the Apple signing credentials
         if: env.MISAG_SIGN_MACOS == 'true'
         shell: bash
         env:
@@ -97,15 +92,26 @@ jobs:
         run: |
           for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
             [ -n "${!name}" ] || { echo "::error::The $name secret is empty, so the app would not be signed and notarized"; exit 1; }
-            echo "$name=${!name}" >> "$GITHUB_ENV"
           done
 
-      # Pinned to v1's commit, since this step gets the signing credentials.
+      # Two copies of the build step, signed and unsigned, because the bundler reads a
+      # set but empty APPLE_* variable as given (an empty APPLE_SIGNING_IDENTITY
+      # replaces the ad-hoc "-" identity in tauri.conf.json and codesign fails), so the
+      # unsigned build must not have them at all. The unsigned copy reuses this step's
+      # `with:` through the &tauri-with anchor, so only their env differs. Both are pinned
+      # to v1's commit, as the signed one gets the signing credentials.
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
-        id: tauri
+        id: tauri-signed
+        if: env.MISAG_SIGN_MACOS == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with: &tauri-with
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
           releaseName: ${{ github.ref_type == 'tag' && format('Mischief of Agents {0}', github.ref_name) || '' }}
           releaseBody: Download the installer for your platform from the assets below.
@@ -115,6 +121,13 @@ jobs:
           releaseAssetNamePattern: Mischief-of-Agents_[version]_${{ matrix.os }}[ext]
           uploadWorkflowArtifacts: ${{ github.ref_type != 'tag' }}
           args: ${{ matrix.args }}
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        id: tauri-unsigned
+        if: env.MISAG_SIGN_MACOS != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with: *tauri-with
 
       - name: Check that the app is signed and notarized
         if: env.MISAG_SIGN_MACOS == 'true'
@@ -132,7 +145,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+          RELEASE_ID: ${{ steps.tauri-signed.outputs.releaseId || steps.tauri-unsigned.outputs.releaseId }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
             --jq '.[] | select(.name | endswith(".app.tar.gz")) | .id' |

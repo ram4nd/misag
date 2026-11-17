@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Bumps the actions pinned to a commit, in the workflows and the local setup action.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/setup
+    schedule:
+      interval: weekly
+    # Proposes a new release only once it is a week old, so a compromised one has time
+    # to be noticed and pulled.
+    cooldown:
+      default-days: 7
