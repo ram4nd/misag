@@ -1,7 +1,7 @@
 //! The hook itself: reads Claude's payload and records the session, moves the
 //! tab's flow run on, or forgets its background tasks.
 
-use super::hook_log::{self, log_failure, note_working};
+use super::hook_log::{log_failure, note_working};
 use super::{SessionId, DB_ENV, HOOK_FLAG, PID_ENV, TAB_ENV};
 use crate::db::{self, SessionReport};
 use crate::layout::TabId;
@@ -107,15 +107,23 @@ enum Outcome {
     /// Recorded the session a tab is now in.
     Recorded,
     /// Handled a Stop (background tasks recorded, the tab's flow run, if any, moved
-    /// on), with the hook output
-    /// that hands Claude the next prompt, if there is one.
-    Stopped(Option<String>),
+    /// on), with the hook output that hands Claude the next prompt, if there is one.
+    Stopped {
+        output: Option<String>,
+        /// Whether it logged a failure along the way (background tasks it could
+        /// not record), so the hook does not then say it works.
+        degraded: bool,
+    },
     /// Recorded that a session ended, so its tab waits on no background tasks.
     Ended,
     /// Handled the person's prompt (see `runs::on_prompt`), with the hook output
     /// that adds a finished flow's note to Claude's context, if one is owed. It
     /// prints nothing else, as a UserPromptSubmit hook's output reaches Claude.
     Prompted(Option<String>),
+    /// Did nothing for a prompt or a session end, as the database has another
+    /// schema (across an upgrade, the app not yet restarted). Not logged, as that
+    /// would log every prompt, nor taken as the hook working.
+    Skipped,
 }
 
 /// The hook output that has Claude go on with `prompt`. Context rather than a
@@ -139,10 +147,11 @@ fn context(event: &str, text: &str) -> String {
 /// moves the tab's flow run on, returning the hook output that hands Claude the
 /// next prompt, if there is one. If it cannot (a payload it cannot read, too), a
 /// running step waits for the person instead (see `runs::hook_failed`).
-fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
+fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Outcome, String> {
     // Across an upgrade (the app not yet restarted) runs cannot be read. That is
     // logged, as SessionStart's is, since a run in this tab will not move on.
     let mut conn = db::connect_existing(db_path)?;
+    let mut degraded = false;
     let moved = serde_json::from_str::<Stop>(input).map_err(|e| format!("bad hook payload: {e}")).and_then(|event| {
         // So the tab keeps showing Claude working while it waits on background tasks.
         // A failure is logged rather than returned, so the flow run still moves on.
@@ -151,69 +160,117 @@ fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>
             None => Err("the Stop payload had no session id".into()),
         };
         if let Err(e) = recorded {
-            log_failure(Some(db_path), Some(tab_id), &format!("could not record background tasks: {e}"));
+            degraded = true;
+            log_failure(Some(db_path), Some(tab_id), Some("Stop"), &format!("could not record background tasks: {e}"));
         }
         crate::runs::on_stop(&mut conn, tab_id, event.last_assistant_message.as_deref())
     });
     match moved {
-        Ok(prompt) => Ok(prompt.as_deref().map(continuation)),
+        Ok(prompt) => Ok(Outcome::Stopped { output: prompt.as_deref().map(continuation), degraded }),
         // hook_failed marks the run waiting so it does not show as running forever.
         Err(e) => Err(crate::runs::hook_failed(&mut conn, tab_id, crate::runs::Hook::Stop, e)),
     }
 }
 
 /// Records that a session ended, so its tab no longer shows Claude waiting on
-/// background tasks, which end with it.
-fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<(), String> {
+/// background tasks, which end with it. Skipped across an upgrade (see
+/// `Outcome::Skipped`).
+fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Outcome, String> {
     let event: SessionEnd = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
-    let conn = db::connect_existing(db_path)?;
-    db::record_background(&conn, tab_id, &event.session_id, false)
+    let Some(conn) = db::connect_if_current(db_path)? else { return Ok(Outcome::Skipped) };
+    db::record_background(&conn, tab_id, &event.session_id, false).map(|()| Outcome::Ended)
 }
 
 /// Tells the tab's flow run, if any, that the person sent a prompt; returns the
 /// hook output that adds a finished flow's note to Claude's context, if one is
 /// owed. If it cannot, a run waiting at a manual prompt waits for the person
-/// instead, as it would never see Claude's answer.
-fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
-    let mut conn = db::connect_existing(db_path)?;
+/// instead, as it would never see Claude's answer. Skipped across an upgrade (see
+/// `Outcome::Skipped`).
+fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Outcome, String> {
+    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(Outcome::Skipped) };
     let told = serde_json::from_str::<PromptSubmit>(input)
         .map_err(|e| format!("bad hook payload: {e}"))
         .and_then(|event| crate::runs::on_prompt(&mut conn, tab_id, &event.prompt));
     match told {
-        Ok(note) => Ok(note.map(|note| context("UserPromptSubmit", &note))),
+        Ok(note) => Ok(Outcome::Prompted(note.map(|note| context("UserPromptSubmit", &note)))),
         Err(e) => Err(crate::runs::hook_failed(&mut conn, tab_id, crate::runs::Hook::Prompt, e)),
     }
+}
+
+/// Reads one hook payload from `input` and handles it (see `handle`).
+#[cfg(test)]
+fn hook(input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<Outcome, String> {
+    handle(input, tab_id, db_path, claude_pid).1
 }
 
 /// Reads one hook payload from `input`: a SessionStart is recorded for `tab_id`,
 /// with the Claude process that sent it, a Stop records the background tasks and
 /// moves the tab's flow run on, a SessionEnd forgets the background tasks, and a
 /// UserPromptSubmit tells a run waiting at a manual prompt that the person sent it
-/// (and hands Claude a finished flow's note, if one is owed).
-fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Result<Outcome, String> {
+/// (and hands Claude a finished flow's note, if one is owed). Also returns the hook
+/// event the payload is for, None if the hook did not get as far as reading it.
+fn handle(
+    mut input: impl Read,
+    tab_id: Option<&TabId>,
+    db_path: Option<&Path>,
+    claude_pid: Option<u32>,
+) -> (Option<String>, Result<Outcome, String>) {
     let (Some(tab_id), Some(db_path)) = (tab_id, db_path) else {
-        return Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}"));
+        return (None, Err(format!("{HOOK_FLAG} needs a valid {TAB_ENV} and {DB_ENV}")));
     };
     let mut payload = String::new();
-    input.read_to_string(&mut payload).map_err(|e| format!("could not read the payload: {e}"))?;
+    if let Err(e) = input.read_to_string(&mut payload) {
+        return (None, Err(format!("could not read the payload: {e}")));
+    }
     // A payload without a readable event name goes to the session recorder, which
     // says what is wrong with it.
     let event = serde_json::from_str::<Event>(&payload).ok().and_then(|e| e.hook_event_name);
-    match event.as_deref() {
-        Some("Stop") => stopped(&payload, tab_id, db_path)
-            .map(Outcome::Stopped)
-            .map_err(|e| format!("could not move the flow run on: {e}")),
-        Some("UserPromptSubmit") => prompted(&payload, tab_id, db_path)
-            .map(Outcome::Prompted)
-            .map_err(|e| format!("could not tell the flow run about the prompt: {e}")),
-        Some("SessionEnd") => ended(&payload, tab_id, db_path)
-            .map(|()| Outcome::Ended)
-            .map_err(|e| format!("could not record the end of the Claude session: {e}")),
+    let handled = match event.as_deref() {
+        Some("Stop") => stopped(&payload, tab_id, db_path).map_err(|e| format!("could not move the flow run on: {e}")),
+        Some("UserPromptSubmit") => {
+            prompted(&payload, tab_id, db_path).map_err(|e| format!("could not tell the flow run about the prompt: {e}"))
+        }
+        Some("SessionEnd") => {
+            ended(&payload, tab_id, db_path).map_err(|e| format!("could not record the end of the Claude session: {e}"))
+        }
         Some("SessionStart") | None => record(&payload, tab_id, db_path, claude_pid)
             .map(|()| Outcome::Recorded)
             .map_err(|e| format!("SessionStart: {e}")),
         Some(other) => Err(format!("misag's hook was run for {other}, which it does not handle")),
+    };
+    (Some(event.unwrap_or_else(|| "SessionStart".into())), handled)
+}
+
+/// Handles one hook payload from `input` (see `handle`) and logs what failed, or
+/// that the hook works again (see `note_working`); returns what to print for
+/// Claude, if anything.
+fn respond(input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude_pid: Option<u32>) -> Option<String> {
+    let (event, handled) = handle(input, tab_id, db_path, claude_pid);
+    let event = event.as_deref();
+    match handled {
+        Err(message) => log_failure(db_path, tab_id, event, &message),
+        // Recorded, but a terminal tab cannot tell whether this session is still open.
+        Ok(Outcome::Recorded) if claude_pid.is_none() => log_failure(
+            db_path,
+            tab_id,
+            event,
+            &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
+        ),
+        Ok(Outcome::Skipped) => {}
+        Ok(outcome) => {
+            // The hook works again for this tab and event, unless it logged a failure
+            // along the way.
+            if !matches!(outcome, Outcome::Stopped { degraded: true, .. })
+                && let Some(event) = event
+            {
+                note_working(db_path, tab_id, event);
+            }
+            if let Outcome::Stopped { output, .. } | Outcome::Prompted(output) = outcome {
+                return output;
+            }
+        }
     }
+    None
 }
 
 /// Entry point for `misag --claude-hook`. Always exits 0: a failure here must
@@ -226,38 +283,25 @@ pub fn run_hook() -> i32 {
     let tab_id = std::env::var(TAB_ENV).ok().and_then(|id| TabId::parse(&id).ok());
     let (panic_log, panic_tab) = (db_path.clone(), tab_id.clone());
     std::panic::set_hook(Box::new(move |info| {
-        log_failure(panic_log.as_deref(), panic_tab.as_ref(), &format!("the hook panicked: {info}"));
+        // Without its event, so any event of the tab that works again clears it.
+        log_failure(panic_log.as_deref(), panic_tab.as_ref(), None, &format!("the hook panicked: {info}"));
         std::process::exit(0);
     }));
     if cfg!(debug_assertions) && std::env::var_os(PANIC_TEST_ENV).is_some() {
         panic!("panic requested through {PANIC_TEST_ENV}");
     }
     let claude_pid = std::env::var(PID_ENV).ok().and_then(|pid| pid.parse().ok());
-    match hook(std::io::stdin(), tab_id.as_ref(), db_path.as_deref(), claude_pid) {
-        Err(message) => log_failure(db_path.as_deref(), tab_id.as_ref(), &message),
-        // Recorded, but a terminal tab cannot tell whether this session is still open.
-        Ok(Outcome::Recorded) if claude_pid.is_none() => log_failure(
-            db_path.as_deref(),
-            tab_id.as_ref(),
-            &format!("{PID_ENV} is missing or invalid, so a terminal tab will not reopen this Claude session"),
-        ),
-        Ok(outcome) => {
-            // Whatever the event, the hook works again for this tab, unless it logged a
-            // failure along the way (such as background tasks it could not record).
-            if !hook_log::failed() {
-                note_working(db_path.as_deref(), tab_id.as_ref());
-            }
-            if let Outcome::Stopped(Some(output)) | Outcome::Prompted(Some(output)) = outcome {
-                println!("{output}");
-            }
-        }
+    if let Some(output) = respond(std::io::stdin(), tab_id.as_ref(), db_path.as_deref(), claude_pid) {
+        println!("{output}");
     }
     0
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::hook_log;
     use crate::claude::test_util::{id, ID};
     use crate::db::test_util::{temp_db, tid};
     use crate::db::Db;
@@ -392,6 +436,73 @@ mod tests {
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"Stop","last_assistant_message":"Done"}}"#);
         let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
         assert!(err.contains("could not move the flow run on") && err.contains("schema"), "{err}");
+    }
+
+    /// The lines of the hook log next to the database at `path`.
+    fn log_lines(path: &Path) -> Vec<String> {
+        let log = std::fs::read_to_string(path.parent().unwrap().join(hook_log::HOOK_LOG)).unwrap_or_default();
+        log.lines().map(str::to_owned).collect()
+    }
+
+    /// Bumps the schema of the database at `path`, as after an upgrade the app has
+    /// not yet been restarted for.
+    fn bump_schema(path: &Path) {
+        let conn = db::connect_existing(path).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        conn.pragma_update(None, "user_version", version + 1).unwrap();
+    }
+
+    #[test]
+    fn a_stop_that_logged_a_failure_along_the_way_does_not_say_the_hook_works() {
+        let path = temp_db("hook-stop-degraded");
+        let db = Db::open(path.clone()).unwrap();
+        let tab = tid("tab-1");
+        let stop = |payload: &str| respond(payload.as_bytes(), Some(&tab), Some(&path), Some(42));
+        stop(&format!(r#"{{"session_id":"{ID}","hook_event_name":"Stop","last_assistant_message":7}}"#));
+        assert_eq!(log_lines(&path).len(), 1);
+        // Moves the run on, but without a session id cannot record background tasks.
+        assert_eq!(stop(r#"{"hook_event_name":"Stop","last_assistant_message":"Done"}"#), None);
+        let lines = log_lines(&path);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].contains("could not record background tasks"), "{lines:?}");
+        assert!(crate::claude::hook_problem(&db).is_some());
+        stop(&format!(r#"{{"session_id":"{ID}","hook_event_name":"Stop","last_assistant_message":"Done"}}"#));
+        assert_eq!(log_lines(&path).len(), 3, "a whole Stop says the hook works");
+        assert_eq!(crate::claude::hook_problem(&db), None);
+    }
+
+    #[test]
+    fn prompts_and_session_ends_against_another_schema_are_skipped_quietly() {
+        let path = temp_db("hook-skip-schema");
+        drop(Db::open(path.clone()).unwrap());
+        let tab = tid("tab-1");
+        // Failures they could otherwise claim to have cleared.
+        hook_log::log_failure(Some(&path), Some(&tab), Some("UserPromptSubmit"), "earlier");
+        hook_log::log_failure(Some(&path), Some(&tab), Some("SessionEnd"), "earlier");
+        let before = log_lines(&path);
+        bump_schema(&path);
+        let prompt = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit","prompt":"Hi"}}"#);
+        assert_eq!(hook(prompt.as_bytes(), Some(&tab), Some(&path), Some(42)), Ok(Outcome::Skipped));
+        assert_eq!(respond(prompt.as_bytes(), Some(&tab), Some(&path), Some(42)), None);
+        let end = format!(r#"{{"session_id":"{ID}","hook_event_name":"SessionEnd"}}"#);
+        assert_eq!(hook(end.as_bytes(), Some(&tab), Some(&path), Some(42)), Ok(Outcome::Skipped));
+        respond(end.as_bytes(), Some(&tab), Some(&path), Some(42));
+        assert_eq!(log_lines(&path), before);
+    }
+
+    #[test]
+    fn a_session_start_failure_is_cleared_by_a_good_session_start_not_by_a_stop() {
+        let path = temp_db("hook-start-cleared");
+        let db = Db::open(path.clone()).unwrap();
+        let tab = tid("tab-1");
+        let start = format!(r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"startup"}}"#);
+        respond(start.as_bytes(), Some(&tab), Some(&path), None);
+        assert!(crate::claude::hook_problem(&db).unwrap().message.contains(PID_ENV));
+        let stop = format!(r#"{{"session_id":"{ID}","hook_event_name":"Stop","last_assistant_message":"Done"}}"#);
+        respond(stop.as_bytes(), Some(&tab), Some(&path), Some(42));
+        assert!(crate::claude::hook_problem(&db).is_some(), "the tab will still not reopen that session");
+        respond(start.as_bytes(), Some(&tab), Some(&path), Some(42));
+        assert_eq!(crate::claude::hook_problem(&db), None);
     }
 
     #[test]

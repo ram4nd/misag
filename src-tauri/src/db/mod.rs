@@ -23,7 +23,8 @@ mod settings;
 pub(crate) mod test_util;
 
 pub use flows::FlowSummary;
-pub use schema::{connect, connect_existing, connect_if_current, OpenError};
+pub use schema::{connect, connect_existing, OpenError};
+pub(crate) use schema::connect_if_current;
 pub use sessions::{record_background, record_claude_session, SessionReport};
 pub use settings::load_settings;
 

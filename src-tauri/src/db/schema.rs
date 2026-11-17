@@ -429,8 +429,9 @@ pub fn connect_existing(path: &Path) -> Result<Connection, String> {
 }
 
 /// Like `connect_existing`, but None (no error) when the schema is not this
-/// binary's, for callers that have nothing to do across an upgrade.
-pub fn connect_if_current(path: &Path) -> Result<Option<Connection>, String> {
+/// binary's, for callers that have nothing to do across an upgrade (the hook at a
+/// prompt or a session end).
+pub(crate) fn connect_if_current(path: &Path) -> Result<Option<Connection>, String> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
