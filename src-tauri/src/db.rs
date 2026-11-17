@@ -1060,6 +1060,8 @@ fn release_open_sessions(conn: &Connection) -> Result<usize, String> {
         conn.execute("UPDATE tabs SET claude_session = NULL WHERE tab_id = ?1", [tab]).map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM claude_sessions WHERE tab_id = ?1", [tab]).map_err(|e| e.to_string())?;
         if has_runs {
+            // One UPDATE of the status, not a `runs::RunState` save: the copy of raterm's
+            // database may not have the columns `RunState` saves.
             conn.execute(&format!("UPDATE flow_runs SET status = 'stopped' WHERE tab_id = ?1 AND status IN {}", runs::ACTIVE), [tab])
                 .map_err(|e| e.to_string())?;
         }
