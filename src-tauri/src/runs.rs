@@ -246,11 +246,15 @@ fn parse_graph(json: &str) -> Result<Graph, String> {
 }
 
 /// A new token naming a paste (see `prefilled`), kept within what JavaScript
-/// numbers hold exactly (2^53 - 1), as the app hands it back.
+/// numbers hold exactly (2^53 - 1), as the app hands it back; never `NO_TOKEN`.
 fn new_token() -> i64 {
     const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
-    i64::try_from(uuid::Uuid::new_v4().as_u64_pair().0 % MAX_SAFE_INTEGER).unwrap_or(0)
+    i64::try_from(uuid::Uuid::new_v4().as_u64_pair().0 % (MAX_SAFE_INTEGER - 1) + 1).unwrap_or(1)
 }
+
+/// The token naming a paste owed with none stored (`prefill_token` NULL, as a
+/// database edited by hand may leave it), so that paste too can be recorded.
+const NO_TOKEN: i64 = 0;
 
 /// Where a run is with its step, and what only that place has. Each phase has one
 /// status (see `Phase::status`); `RunState::from_columns` and `RunState::columns`
@@ -987,7 +991,7 @@ pub fn prefill_text(conn: &mut Connection, run_id: i64, step_id: &str) -> Result
         return Ok(None);
     }
     let text = flows::prefill_text(&run.graph, node, !state.briefed);
-    Ok(Some(Prefill { text, token: state.prefill_token.unwrap_or(0) }).filter(|p| !p.text.is_empty()))
+    Ok(Some(Prefill { text, token: state.prefill_token.unwrap_or(NO_TOKEN) }).filter(|p| !p.text.is_empty()))
 }
 
 /// The app put the manual prompt's text named by `token` into Claude's input (see
@@ -2123,6 +2127,17 @@ mod tests {
         // Claude's reply needs no FLOW line.
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed it.")).unwrap(), prompt_of(&g, "p"));
         assert_eq!(only_run(&conn).step_id, "p");
+    }
+
+    #[test]
+    fn a_paste_owed_with_no_token_is_pasted_once() {
+        // As a database edited by hand, or an older version, may leave it.
+        let g = manual_prompt_first("Fix the bug in ");
+        let (_db, mut conn, flow) = setup("runs-manual-prompt-no-token", &g);
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        conn.execute("UPDATE flow_runs SET prefill_token = NULL WHERE id = ?1", [run]).unwrap();
+        assert_eq!(paste(&mut conn, run).as_deref(), Some(DRAFT));
+        assert_eq!(owed(&mut conn, run, "mp"), None, "it is pasted once");
     }
 
     #[test]
@@ -3416,7 +3431,7 @@ mod tests {
     fn paste_tokens_stay_within_what_javascript_holds_exactly() {
         for _ in 0..1000 {
             let token = new_token();
-            assert!((0..(1 << 53) - 1).contains(&token), "{token}");
+            assert!((1..(1 << 53) - 1).contains(&token), "{token}");
         }
     }
 }

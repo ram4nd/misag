@@ -5,7 +5,7 @@
 
 use super::{
     awaits_prompt, continue_offered, node_of, By, Change, Phase, Resume, RunState, Say, Status, Taken, BRIEFING_TIMEOUT_SECS,
-    CLEAR_TIMEOUT_SECS, MAX_RUN_STEPS, NO_REPLY,
+    CLEAR_TIMEOUT_SECS, MAX_RUN_STEPS, NO_REPLY, NO_TOKEN,
 };
 use crate::flows::{self, Graph, Kind, Node};
 
@@ -213,7 +213,7 @@ pub(super) fn proceed(cx: &Cx, state: &RunState, step_id: &str, output: &str) ->
 /// The app pasted the manual prompt named by `token` at `step_id`: the run no
 /// longer owes it, unless a paste was owed since (see `super::prefilled`).
 pub(super) fn prefilled(state: &RunState, step_id: &str, token: i64) -> Option<RunState> {
-    if state.node_id != step_id || state.prefill_token != Some(token) {
+    if state.node_id != step_id || state.prefill_token.unwrap_or(NO_TOKEN) != token {
         return None;
     }
     Some(RunState { phase: state.phase.clone().with_prefill(false), ..state.clone() })
