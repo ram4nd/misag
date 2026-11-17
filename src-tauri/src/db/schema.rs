@@ -417,7 +417,10 @@ pub fn connect_existing(path: &Path) -> Result<Connection, String> {
             .ok()
             .and_then(|conn| schema_version(&conn).ok())
             .map_or_else(|| "?".to_string(), |v| v.to_string());
-        format!("schema {found} in {}, this binary knows {known}", path.display())
+        format!(
+            "schema {found} in {}, this binary knows {known}: misag was likely updated and not yet restarted; restart it",
+            path.display()
+        )
     })
 }
 

@@ -140,9 +140,9 @@ fn context(event: &str, text: &str) -> String {
 /// next prompt, if there is one. If it cannot (a payload it cannot read, too), a
 /// running step waits for the person instead (see `runs::hook_failed`).
 fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
-    // Across an upgrade (the app not yet restarted) runs cannot be read; every turn
-    // of every tab ends here, so that is not logged each time.
-    let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
+    // Across an upgrade (the app not yet restarted) runs cannot be read. That is
+    // logged, as SessionStart's is, since a run in this tab will not move on.
+    let mut conn = db::connect_existing(db_path)?;
     let moved = serde_json::from_str::<Stop>(input).map_err(|e| format!("bad hook payload: {e}")).and_then(|event| {
         // So the tab keeps showing Claude working while it waits on background tasks.
         // A failure is logged rather than returned, so the flow run still moves on.
@@ -371,6 +371,19 @@ mod tests {
         let run = &crate::runs::active(&conn).unwrap()[0];
         assert_eq!(run.status, crate::runs::Status::Attention);
         assert!(run.note.as_deref().unwrap().contains("The Stop hook could not move the run on"), "{:?}", run.note);
+    }
+
+    #[test]
+    fn a_stop_against_another_schema_is_reported_not_dropped() {
+        let path = temp_db("hook-stop-schema");
+        drop(Db::open(path.clone()).unwrap());
+        // As after an upgrade the app has not yet been restarted for.
+        let conn = db::connect_existing(&path).unwrap();
+        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        conn.pragma_update(None, "user_version", version + 1).unwrap();
+        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"Stop","last_assistant_message":"Done"}}"#);
+        let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
+        assert!(err.contains("could not move the flow run on") && err.contains("schema"), "{err}");
     }
 
     #[test]
