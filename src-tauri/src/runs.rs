@@ -268,6 +268,12 @@ enum Phase {
     /// Running a step (status running): Claude works on a prompt step, or answers the
     /// person's prompt at a manual prompt.
     Working,
+    /// Running a prompt step whose prompt the app typed into the tab after the person
+    /// moved a running step on (see `transition::proceed`; status running, typed 1):
+    /// Claude may still be answering the step before, and Claude Code holds the
+    /// prompt until that turn ends, so a turn that ends before Claude Code reports the
+    /// prompt submitted (see `on_prompt`) is not this step's reply. Then `Working`.
+    Typed,
     /// Waiting for the person (status manual): at a pause to go on, at a manual prompt
     /// for their prompt; `prefill`, whether the app has yet to fill Claude's input for
     /// that prompt (prefill 1; see `prefill_text`).
@@ -283,7 +289,7 @@ enum Phase {
 impl Phase {
     fn status(&self) -> Status {
         match self {
-            Phase::Clearing { .. } | Phase::Briefing { .. } | Phase::Working => Status::Running,
+            Phase::Clearing { .. } | Phase::Briefing { .. } | Phase::Working | Phase::Typed => Status::Running,
             Phase::Waiting { .. } => Status::Manual,
             Phase::NeedsPerson { .. } => Status::Attention,
             Phase::Ended { stopped: true, .. } => Status::Stopped,
@@ -322,6 +328,7 @@ struct Columns {
     briefing: bool,
     briefing_at: Option<i64>,
     closing: bool,
+    typed: bool,
 }
 
 impl Columns {
@@ -340,6 +347,7 @@ impl Columns {
             briefing: row.get("briefing")?,
             briefing_at: row.get("briefing_at")?,
             closing: row.get("closing")?,
+            typed: row.get("typed")?,
         })
     }
 }
@@ -370,7 +378,7 @@ struct RunState {
 
 impl RunState {
     /// The columns `from_row` reads.
-    const COLUMNS: &str = "node_id, status, steps, note, resume, clear, briefed, prefill, prefill_token, briefing, briefing_at, closing";
+    const COLUMNS: &str = "node_id, status, steps, note, resume, clear, briefed, prefill, prefill_token, briefing, briefing_at, closing, typed";
 
     /// The state in `row`'s `COLUMNS`; an error for a state this version cannot read
     /// (see `from_columns`), including a column of the wrong type, so one such run
@@ -406,14 +414,17 @@ impl RunState {
                 if c.prefill {
                     return cannot("a paste owed");
                 }
-                match (clear, c.briefing) {
-                    (Some(_), true) => return cannot("both a clear and a briefing"),
-                    (Some(clear), false) => Phase::Clearing { done: clear == Clear::Done },
-                    (None, true) => match c.briefing_at {
+                match (clear, c.briefing, c.typed) {
+                    (Some(_), true, _) => return cannot("both a clear and a briefing"),
+                    (Some(_), false, true) => return cannot("both a clear and a typed prompt"),
+                    (None, true, true) => return cannot("both a briefing and a typed prompt"),
+                    (Some(clear), false, false) => Phase::Clearing { done: clear == Clear::Done },
+                    (None, true, false) => match c.briefing_at {
                         Some(sent_at) => Phase::Briefing { sent_at },
                         None => return cannot("a briefing with no time it was sent"),
                     },
-                    (None, false) => Phase::Working,
+                    (None, false, true) => Phase::Typed,
+                    (None, false, false) => Phase::Working,
                 }
             }
             Status::Manual | Status::Attention => {
@@ -423,6 +434,9 @@ impl RunState {
                 }
                 if c.briefing {
                     return cannot("a briefing");
+                }
+                if c.typed {
+                    return cannot("a typed prompt");
                 }
                 if status == Status::Manual {
                     if c.note.is_some() {
@@ -458,11 +472,13 @@ impl RunState {
             briefing: false,
             briefing_at: None,
             closing: false,
+            typed: false,
         };
         match &self.phase {
             Phase::Clearing { done } => c.clear = Some(if *done { Clear::Done } else { Clear::Pending }.as_str().to_owned()),
             Phase::Briefing { sent_at } => (c.briefing, c.briefing_at) = (true, Some(*sent_at)),
             Phase::Working => {}
+            Phase::Typed => c.typed = true,
             Phase::Waiting { prefill } => c.prefill = *prefill,
             Phase::NeedsPerson { why, resume, prefill } => {
                 (c.note, c.resume, c.prefill) = (Some(why.clone()), resume.map(|r| r.as_str().to_owned()), *prefill);
@@ -511,7 +527,7 @@ impl RunState {
             .execute(
                 "UPDATE flow_runs SET node_id = :node_id, status = :status, steps = :steps, note = :note, resume = :resume,
                  clear = :clear, briefed = :briefed, prefill = :prefill, prefill_token = :prefill_token, briefing = :briefing,
-                 briefing_at = :briefing_at, closing = :closing, updated_at = :updated_at WHERE id = :id",
+                 briefing_at = :briefing_at, closing = :closing, typed = :typed, updated_at = :updated_at WHERE id = :id",
                 named_params! {
                     ":id": run_id,
                     ":node_id": c.node_id,
@@ -526,6 +542,7 @@ impl RunState {
                     ":briefing": c.briefing,
                     ":briefing_at": c.briefing_at,
                     ":closing": c.closing,
+                    ":typed": c.typed,
                     ":updated_at": now(),
                 },
             )
@@ -911,7 +928,9 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
 /// The person picked `output` for `step_id`, the step they saw the run at; returns
 /// the next prompt to send, if any. Usually the run waits (manual or needs
 /// attention), but a running step can be moved on too, for when Claude was
-/// interrupted and no reply will come. Refused if the run has moved on from
+/// interrupted and no reply will come; as Claude may yet be answering it, a prompt
+/// step reached that way counts a reply only once Claude Code reports its prompt
+/// submitted (see `Phase::Typed`). Refused if the run has moved on from
 /// `step_id` (a second click, or a pick from a page not yet redrawn), and while the
 /// run is still clearing the conversation before its first step. The person
 /// stepping in restarts the count toward `MAX_RUN_STEPS`.
@@ -977,7 +996,7 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
     // Every prompt in every tab comes here: look before taking the write lock.
     let waiting = conn
         .query_row(
-            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status IN ('manual', 'attention')
+            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND (status IN ('manual', 'attention') OR typed = 1)
              UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
             [tab_id.as_str()],
             |_| Ok(()),
@@ -2310,6 +2329,31 @@ mod tests {
         let run = only_run(&conn);
         assert_eq!(pick(&mut conn, run.id, "fail").unwrap(), prompt_of(&g, "p"));
         assert_eq!(pick(&mut conn, run.id, "pass").unwrap(), None, "a run that ends sends nothing");
+        assert!(active(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_late_reply_to_a_step_moved_on_by_hand_does_not_count_for_the_next() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-take-over-late", &g);
+        begin(&mut conn, flow, &tab("t1")).unwrap();
+        let run = only_run(&conn);
+        // The person moves on while Claude is still answering "p"; the app types the
+        // next prompt, which Claude Code holds until that turn ends.
+        assert_eq!(pick(&mut conn, run.id, "fail").unwrap(), prompt_of(&g, "p"));
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap(), None, "the late reply");
+        let still = only_run(&conn);
+        assert_eq!((still.status, still.step_id.as_str(), still.steps), (Status::Running, "p", 1));
+        // Claude Code reports the typed prompt; the turn after it is the step's reply.
+        on_prompt(&mut conn, &tab("t1"), &prompt_of(&g, "p").unwrap()).unwrap();
+        assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty(), "the reply ended the run");
+        // A pick while Claude waits for the person sends a prompt with no turn in the way.
+        let g = manual_first();
+        let (_db, mut conn, flow) = setup("runs-take-over-idle", &g);
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        pick(&mut conn, run, "ok").unwrap();
+        on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap();
         assert!(active(&conn).unwrap().is_empty());
     }
 

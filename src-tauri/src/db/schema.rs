@@ -258,6 +258,14 @@ const MIGRATIONS: &[&str] = &[r#"
         WHERE status IN ('running', 'manual', 'attention');
     CREATE INDEX flow_runs_by_flow ON flow_runs (flow_id);
     CREATE INDEX flow_runs_closing ON flow_runs (tab_id) WHERE closing = 1;
+"#, r#"
+    -- 1 while a run runs a step whose prompt the app typed into the tab while Claude
+    -- may still have been answering the step before (see runs::Phase::Typed), until
+    -- Claude Code reports it submitted: a turn that ends before then is not its reply.
+    ALTER TABLE flow_runs ADD COLUMN typed INTEGER NOT NULL DEFAULT 0
+        CONSTRAINT typed_only_when_running
+        CHECK (typed IN (0, 1) AND (status IN ('done', 'stopped') OR typed = 0
+               OR (status = 'running' AND clear IS NULL AND briefing = 0)));
 "#];
 
 /// The index in MIGRATIONS of the migration adding flow_runs' CHECKs, which
@@ -1012,6 +1020,10 @@ mod tests {
             ("prefill = 1", "prefill_only_when_waiting"),
             ("closing = 1", "closing_only_when_ended"),
             ("status = 'manual', closing = 1", "closing_only_when_ended"),
+            ("typed = 1, clear = 'pending'", "typed_only_when_running"),
+            ("typed = 1, briefing = 1, briefing_at = 1", "typed_only_when_running"),
+            ("status = 'manual', typed = 1", "typed_only_when_running"),
+            ("typed = 2", "typed_only_when_running"),
         ] {
             let e = conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_err().to_string();
             assert!(e.contains("CHECK constraint failed") && e.contains(check), "{set}: {e}");
@@ -1030,6 +1042,8 @@ mod tests {
             "clear = 'done'",
             "clear = NULL, briefing = 1, briefing_at = 1",
             "briefing = 0, briefing_at = NULL",
+            "typed = 1",
+            "typed = 0",
             "status = 'manual', prefill = 1",
             "status = 'attention', note = 'why', resume = 'remind'",
             "status = 'stopped', briefing = 1, clear = 'done', closing = 1",
