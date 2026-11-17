@@ -8,6 +8,8 @@ const backend = vi.hoisted(() => ({
   unsent: [] as unknown[],
   /** What flow_unsent returns, or the error it fails with. */
   unsentReply: true as boolean | Error,
+  /** What flow_runs returns. */
+  runs: [] as unknown[],
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -19,7 +21,8 @@ vi.mock("@tauri-apps/api/core", () => ({
       return backend.unsentReply;
     }
     if (cmd === "flow_start") return backend.started;
-    if (cmd === "flow_runs") return [];
+    if (cmd === "flow_runs") return backend.runs;
+    if (cmd === "flow_prefill_text") return { text: "Fix the issues", token: 1 };
     if (cmd === "flow_continue") return { stepId: "fix", prompt: "Fix what the review found", briefs: true };
     if (cmd === "flow_resume") return { stepId: "s", prompt: "Go on with the step", briefs: false };
     if (cmd === "flow_cleared") return { state: "gone" };
@@ -58,6 +61,7 @@ beforeEach(() => {
   onLock = () => {};
   backend.calls = [];
   backend.unsent = [];
+  backend.runs = [];
   backend.unsentReply = true;
   backend.started = { runId: 7, clear: false, prompt: "Review the diff" };
   runs = createRunController<Tab>({
@@ -97,6 +101,33 @@ describe("a flow sending a prompt", () => {
 
   test("leaves an input the person did not type in alone", async () => {
     runs.typed(tab, "sent\r");
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
+  });
+
+  test("a focus report from the terminal does not count as typing", async () => {
+    runs.typed(tab, "\x1b[O");
+    runs.typed(tab, "\x1b[I");
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
+  });
+
+  test("a focus report leaves what the person typed counted", async () => {
+    runs.typed(tab, "a");
+    runs.typed(tab, new TextEncoder().encode("\x1b[O"));
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(typed[0]).toBe("\x03");
+  });
+
+  test("an Enter followed by a focus report still sends the input", async () => {
+    runs.typed(tab, "half a thought");
+    runs.typed(tab, "\r\x1b[O");
     const done = runs.start(flow);
     await vi.runAllTimersAsync();
     await done;
@@ -312,5 +343,30 @@ describe("starting a flow", () => {
     expect(typed).toEqual(["\x1b[200~/clear\x1b[201~", "\r"]);
     await vi.runAllTimersAsync();
     await done;
+  });
+});
+
+describe("a manual prompt's draft", () => {
+  const run = { id: 8, tabId: "t1", stepId: "m", step: "Manual prompt", flowId: 1, status: "manual", prefill: true } as unknown as Run;
+
+  test("goes in after a focus report from clicking the run bar", async () => {
+    runs.typed(tab, "\x1b[O");
+    backend.runs = [run];
+    await runs.poll();
+    await vi.runAllTimersAsync();
+    expect(typed).toEqual(["\x1b[200~Fix the issues\x1b[201~"]);
+  });
+
+  test("is still taken back out on stop after a focus report", async () => {
+    backend.runs = [run];
+    await runs.poll();
+    await vi.runAllTimersAsync();
+    backend.runs = [];
+    runs.typed(tab, "\x1b[O");
+    typed = [];
+    const stopped = runs.stop(run);
+    await vi.runAllTimersAsync();
+    await stopped;
+    expect(typed).toEqual(["\x03"]);
   });
 });

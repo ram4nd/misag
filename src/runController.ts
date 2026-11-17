@@ -41,6 +41,8 @@ const CLEAR_TIMEOUT_MS = 30_000;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
+/** The terminal's focus-in and focus-out reports. */
+const FOCUS_REPORTS = /\x1b\[[IO]/g;
 
 /** A tab, as flow runs need it. */
 export interface RunTab {
@@ -508,7 +510,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       show();
     },
     typed(tab, data) {
-      const text = typeof data === "string" ? data : decoder.decode(data);
+      // Focus reports (Claude Code turns on mode 1004) are not typing.
+      const text = (typeof data === "string" ? data : decoder.decode(data)).replace(FOCUS_REPORTS, "");
       // An Enter that is not inside a paste sends the input; Ctrl+C clears it.
       const sent = (text.endsWith("\r") && !text.includes("\x1b[200~")) || text === "\x03";
       if (sent) dirtyTabs.delete(tab.tabId);
