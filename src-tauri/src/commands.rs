@@ -318,8 +318,8 @@ pub struct SpawnPlan {
     pub fell_back_to_home: bool,
     pub tracked: bool,
     pub skips_permissions: bool,
-    /// The saved Claude session of a terminal tab, typed at its prompt once it
-    /// starts (the shell reads it as if the user had typed it), or why not.
+    /// The saved Claude session of a terminal tab, typed at its prompt once the
+    /// shell shows it (it reads it as if the user had typed it), or why not.
     pub resume: Option<Resume>,
 }
 
@@ -365,7 +365,7 @@ pub fn plan_spawn(tab: &TabLaunch, exe: &AppExe, db: &Db, dirs: &TabDirs) -> Res
 #[derive(Serialize, Debug, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ResumeReport {
-    /// `claude --resume` was typed at the prompt.
+    /// `claude --resume` is typed at the prompt once the shell shows it.
     Typed,
     /// Claude saved no conversation for it.
     NoConversation,
@@ -397,7 +397,7 @@ pub fn pty_spawn(
     )?;
     let SpawnPlan { fell_back_to_home, tracked, skips_permissions, resume, .. } = plan;
     let resume = resume.map(|resume| match resume {
-        Resume::Session(session) => match state.write(id, resume_input(&session).into_bytes()) {
+        Resume::Session(session) => match state.type_at_prompt(id, resume_input(&session).into_bytes()) {
             Ok(()) => ResumeReport::Typed,
             Err(e) => ResumeReport::Failed { message: format!("could not type the command: {e}") },
         },

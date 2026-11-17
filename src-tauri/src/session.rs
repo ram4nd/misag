@@ -14,6 +14,10 @@ use std::time::Duration;
 /// Unix; on Windows their console closing) before they are killed.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
 
+/// How long `type_at_prompt` waits for the shell's prompt before typing anyway.
+#[cfg(unix)]
+pub const PROMPT_WAIT: Duration = Duration::from_secs(15);
+
 /// How many bytes of input may wait for a session's program to read them. Far
 /// more than anyone types or pastes while a program is busy, so in practice only
 /// input to a program that has stopped reading is refused. A refused write returns
@@ -87,6 +91,39 @@ impl ExitFlag {
 }
 
 impl Session {
+    /// Queues input; see `Sessions::write`.
+    fn send(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        let len = data.len();
+        // Added up front, so writers at once cannot all slip under the limit, and judged
+        // by the count before this write, so a large write is refused only on a full queue.
+        let before = self.queued.fetch_add(len, Ordering::Relaxed);
+        if before >= INPUT_LIMIT {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return Err(format!(
+                "its program is not reading input ({before} bytes are still waiting); interrupt it or close the tab"
+            ));
+        }
+        self.input.send(data).map_err(|_| {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            format!("session {id} is closed")
+        })
+    }
+
+    /// Whether the shell's line editor (readline, zle, fish's) is reading, which it
+    /// does only at its prompt, with the terminal out of canonical (line) mode. A
+    /// `read` in the shell's startup files keeps that mode on.
+    #[cfg(unix)]
+    fn at_prompt(&self) -> bool {
+        let master = lock(&self.master);
+        let Some(fd) = master.as_ref().and_then(|m| m.as_raw_fd()) else { return true };
+        // SAFETY: a plain-data struct the kernel fills, for a descriptor the locked master keeps open.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+            return true;
+        }
+        t.c_lflag & libc::ICANON == 0
+    }
+
     /// Hangs the child up, then kills what is left of it after `grace`: on Unix
     /// SIGHUP, then SIGKILL to its process groups, in a thread that ends as soon as
     /// the child is reaped; on Windows the shell ends at once and the tab's job
@@ -714,21 +751,38 @@ impl Sessions {
     /// `INPUT_LIMIT` bytes wait for the program to read them; a write of any size is
     /// taken below that, so the queue can go past the limit by one write.
     pub fn write(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
-        let s = self.get(id)?;
-        let len = data.len();
-        // Added up front, so writers at once cannot all slip under the limit, and judged
-        // by the count before this write, so a large write is refused only on a full queue.
-        let before = s.queued.fetch_add(len, Ordering::Relaxed);
-        if before >= INPUT_LIMIT {
-            s.queued.fetch_sub(len, Ordering::Relaxed);
-            return Err(format!(
-                "its program is not reading input ({before} bytes are still waiting); interrupt it or close the tab"
-            ));
-        }
-        s.input.send(data).map_err(|_| {
-            s.queued.fetch_sub(len, Ordering::Relaxed);
-            format!("session {id} is closed")
-        })
+        self.get(id)?.send(id, data)
+    }
+
+    /// Types `data` at a login shell's prompt once the shell shows it, so a question
+    /// its startup files ask does not take it as the answer; after `PROMPT_WAIT`
+    /// it is typed anyway (a shell without a line editor, such as dash, never
+    /// leaves canonical mode). Returns at once.
+    #[cfg(unix)]
+    pub fn type_at_prompt(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        // Weak, so a closed tab is not kept open while this waits.
+        let s = Arc::downgrade(&self.get(id)?);
+        std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while let Some(session) = s.upgrade() {
+                if session.at_prompt() || start.elapsed() >= PROMPT_WAIT {
+                    if let Err(e) = session.send(id, data) {
+                        eprintln!("misag: could not type at the prompt of session {id}: {e}");
+                    }
+                    return;
+                }
+                drop(session);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Ok(())
+    }
+
+    /// The same on Windows, where it is typed at once: PowerShell has no terminal
+    /// mode that tells its prompt apart.
+    #[cfg(windows)]
+    pub fn type_at_prompt(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        self.write(id, data)
     }
 
     /// Like `spawn`, clamps 0 columns or rows to 1, which programs cannot draw in.
@@ -1562,6 +1616,29 @@ mod unix_tests {
         assert_eq!(code, Ok(0), "the tab ended only after {:?}", start.elapsed());
         assert!(p.text().contains("last-line"), "the shell's last output was cut off: {:?}", p.text());
         assert!(s.write(p.id, b"x".to_vec()).is_err(), "the session is gone");
+    }
+
+    /// Types a resume command the way `pty_spawn` does.
+    fn type_resume(s: &Sessions, id: u32, data: &[u8]) {
+        s.type_at_prompt(id, data.to_vec()).unwrap();
+    }
+
+    #[test]
+    fn typed_input_waits_for_the_prompt_past_a_startup_question() {
+        let home = crate::test_support::temp_dir("startup-question");
+        std::fs::write(home.join(".bash_profile"), "read -p 'update? ' answer; echo \"answer=[$answer]\"\n").unwrap();
+        let s = Sessions::new("/bin/bash", Duration::from_millis(300));
+        let env = vec![("HOME".to_string(), home.to_string_lossy().into_owned())];
+        let p = spawn_with(&s, Launch::LoginShell, Some(home.to_str().unwrap()), env);
+        type_resume(&s, p.id, b"echo resumed-$((1+1))\r");
+        p.wait_for("update? ");
+        std::thread::sleep(Duration::from_millis(300));
+        s.write(p.id, b"n\r".to_vec()).unwrap();
+        p.wait_for("answer=[");
+        p.wait_for("resumed-2");
+        assert!(p.text().contains("answer=[n]"), "output: {:?}", p.text());
+        s.kill(p.id);
+        p.exit_code();
     }
 
     #[test]
