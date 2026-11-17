@@ -122,6 +122,9 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   let runs: Run[] = [];
   /** Until the saved tabs are back, a run's tab may just not be open yet. */
   let tabsRestored = false;
+  /** How many polls were sent, and the number of the latest one whose reply was shown. */
+  let polls = 0;
+  let shownPoll = 0;
   /** The error poll shows, so a later good poll clears only its own. */
   let runsError: string | null = null;
   /** Tabs whose Claude input may hold text the person typed and has not sent. */
@@ -472,10 +475,18 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     await poll();
   }
 
-  /** Shows the active tab's runs, and marks the tabs whose run waits for the person. */
+  /**
+   * Shows the active tab's runs, and marks the tabs whose run waits for the person.
+   * Replies can come back out of order: one older than a reply already shown is
+   * dropped, as it would bring back runs that have moved on and redraw their rows.
+   */
   async function poll() {
+    const seq = ++polls;
     try {
-      runs = await invoke<Run[]>("flow_runs");
+      const next = await invoke<Run[]>("flow_runs");
+      if (seq < shownPoll) return;
+      shownPoll = seq;
+      runs = next;
       if (runsError !== null) flows.showBoxError(null);
       runsError = null;
       show();
@@ -486,6 +497,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       opts.markWaiting((tab) => waitingTabs.has(tab.tabId));
       for (const run of runs) if (run.prefill) void fill(run);
     } catch (err) {
+      if (seq < shownPoll) return;
+      shownPoll = seq;
       console.error("misag: could not read the flow runs", err);
       runsError = `Flow runs could not be read: ${opts.errorText(err)}`;
       flows.showBoxError(runsError);

@@ -8,7 +8,9 @@ const backend = vi.hoisted(() => ({
   unsent: [] as unknown[],
   /** What flow_unsent returns, or the error it fails with. */
   unsentReply: true as boolean | Error,
-  /** What flow_runs returns. */
+  /** What the next flow_runs calls answer, one each, in order; then `runs`. */
+  runsReplies: [] as Promise<unknown[]>[],
+  /** What flow_runs returns once `runsReplies` is used up. */
   runs: [] as unknown[],
 }));
 
@@ -21,7 +23,7 @@ vi.mock("@tauri-apps/api/core", () => ({
       return backend.unsentReply;
     }
     if (cmd === "flow_start") return backend.started;
-    if (cmd === "flow_runs") return backend.runs;
+    if (cmd === "flow_runs") return backend.runsReplies.shift() ?? backend.runs;
     if (cmd === "flow_prefill_text") return { text: "Fix the issues", token: 1 };
     if (cmd === "flow_continue") return { stepId: "fix", prompt: "Fix what the review found", briefs: true };
     if (cmd === "flow_resume") return { stepId: "s", prompt: "Go on with the step", briefs: false };
@@ -49,6 +51,8 @@ let write: (text: string) => void;
 /** Called as a flow takes or releases the tab's lock. */
 let onLock: () => void;
 const tab: Tab = { tabId: "t1" };
+/** The ids of the runs shown each time the list is drawn. */
+let shownRuns: number[][];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -63,9 +67,11 @@ beforeEach(() => {
   backend.unsent = [];
   backend.runs = [];
   backend.unsentReply = true;
+  backend.runsReplies = [];
+  shownRuns = [];
   backend.started = { runId: 7, clear: false, prompt: "Review the diff" };
   runs = createRunController<Tab>({
-    flows: { showRuns: () => {}, showBoxError: () => {}, reload: async () => {} },
+    flows: { showRuns: (here) => shownRuns.push(here.map((r) => r.id)), showBoxError: () => {}, reload: async () => {} },
     errorText: String,
     tabs: () => [tab],
     active: () => tab,
@@ -368,5 +374,20 @@ describe("a manual prompt's draft", () => {
     await vi.runAllTimersAsync();
     await stopped;
     expect(typed).toEqual(["\x03"]);
+  });
+});
+
+describe("reading the runs", () => {
+  test("a reply that comes in after a newer one is dropped", async () => {
+    let answerOld!: (runs: unknown[]) => void;
+    backend.runsReplies = [new Promise((resolve) => (answerOld = resolve)), Promise.resolve([])];
+    const old = runs.poll();
+    await runs.poll();
+    expect(shownRuns).toEqual([[]]);
+    answerOld([{ id: 7, tabId: "t1", flowId: 1, stepId: "s", status: "manual", outputs: ["ok"] }]);
+    await old;
+    // The run was stored as moved on (gone): the older reply does not bring it back.
+    expect(shownRuns).toEqual([[]]);
+    expect(runs.waiting(tab)).toBe(false);
   });
 });
