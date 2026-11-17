@@ -516,13 +516,24 @@ pub fn cleared(conn: &mut Connection, run_id: i64) -> Result<Cleared, String> {
     }
 }
 
+/// Whether Continue is offered for a run with `status` at a step of `kind`
+/// (see `resume`): only at a prompt step that needs attention, where Claude
+/// going on can help. A reply that ends with one of the step's outputs moves
+/// such a run on too (see `on_stop`).
+fn continue_offered(status: Status, kind: Kind, resume: Option<Resume>) -> bool {
+    status == Status::Attention && kind == Kind::Prompt && resume.is_some()
+}
+
 /// Why a run waits when Claude Code does not report Claude's replies.
 const NO_REPLY: &str = "Claude Code did not report Claude's reply to Mischief of Agents; update Claude Code to run flows.";
 
 /// Claude in tab `tab_id` ended its turn with `reply` (None when Claude Code did
 /// not report it): moves the tab's run on. Returns the next prompt to send, if
-/// any. A tab with no run, or whose run waits for the person, is left alone. A
-/// manual prompt the person sent goes on by its one output, whatever the reply.
+/// any. A tab with no run is left alone. A run that waits for the person at a
+/// prompt step is left alone too, unless Claude's reply ends with one of the
+/// step's outputs and Continue is offered there (see `continue_offered`); one
+/// that waits at Start or a manual prompt always is. A manual prompt the person
+/// sent goes on by its one output, whatever the reply.
 pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Result<Option<String>, String> {
     // Every turn of every tab ends here: most tabs run no flow, so look before
     // taking the write lock.
@@ -575,6 +586,21 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
         };
         // The person stepped in, which restarts the count toward MAX_RUN_STEPS.
         let prompt = go(&tx, &run, &node, output, 0, By::Flow)?;
+        tx.commit().map_err(sql)?;
+        return Ok(prompt);
+    }
+    if run.status == Status::Attention {
+        // The person may be chatting with Claude while the run waits. Only a reply
+        // that ends with one of the step's outputs moves it on, and only where
+        // Continue is offered: at a step limit only a pick passes the wait. Any other
+        // turn leaves the wait, its note and Continue as they were.
+        let Some(output) = reply
+            .and_then(flows::parse_marker)
+            .filter(|m| continue_offered(run.status, node.kind, run.resume) && m != flows::ATTENTION && node.outputs.contains(m))
+        else {
+            return Ok(None);
+        };
+        let prompt = go(&tx, &run, &node, &output, run.steps, By::Flow)?;
         tx.commit().map_err(sql)?;
         return Ok(prompt);
     }
@@ -788,7 +814,7 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Strin
     if run.status != Status::Attention || node.kind != Kind::Prompt {
         return Err(format!("\"{}\" does not need attention; pick an output instead", node.name()));
     }
-    let Some(how) = run.resume else {
+    let Some(how) = run.resume.filter(|_| continue_offered(run.status, node.kind, run.resume)) else {
         return Err(format!("Claude going on with \"{}\" would not help; pick an output instead", node.name()));
     };
     // Logged with why it waited, before going on clears that.
@@ -1014,8 +1040,7 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
             let states = Resume::parse(resume).and_then(|resume| Ok((resume, Clear::parse(clear)?)));
             let (step, outputs, note, resumable, step_kind) = match node.and_then(|node| states.map(|states| (node, states))) {
                 Ok((node, (resume, clear))) => {
-                    // The same test as `resume`'s.
-                    let resumable = status == Status::Attention && node.kind == Kind::Prompt && resume.is_some();
+                    let resumable = continue_offered(status, node.kind, resume);
                     if clear.is_some() || briefing {
                         // Nothing to pick until the first step is taken (see `proceed`).
                         let note = clear.is_some().then(|| "Clearing the conversation before the first step.".to_owned());
@@ -1470,20 +1495,95 @@ mod tests {
         let g = runnable();
         let (_db, mut conn, flow) = setup("runs-attention", &g);
         begin(&mut conn, flow, &tab("t1")).unwrap();
-        for (reply, why) in [
+        for (i, (reply, why)) in [
             ("I changed some files.", "FLOW"),
             ("FLOW: maybe", "maybe"),
             ("Which database should I use?\nFLOW: attention", "asked for a person"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_db, mut conn, flow) = setup(&format!("runs-attention-{i}"), &g);
+            begin(&mut conn, flow, &tab("t1")).unwrap();
             assert_eq!(on_stop(&mut conn, &tab("t1"), Some(reply)).unwrap(), None);
             let run = only_run(&conn);
             assert_eq!(run.status, Status::Attention, "{reply:?}");
             assert!(run.note.as_deref().unwrap_or("").contains(why), "{:?} should mention {why:?}", run.note);
+            assert!(run.resumable, "{reply:?}");
         }
-        // The person answers Claude in the terminal; its next reply moves the run on.
+        // The person answers Claude in the terminal; replies that do not end with one of the step's outputs
+        // leave the wait as it was, and the first with one moves the run on.
+        on_stop(&mut conn, &tab("t1"), Some("I changed some files.")).unwrap();
+        let waiting = only_run(&conn);
+        for reply in [Some("Which one?"), Some("FLOW: maybe"), Some("FLOW: attention"), None] {
+            assert_eq!(on_stop(&mut conn, &tab("t1"), reply).unwrap(), None);
+            assert_eq!(only_run(&conn), waiting, "{reply:?}");
+        }
         assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Used SQLite.\nFLOW: fail")).unwrap(), prompt_of(&g, "p"));
         let run = only_run(&conn);
         assert_eq!((run.status, run.note), (Status::Running, None));
+    }
+
+    #[test]
+    fn a_chat_turn_while_a_run_waits_leaves_its_note_and_continue_alone() {
+        let g = runnable();
+        let t = tab("t1");
+        // After a clear, Continue sends the step's prompt again, as Claude lost it.
+        let (_db, mut conn, flow) = setup("runs-chat-cleared", &g);
+        begin(&mut conn, flow, &t).unwrap();
+        clear_tab(&mut conn, &t, "The conversation was cleared.").unwrap();
+        let waiting = only_run(&conn);
+        assert_eq!(waiting.note.as_deref(), Some("The conversation was cleared."));
+        assert_eq!(on_stop(&mut conn, &t, Some("Sure, here is the answer to your question.")).unwrap(), None);
+        assert_eq!(only_run(&conn), waiting);
+        let text = go_on(&mut conn, waiting.id).unwrap();
+        assert!(text.contains(&flows::prompt_text(&g.nodes[1])), "{text}");
+        // At the step limit, where only a pick goes on, not even a reply ending with one of its outputs moves it.
+        let (_db, mut conn, flow) = setup("runs-chat-limit", &g);
+        begin(&mut conn, flow, &t).unwrap();
+        for _ in 0..MAX_RUN_STEPS {
+            on_stop(&mut conn, &t, Some("FLOW: fail")).unwrap();
+        }
+        let waiting = only_run(&conn);
+        assert!(!waiting.resumable);
+        for reply in [Some("What now?"), Some("FLOW: fail"), Some("FLOW: pass"), None] {
+            assert_eq!(on_stop(&mut conn, &t, reply).unwrap(), None);
+            assert_eq!(only_run(&conn), waiting, "{reply:?}");
+        }
+        // Nor where Claude Code does not report replies.
+        let (_db, mut conn, flow) = setup("runs-chat-unreported", &g);
+        begin(&mut conn, flow, &t).unwrap();
+        on_stop(&mut conn, &t, None).unwrap();
+        let waiting = only_run(&conn);
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: fail")).unwrap(), None);
+        assert_eq!(only_run(&conn), waiting);
+    }
+
+    #[test]
+    fn a_valid_flow_line_while_a_run_waits_moves_it_on() {
+        let g = runnable();
+        let t = tab("t1");
+        // After a clear Claude lacks the run's rules, so the next step carries them.
+        let (_db, mut conn, flow) = setup("runs-chat-moves", &g);
+        begin(&mut conn, flow, &t).unwrap();
+        clear_tab(&mut conn, &t, "The conversation was cleared.").unwrap();
+        let next = on_stop(&mut conn, &t, Some("Done it again.\nFLOW: fail")).unwrap().unwrap();
+        assert_eq!(next, flows::first_prompt_text(&g, "F", &g.nodes[1]));
+        let run = only_run(&conn);
+        assert_eq!((run.status, run.note, run.steps), (Status::Running, None, 2));
+        // Going on still keeps to a step's run limit.
+        let g = review_loop();
+        let (_db, mut conn, flow) = setup("runs-chat-max", &g);
+        begin(&mut conn, flow, &t).unwrap();
+        on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap();
+        on_stop(&mut conn, &t, Some("FLOW: done")).unwrap();
+        on_stop(&mut conn, &t, Some("FLOW: issues")).unwrap();
+        on_stop(&mut conn, &t, Some("Which fix?\nFLOW: attention")).unwrap();
+        assert!(only_run(&conn).resumable);
+        assert_eq!(on_stop(&mut conn, &t, Some("Fixed.\nFLOW: done")).unwrap(), None);
+        let run = only_run(&conn);
+        assert_eq!((run.status, run.step_id.as_str(), run.resumable), (Status::Attention, "fix", false));
+        assert!(run.note.unwrap().contains("already run 2 times"));
     }
 
     #[test]
