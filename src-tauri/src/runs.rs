@@ -1360,6 +1360,70 @@ fn log_once(what: &'static str, id: i64, message: impl FnOnce() -> String) {
     }
 }
 
+/// An active run's row, as `active` reads it: what cannot be read is kept as its
+/// error, so the run is still listed.
+struct ActiveRow {
+    id: i64,
+    flow_id: i64,
+    flow_name: String,
+    tab_id: String,
+    graph: Result<String, String>,
+    step_id: String,
+    status: String,
+    state: Result<RunState, String>,
+}
+
+/// What `active` shows of the step a run is at.
+struct Shown {
+    step: String,
+    outputs: Vec<String>,
+    note: Option<String>,
+    resumable: bool,
+    step_kind: Option<Kind>,
+    prefill: bool,
+    briefing: bool,
+    steps: i64,
+}
+
+impl Shown {
+    /// What is shown of a run at `node` in `state`.
+    fn of(node: Node, state: RunState) -> Self {
+        let resumable = continue_offered(&state.phase, node.kind).is_some();
+        let mut shown = Shown {
+            step: node.name().to_owned(),
+            outputs: Vec::new(),
+            note: None,
+            resumable: false,
+            step_kind: Some(node.kind),
+            prefill: state.phase.prefill(),
+            briefing: false,
+            steps: state.steps,
+        };
+        match state.phase {
+            // Nothing to pick until the first step is taken (see `proceed`).
+            Phase::Clearing { .. } => shown.note = Some("Clearing the conversation before the first step.".to_owned()),
+            Phase::Briefing { .. } => shown.briefing = true,
+            Phase::NeedsPerson { why, .. } => (shown.outputs, shown.note, shown.resumable) = (node.outputs, Some(why), resumable),
+            _ => (shown.outputs, shown.resumable) = (node.outputs, resumable),
+        }
+        shown
+    }
+
+    /// What is shown of a run at `step_id` that cannot be read, saying why.
+    fn unreadable(step_id: &str, why: &str) -> Self {
+        Shown {
+            step: step_id.to_owned(),
+            outputs: Vec::new(),
+            note: Some(format!("This run cannot be read: {why}. Stop it.")),
+            resumable: false,
+            step_kind: None,
+            prefill: false,
+            briefing: false,
+            steps: 0,
+        }
+    }
+}
+
 /// Every active run, oldest first. Writes nothing: timeouts are `expire`'s, so
 /// call that first when they must be applied.
 pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
@@ -1370,26 +1434,25 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
             RunState::COLUMNS
         ))
         .map_err(sql)?;
-    type Row = (i64, i64, String, String, Result<String, String>, String, String, Result<RunState, String>);
     let rows = stmt
         .query_map([], |r| {
-            Ok((
-                r.get("id")?,
-                r.get("flow_id")?,
-                r.get("flow_name")?,
-                r.get("tab_id")?,
-                r.get("graph").map_err(|e| format!("the run's steps cannot be read ({e})")),
+            Ok(ActiveRow {
+                id: r.get("id")?,
+                flow_id: r.get("flow_id")?,
+                flow_name: r.get("flow_name")?,
+                tab_id: r.get("tab_id")?,
+                graph: r.get("graph").map_err(|e| format!("the run's steps cannot be read ({e})")),
                 // Of the wrong type, it is only shown blank: the state's error says why.
-                r.get("node_id").unwrap_or_default(),
-                r.get("status")?,
-                RunState::from_row(r),
-            ))
+                step_id: r.get("node_id").unwrap_or_default(),
+                status: r.get("status")?,
+                state: RunState::from_row(r),
+            })
         })
         .map_err(sql)?
-        .collect::<Result<Vec<Row>, _>>()
+        .collect::<Result<Vec<ActiveRow>, _>>()
         .map_err(sql)?;
     rows.into_iter()
-        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, state)| {
+        .map(|ActiveRow { id, flow_id, flow_name, tab_id, graph, step_id, status, state }| {
             // A run that cannot be read is still listed, saying why, so it can be stopped.
             let graph = graph.and_then(|graph| parse_graph(&graph));
             // Only shown, so a failure to count leaves the run listed, and stoppable.
@@ -1406,23 +1469,11 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
             });
             // Only active statuses are selected, so this one is known.
             let status = Status::parse(&status)?;
-            let (step, outputs, note, resumable, step_kind, prefill, briefing, steps) = match node.and_then(|node| state.map(|state| (node, state))) {
-                Ok((node, state)) => {
-                    let resumable = continue_offered(&state.phase, node.kind).is_some();
-                    let (prefill, steps) = (state.phase.prefill(), state.steps);
-                    match state.phase {
-                        // Nothing to pick until the first step is taken (see `proceed`).
-                        Phase::Clearing { .. } => {
-                            let note = Some("Clearing the conversation before the first step.".to_owned());
-                            (node.name().to_owned(), Vec::new(), note, false, Some(node.kind), prefill, false, steps)
-                        }
-                        Phase::Briefing { .. } => (node.name().to_owned(), Vec::new(), None, false, Some(node.kind), prefill, true, steps),
-                        Phase::NeedsPerson { why, .. } => (node.name().to_owned(), node.outputs, Some(why), resumable, Some(node.kind), prefill, false, steps),
-                        _ => (node.name().to_owned(), node.outputs, None, resumable, Some(node.kind), prefill, false, steps),
-                    }
-                }
-                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false, None, false, false, 0),
-            };
+            let Shown { step, outputs, note, resumable, step_kind, prefill, briefing, steps } =
+                match node.and_then(|node| state.map(|state| (node, state))) {
+                    Ok((node, state)) => Shown::of(node, state),
+                    Err(e) => Shown::unreadable(&step_id, &e),
+                };
             Ok(Run { id, flow_id, flow_name, tab_id, step, outputs, step_id, status, note, steps, done, total, resumable, prefill, step_kind, briefing })
         })
         .collect()
