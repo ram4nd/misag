@@ -36,7 +36,7 @@
 
 use crate::flows::{self, Graph, Kind, Node};
 use crate::layout::TabId;
-use rusqlite::{named_params, params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{named_params, params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Mutex, PoisonError};
@@ -252,7 +252,10 @@ fn new_token() -> i64 {
 
 /// Where a run is with its step, and what only that place has. Each phase has one
 /// status (see `Phase::status`); `RunState::from_columns` and `RunState::columns`
-/// map it to and from `flow_runs`' columns.
+/// map it to and from `flow_runs`' columns. The CHECKs on `flow_runs` (in db.rs's
+/// MIGRATIONS) spell out the same rules, and SQLite cannot change a table's CHECKs:
+/// changing the phases or how they are stored needs a new migration that rebuilds
+/// the table with new CHECKs.
 #[derive(Clone, Debug, PartialEq)]
 enum Phase {
     /// Running at Start, whose step clears: the app types `/clear` (status running,
@@ -350,7 +353,8 @@ impl Columns {
 /// read (in `stop` and in `stop_in`), dropping the note owed for an ended run
 /// (`drop_closing`, and `on_prompt`'s `closing` UPDATE ... RETURNING), and stopping
 /// the runs of tabs a raterm import leaves behind (in db.rs). Every other state
-/// change is a load and a save.
+/// change is a load and a save. The CHECKs on `flow_runs` (in db.rs's MIGRATIONS)
+/// hold an active row to the combinations `from_columns` reads, for every writer.
 #[derive(Clone, Debug, PartialEq)]
 struct RunState {
     node_id: String,
@@ -380,7 +384,10 @@ impl RunState {
     /// the status leaves no room for, naming them; except what versions before this
     /// one left behind, which is dropped: everything but `closing` on an ended run
     /// (a raw stop, as for an unreadable run, leaves the rest as it was), and a
-    /// `briefing_at` the briefing has outlived.
+    /// `briefing_at` the briefing has outlived, which the CHECKs now refuse (the
+    /// migration that added them cleared it), so only a writer that bypasses them
+    /// (such as a database edited by hand) can leave one. Changing what this reads
+    /// needs a new migration rebuilding `flow_runs` with matching CHECKs (see `Phase`).
     fn from_columns(c: Columns) -> Result<Self, String> {
         let status = Status::parse(&c.status)?;
         let cannot = |what: &str| Err(format!("the run is {} with {what}, which cannot be", status.as_str()));
@@ -833,8 +840,9 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
         ],
     );
     match inserted {
-        // The flow exists and the values are checked, so the constraint is the one-run index.
-        Err(e) if e.sqlite_error_code() == Some(ErrorCode::ConstraintViolation) => {
+        // The one-run index is the only UNIQUE constraint an insert can break; any
+        // other refusal (a CHECK, say) is reported as itself.
+        Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
             return Err("this tab is already running a flow; stop that run first".into());
         }
         other => other.map_err(sql)?,
@@ -2819,6 +2827,7 @@ mod tests {
         ]
     }
 
+    /// Each save also passes flow_runs' CHECKs (see db.rs), which hold every phase.
     #[test]
     fn a_run_s_state_is_saved_and_loaded_whole() {
         let (_db, mut conn, flow) = setup("runs-state-round-trip", &manual_first());
@@ -2976,10 +2985,11 @@ mod tests {
     fn after_a_restart_a_database_error_is_returned_not_skipped() {
         let (_db, mut conn, flow) = setup("runs-restart-sql-error", &runnable());
         begin(&mut conn, flow, &tab("t1")).unwrap();
-        // A column the run's state is read from is gone: the database, not the run, is at fault.
-        conn.execute_batch("ALTER TABLE flow_runs DROP COLUMN briefing_at").unwrap();
+        // A column the run's state is read from is gone (not one a CHECK names, which
+        // SQLite will not drop): the database, not the run, is at fault.
+        conn.execute_batch("ALTER TABLE flow_runs DROP COLUMN prefill_token").unwrap();
         let e = after_restart(&mut conn, &[tab("t1")]).unwrap_err();
-        assert!(e.contains("briefing_at"), "{e}");
+        assert!(e.contains("prefill_token"), "{e}");
     }
 
     #[test]
@@ -3081,6 +3091,66 @@ mod tests {
         assert_eq!(before, RunState::initial(&g.nodes[0], true));
         clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
         assert_eq!(state(&conn, run), RunState { phase: Phase::Clearing { done: true }, briefed: false, ..before });
+    }
+
+    #[test]
+    fn the_checks_on_flow_runs_accept_an_active_row_exactly_when_from_columns_reads_it() {
+        let (_db, mut conn, flow) = setup("runs-checks-agree", &runnable());
+        conn.pragma_update(None, "ignore_check_constraints", false).unwrap();
+        let (mut stored_any, mut refused_any) = (false, false);
+        // Every active status, with each column the CHECKs name set or not.
+        for i in 0..3 * 2 * 2 * 3 * 2 * 2 * 2 * 2 {
+            let mut left = i;
+            let mut pick = |n: usize| {
+                let picked = left % n;
+                left /= n;
+                picked
+            };
+            let c = Columns {
+                status: ["running", "manual", "attention"][pick(3)].into(),
+                note: (pick(2) == 1).then(|| "why".to_string()),
+                resume: (pick(2) == 1).then(|| "remind".to_string()),
+                clear: [None, Some("pending"), Some("done")][pick(3)].map(String::from),
+                briefing: pick(2) == 1,
+                briefing_at: (pick(2) == 1).then_some(5),
+                prefill: pick(2) == 1,
+                closing: pick(2) == 1,
+                ..working_columns()
+            };
+            let tx = conn.transaction().unwrap();
+            let inserted = tx.execute(
+                "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, note, started_at, updated_at, resume, clear,
+                                        briefed, prefill, prefill_token, briefing, briefing_at, closing)
+                 VALUES (?1, 't1', '{}', ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    flow, c.node_id, c.status, c.steps, c.note, c.resume, c.clear, c.briefed, c.prefill, c.prefill_token, c.briefing,
+                    c.briefing_at, c.closing
+                ],
+            );
+            drop(tx);
+            let stored = match inserted {
+                Ok(_) => true,
+                Err(e) => {
+                    assert!(e.to_string().contains("CHECK constraint failed"), "{c:?}: {e}");
+                    false
+                }
+            };
+            (stored_any, refused_any) = (stored_any || stored, refused_any || !stored);
+            // from_columns also reads a briefing's time the briefing has outlived,
+            // which only writers that bypass the CHECKs can leave.
+            let stale_briefing_at = !c.briefing && c.briefing_at.is_some();
+            assert_eq!(stored, RunState::from_columns(c.clone()).is_ok() && !stale_briefing_at, "{c:?}");
+        }
+        assert!(stored_any && refused_any);
+    }
+
+    #[test]
+    fn start_reports_a_refused_insert_as_itself_not_as_a_busy_tab() {
+        let (_db, mut conn, flow) = setup("runs-start-refused", &runnable());
+        conn.execute_batch("CREATE TEMP TRIGGER refuse BEFORE INSERT ON flow_runs BEGIN SELECT RAISE(ABORT, 'refused here'); END")
+            .unwrap();
+        let e = start(&mut conn, flow, &tab("t1")).unwrap_err();
+        assert!(e.contains("refused here") && !e.contains("already running"), "{e}");
     }
 
     #[test]

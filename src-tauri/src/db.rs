@@ -193,7 +193,156 @@ const MIGRATIONS: &[&str] = &[r#"
     -- while briefing = 1.
     ALTER TABLE flow_runs ADD COLUMN briefing_at INTEGER;
     UPDATE flow_runs SET briefing_at = updated_at WHERE briefing = 1;
+"#, r#"
+    -- The cross-column rules of a run's state (runs::Phase), so every writer keeps
+    -- them, for active runs only: an ended run is read by `closing` alone, and a raw
+    -- stop (of a run a version cannot read) leaves the rest as it was.
+    --
+    -- First, in this transaction, `normalise_runs` makes the rows older versions
+    -- left fit them (see apply_migrations).
+    --
+    -- SQLite cannot add a CHECK to a table, so flow_runs is rebuilt (see the
+    -- foreign_keys handling in `migrate` for the foreign keys of flow_run_events
+    -- and flow_run_resumes, which name it).
+    CREATE TABLE flow_runs_new (
+        id            INTEGER PRIMARY KEY,
+        flow_id       INTEGER NOT NULL REFERENCES flows (id) ON DELETE CASCADE,
+        tab_id        TEXT NOT NULL,
+        graph         TEXT NOT NULL,
+        node_id       TEXT NOT NULL,
+        status        TEXT NOT NULL CHECK (status IN ('running', 'manual', 'attention', 'done', 'stopped')),
+        -- Steps taken since a person last stepped in; see runs::MAX_RUN_STEPS.
+        steps         INTEGER NOT NULL DEFAULT 0,
+        -- Why the run needs attention.
+        note          TEXT,
+        started_at    INTEGER NOT NULL,
+        updated_at    INTEGER NOT NULL,
+        -- How Continue goes on with a run that needs attention (see runs::Resume);
+        -- NULL when it cannot help, and the person picks an output.
+        resume        TEXT CHECK (resume IN ('remind', 'prompt')),
+        -- For a run whose Start clears, while it waits at Start for Claude's /clear
+        -- (see runs::Clear); NULL otherwise.
+        clear         TEXT CHECK (clear IN ('pending', 'done')),
+        -- 0 while Claude lacks Start's base info: from a run's start, and after each
+        -- /clear in its tab, until a prompt carries it (see runs::go).
+        briefed       INTEGER NOT NULL DEFAULT 1 CHECK (briefed IN (0, 1)),
+        -- 1 while a run waits at a manual prompt whose text the app has yet to put
+        -- into Claude's input (see runs::prefill_text).
+        prefill       INTEGER NOT NULL DEFAULT 0 CHECK (prefill IN (0, 1)),
+        -- Names the paste a run owes while prefill is 1, so the record of an earlier
+        -- paste does not cancel one owed since (see runs::prefilled).
+        prefill_token INTEGER,
+        -- 1 while a run waits at Start for Claude's reply to its briefing (see
+        -- runs::on_stop): only that reply takes the first step.
+        briefing      INTEGER NOT NULL DEFAULT 0 CHECK (briefing IN (0, 1)),
+        -- 1 on a finished or stopped run whose Claude has yet to be told the flow is
+        -- finished, which comes with the person's next prompt (see runs::on_prompt).
+        closing       INTEGER NOT NULL DEFAULT 0 CHECK (closing IN (0, 1)),
+        -- When the run sent its briefing, which its timeout counts from (see
+        -- runs::expire), so other writes to the run do not restart it.
+        briefing_at   INTEGER,
+        -- A run needs attention (NeedsPerson) exactly when it says why.
+        CONSTRAINT note_only_when_attention
+            CHECK (status IN ('done', 'stopped') OR (note IS NOT NULL) = (status = 'attention')),
+        CONSTRAINT resume_only_when_attention
+            CHECK (status IN ('done', 'stopped') OR resume IS NULL OR status = 'attention'),
+        -- Clearing and Briefing are at Start, running, and not both at once (a
+        -- briefing also needs the time it was sent).
+        CONSTRAINT clear_only_when_running
+            CHECK (status IN ('done', 'stopped') OR clear IS NULL OR status = 'running'),
+        CONSTRAINT briefing_only_when_running
+            CHECK (status IN ('done', 'stopped') OR briefing = 0
+                   OR (status = 'running' AND clear IS NULL AND briefing_at IS NOT NULL)),
+        CONSTRAINT briefing_at_only_when_briefing
+            CHECK (status IN ('done', 'stopped') OR briefing = 1 OR briefing_at IS NULL),
+        -- A paste is owed only at a manual prompt (Waiting, NeedsPerson).
+        CONSTRAINT prefill_only_when_waiting
+            CHECK (status IN ('done', 'stopped') OR prefill = 0 OR status IN ('manual', 'attention')),
+        -- The note that a flow is finished is owed only by an ended run.
+        CONSTRAINT closing_only_when_ended
+            CHECK (closing = 0 OR status IN ('done', 'stopped'))
+    );
+    INSERT INTO flow_runs_new (id, flow_id, tab_id, graph, node_id, status, steps, note, started_at, updated_at,
+                               resume, clear, briefed, prefill, prefill_token, briefing, closing, briefing_at)
+    SELECT id, flow_id, tab_id, graph, node_id, status, steps, note, started_at, updated_at,
+           resume, clear, briefed, prefill, prefill_token, briefing, closing, briefing_at
+    FROM flow_runs;
+    DROP TABLE flow_runs;
+    ALTER TABLE flow_runs_new RENAME TO flow_runs;
+    CREATE UNIQUE INDEX one_active_run_per_tab ON flow_runs (tab_id)
+        WHERE status IN ('running', 'manual', 'attention');
+    CREATE INDEX flow_runs_by_flow ON flow_runs (flow_id);
+    CREATE INDEX flow_runs_closing ON flow_runs (tab_id) WHERE closing = 1;
 "#];
+
+/// The index in MIGRATIONS of the migration adding flow_runs' CHECKs, which
+/// `normalise_runs` precedes.
+const RUN_CHECKS: usize = 21;
+
+/// Makes the rows older versions left fit flow_runs' CHECKs, before the migration
+/// adding them; the ids of the active runs it held for the person, which SQL
+/// cannot report, so it is Rust's.
+fn normalise_runs(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
+    // First, rows from_columns still accepts but that carry a stale briefing_at get it cleared.
+    conn.execute(
+        "UPDATE flow_runs SET briefing_at = NULL
+         WHERE status IN ('running', 'manual', 'attention') AND briefing = 0 AND briefing_at IS NOT NULL",
+        [],
+    )?;
+    // Then the active rows it refuses wait for the person where they are, keeping
+    // the steps, what Claude has (briefed), the last paste's token and a note a run
+    // needing attention had: the person sees the run and stops it, or picks an
+    // output if they know where it was.
+    let mut stmt = conn.prepare(
+        "UPDATE flow_runs SET
+             status = 'attention',
+             note = 'This run could not be read after an update, so it waits here. Stop it, or pick an output if you know where it was.'
+                 || CASE WHEN status = 'attention' AND trim(COALESCE(note, '')) <> '' THEN ' (it said: ' || note || ')' ELSE '' END,
+             resume = NULL, clear = NULL, prefill = 0, briefing = 0, briefing_at = NULL, closing = 0
+         WHERE status IN ('running', 'manual', 'attention') AND NOT (
+             (note IS NOT NULL) = (status = 'attention')
+             AND (resume IS NULL OR status = 'attention')
+             AND (clear IS NULL OR status = 'running')
+             AND (briefing = 0 OR (status = 'running' AND clear IS NULL AND briefing_at IS NOT NULL))
+             AND (briefing = 1 OR briefing_at IS NULL)
+             AND (prefill = 0 OR status IN ('manual', 'attention'))
+             AND closing = 0
+         )
+         RETURNING id",
+    )?;
+    let mut held = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+    held.sort_unstable();
+    Ok(held)
+}
+
+/// A row whose foreign key leads nowhere, as `PRAGMA foreign_key_check` reports it.
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+struct Orphan {
+    table: String,
+    /// None for a table without rowids.
+    rowid: Option<i64>,
+    /// The table the key names.
+    parent: String,
+}
+
+impl fmt::Display for Orphan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.rowid {
+            Some(rowid) => write!(f, "{} row {rowid} (no {} row)", self.table, self.parent),
+            None => write!(f, "a {} row (no {} row)", self.table, self.parent),
+        }
+    }
+}
+
+fn orphans(conn: &Connection) -> rusqlite::Result<Vec<Orphan>> {
+    let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
+    let found = stmt.query_map([], |r| Ok(Orphan { table: r.get(0)?, rowid: r.get(1)?, parent: r.get(2)? }))?;
+    found.collect()
+}
+
+fn list(orphans: &[Orphan]) -> String {
+    orphans.iter().map(Orphan::to_string).collect::<Vec<_>>().join(", ")
+}
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
 #[derive(Debug, PartialEq)]
@@ -291,11 +440,34 @@ pub fn connect_if_current(path: &Path) -> Result<Option<Connection>, String> {
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), OpenError> {
-    let known = MIGRATIONS.len() as i64;
+    migrate_with(conn, MIGRATIONS)
+}
+
+fn migrate_with(conn: &mut Connection, migrations: &[&str]) -> Result<(), OpenError> {
+    let known = migrations.len() as i64;
     // Usually current: then no write lock is taken, so startup never waits on the hook.
     if schema_version(conn)? == known {
         return Ok(());
     }
+    // A migration that rebuilds a table drops it, which with foreign keys enforced
+    // would delete the rows of the tables naming it (ON DELETE CASCADE). So, as
+    // SQLite's ALTER TABLE docs prescribe, they are off while migrating (which only
+    // takes outside a transaction), each migration checks them before it commits,
+    // and they are back on after, however migrating ends.
+    conn.pragma_update(None, "foreign_keys", false).map_err(|e| classify("foreign keys", e))?;
+    let migrated = apply_migrations(conn, migrations);
+    let enforced = enforce_foreign_keys(conn);
+    if let (Err(_), Err(e)) = (&migrated, &enforced) {
+        // The migration's error says what went wrong; this one only follows.
+        eprintln!("misag: after a failed migration, {e}");
+        return migrated;
+    }
+    migrated.and(enforced)
+}
+
+fn apply_migrations(conn: &mut Connection, migrations: &[&str]) -> Result<(), OpenError> {
+    let known = migrations.len() as i64;
+    let mut logged = Vec::new();
     loop {
         // IMMEDIATE takes the write lock first, so two processes cannot both apply
         // the same migration; the version is re-read under that lock.
@@ -309,9 +481,38 @@ fn migrate(conn: &mut Connection) -> Result<(), OpenError> {
         if done == known {
             return Ok(());
         }
-        tx.execute_batch(MIGRATIONS[done as usize])
-            .map_err(|e| classify(&format!("migration {}", done + 1), e))?;
-        tx.pragma_update(None, "user_version", done + 1).map_err(|e| classify("schema version", e))?;
+        let number = done + 1;
+        // Rows that already lead nowhere are logged, not fatal: they would otherwise
+        // keep the database from ever being upgraded. Only new ones fail the migration.
+        let before = orphans(&tx).map_err(|e| classify("foreign key check", e))?;
+        if !before.is_empty() && before != logged {
+            eprintln!("misag: before migration {number}, rows' foreign keys lead nowhere: {}", list(&before));
+            logged.clone_from(&before);
+        }
+        if done as usize == RUN_CHECKS {
+            let held = normalise_runs(&tx).map_err(|e| classify(&format!("migration {number}"), e))?;
+            if !held.is_empty() {
+                eprintln!("misag: migration {number} holds {} active runs it cannot read for the person: ids {held:?}", held.len());
+            }
+        }
+        tx.execute_batch(migrations[done as usize]).map_err(|e| classify(&format!("migration {number}"), e))?;
+        let before: HashSet<_> = before.into_iter().collect();
+        let new: Vec<_> = orphans(&tx)
+            .map_err(|e| classify("foreign key check", e))?
+            .into_iter()
+            .filter(|o| !before.contains(o))
+            .collect();
+        if !new.is_empty() {
+            eprintln!("misag: migration {number} would leave rows whose foreign keys lead nowhere: {}", list(&new));
+            const SHOWN: usize = 3;
+            let more = new.len().saturating_sub(SHOWN);
+            let more = if more > 0 { format!(" and {more} more") } else { String::new() };
+            return Err(OpenError::Other(format!(
+                "migration {number} would leave rows whose foreign keys lead nowhere: {}{more}",
+                list(&new[..new.len().min(SHOWN)])
+            )));
+        }
+        tx.pragma_update(None, "user_version", number).map_err(|e| classify("schema version", e))?;
         tx.commit().map_err(|e| classify("migration commit", e))?;
     }
 }
@@ -2181,7 +2382,9 @@ pub(crate) mod tests {
         let idle_run = crate::runs::active(&runs).unwrap()[1].id;
         crate::runs::stop(&runs, idle_run).unwrap();
         for status in ["running", "manual", "attention"] {
-            runs.execute("UPDATE flow_runs SET status = ?1 WHERE tab_id = 't1'", [status]).unwrap();
+            // A run needs attention saying why (see the CHECKs on flow_runs).
+            runs.execute("UPDATE flow_runs SET status = ?1, note = iif(?1 = 'attention', 'why', NULL) WHERE tab_id = 't1'", [status])
+                .unwrap();
             let err = db.delete_flow(ids[0]).unwrap_err();
             assert!(err.contains("running"), "{status}: {err}");
         }
@@ -2257,5 +2460,315 @@ pub(crate) mod tests {
         assert!(db.load_settings().unwrap().disable_auto_memory);
         assert!(db.list_flows().unwrap().is_empty());
         db.create_flow("Deploy").unwrap();
+    }
+
+    /// The database at `path` at the schema before flow_runs' cross-column CHECKs,
+    /// holding one flow, whose runs `old_run` adds.
+    fn before_run_checks(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        let before = MIGRATIONS.iter().position(|m| m.contains("CREATE TABLE flow_runs_new")).unwrap();
+        assert_eq!(before, RUN_CHECKS, "normalise_runs goes with the migration adding the CHECKs");
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        let graph = serde_json::to_string(&crate::flows::tests::runnable()).unwrap();
+        conn.execute("INSERT INTO flows (name, position, graph, created_at, updated_at) VALUES ('F', 0, ?1, 0, 0)", [graph]).unwrap();
+        conn
+    }
+
+    /// Adds a run at step p of flow 1 in tab `tab`: inserts it as stopped, then sets
+    /// the columns `set` gives, bypassing the typed writers, as an older version may
+    /// have written them; its id.
+    fn old_run(conn: &Connection, tab: &str, set: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, started_at, updated_at)
+             SELECT 1, ?1, graph, 'p', 'stopped', 3, 10, 20 FROM flows WHERE id = 1",
+            [tab],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [id]).unwrap();
+        id
+    }
+
+    /// Every column of every run, by id.
+    fn run_rows(conn: &Connection) -> Vec<Vec<rusqlite::types::Value>> {
+        let columns = "id, flow_id, tab_id, graph, node_id, status, steps, note, started_at, updated_at, resume, clear, briefed,
+                       prefill, prefill_token, briefing, closing, briefing_at";
+        let mut stmt = conn.prepare(&format!("SELECT {columns} FROM flow_runs ORDER BY id")).unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect()).unwrap().collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn upgrading_keeps_runs_of_every_phase_as_they_were() {
+        let path = temp_db("upgrade-run-checks-kept");
+        let conn = before_run_checks(&path);
+        for (tab, set) in [
+            ("clearing", "status = 'running', clear = 'pending', briefed = 0"),
+            ("cleared", "status = 'running', clear = 'done', briefed = 0"),
+            ("briefing", "status = 'running', briefing = 1, briefing_at = 15, briefed = 0"),
+            ("working", "status = 'running'"),
+            ("waiting", "status = 'manual'"),
+            ("pasting", "status = 'manual', prefill = 1, prefill_token = 7"),
+            ("needs", "status = 'attention', note = 'why', resume = 'prompt', prefill = 1, prefill_token = 8"),
+            ("stuck", "status = 'attention', note = 'why'"),
+            // An ended run keeps what a stop left behind: only `closing` is read.
+            ("done", "status = 'done', closing = 1, note = 'old', resume = 'remind', clear = 'pending', prefill = 1, briefing = 1, briefing_at = 5"),
+            ("stopped", "status = 'stopped', briefing_at = 5"),
+        ] {
+            old_run(&conn, tab, set);
+        }
+        let before = run_rows(&conn);
+        drop(conn);
+        Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        assert_eq!(run_rows(&conn), before);
+        let runs = crate::runs::active(&conn).unwrap();
+        assert_eq!(runs.len(), 8);
+        for run in runs {
+            assert!(!run.note.as_deref().unwrap_or_default().contains("cannot be read"), "{run:?}");
+        }
+        // The rebuilt table keeps its indexes.
+        let indexes: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'flow_runs' AND sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(indexes, ["flow_runs_by_flow", "flow_runs_closing", "one_active_run_per_tab"]);
+    }
+
+    #[test]
+    fn upgrading_keeps_a_run_s_events_and_resumes_which_still_go_with_it() {
+        let path = temp_db("upgrade-run-checks-children");
+        let conn = before_run_checks(&path);
+        let run = old_run(&conn, "t1", "status = 'running'");
+        conn.execute("INSERT INTO flow_run_events (run_id, node_id, output, at) VALUES (?1, 'start', 'next', 0)", [run]).unwrap();
+        conn.execute("INSERT INTO flow_run_resumes (run_id, node_id, note, at) VALUES (?1, 'p', 'why', 0)", [run]).unwrap();
+        drop(conn);
+        // The connection that migrated enforces foreign keys again, and they still
+        // lead to the rebuilt table.
+        let conn = connect(&path).unwrap();
+        let fk: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
+        assert!(fk);
+        let db = Db::open(path.clone()).unwrap();
+        let count = |table: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap() };
+        assert_eq!((count("flow_run_events"), count("flow_run_resumes")), (1, 1));
+        crate::runs::stop(&conn, run).unwrap();
+        db.delete_flow(1).unwrap();
+        assert_eq!((count("flow_runs"), count("flow_run_events"), count("flow_run_resumes")), (0, 0, 0));
+    }
+
+    #[test]
+    fn upgrading_drops_what_runs_left_behind_and_holds_runs_it_cannot_read_for_the_person() {
+        let path = temp_db("upgrade-run-checks-normalised");
+        let conn = before_run_checks(&path);
+        // A briefing's time, which versions before kept after the briefing, goes.
+        let stale = old_run(&conn, "stale", "status = 'running', briefing_at = 5");
+        let stale_manual = old_run(&conn, "stale-manual", "status = 'manual', prefill = 1, prefill_token = 4, briefing_at = 5");
+        let odd: Vec<i64> = [
+            "status = 'running', note = 'old'",
+            "status = 'running', resume = 'remind'",
+            "status = 'running', prefill = 1",
+            "status = 'running', clear = 'pending', briefing = 1, briefing_at = 5",
+            "status = 'running', briefing = 1",
+            "status = 'manual', closing = 1",
+            "status = 'manual', note = 'old'",
+            "status = 'manual', clear = 'done'",
+            "status = 'attention'",
+            "status = 'attention', note = 'old', briefing = 1, briefing_at = 5",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, set)| old_run(&conn, &format!("odd{i}"), &format!("{set}, briefed = {}, prefill_token = 9", i % 2)))
+        .collect();
+        drop(conn);
+        Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        type Row = (String, String, i64, Option<String>, Option<String>, Option<String>, bool, bool, Option<i64>, bool, Option<i64>, bool);
+        let row = |id: i64| -> Row {
+            conn.query_row(
+                "SELECT node_id, status, steps, note, resume, clear, briefed, prefill, prefill_token, briefing, briefing_at, closing
+                 FROM flow_runs WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?)),
+            )
+            .unwrap()
+        };
+        let p = || "p".to_string();
+        assert_eq!(row(stale), (p(), "running".into(), 3, None, None, None, true, false, None, false, None, false));
+        assert_eq!(row(stale_manual), (p(), "manual".into(), 3, None, None, None, true, true, Some(4), false, None, false));
+        // A run no version could have left so is held for the person, where it was,
+        // with what it knew of Claude (briefed) and its last paste's token.
+        for (i, id) in odd.into_iter().enumerate() {
+            let (node, status, steps, note, resume, clear, briefed, prefill, token, briefing, briefing_at, closing) = row(id);
+            assert_eq!(
+                (node, status, steps, resume, clear, briefed, prefill, token, briefing, briefing_at, closing),
+                (p(), "attention".into(), 3, None, None, i % 2 == 1, false, Some(9), false, None, false),
+                "odd{i}"
+            );
+            let note = note.unwrap();
+            assert!(note.contains("could not be read"), "odd{i}");
+            // Only a run that already needed attention had a note worth keeping.
+            assert_eq!(note.ends_with(" (it said: old)"), i == 9, "odd{i}: {note}");
+        }
+        for run in crate::runs::active(&conn).unwrap() {
+            assert!(!run.note.as_deref().unwrap_or_default().contains("cannot be read"), "{run:?}");
+        }
+    }
+
+    #[test]
+    fn upgrading_names_the_runs_it_holds_for_the_person() {
+        let path = temp_db("upgrade-run-checks-held");
+        let mut conn = before_run_checks(&path);
+        old_run(&conn, "stale", "status = 'running', briefing_at = 5");
+        old_run(&conn, "fine", "status = 'manual'");
+        let odd = old_run(&conn, "odd", "status = 'manual', note = 'old'");
+        old_run(&conn, "ended", "status = 'done', note = 'old'");
+        let tx = conn.transaction().unwrap();
+        assert_eq!(normalise_runs(&tx).unwrap(), [odd]);
+    }
+
+    #[test]
+    fn a_failed_upgrade_changes_nothing_and_enforces_foreign_keys_again() {
+        let path = temp_db("upgrade-run-checks-failed");
+        let conn = before_run_checks(&path);
+        // A value no version knows, as a database edited by hand may hold, on an
+        // ended run, which the upgrade leaves as it is; the rebuilt table refuses it.
+        conn.pragma_update(None, "ignore_check_constraints", true).unwrap();
+        old_run(&conn, "later", "status = 'stopped', resume = 'later'");
+        old_run(&conn, "working", "status = 'running'");
+        let table_sql = |conn: &Connection| -> String {
+            conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'flow_runs'", [], |r| r.get(0)).unwrap()
+        };
+        let (before_sql, before_rows) = (table_sql(&conn), run_rows(&conn));
+        let version = schema_version(&conn).unwrap();
+        drop(conn);
+        let e = Db::open(path.clone()).err().unwrap().to_string();
+        assert!(e.contains(&format!("migration {}", version + 1)) && e.contains("CHECK constraint failed"), "{e}");
+        let mut conn = Connection::open(&path).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), version);
+        assert_eq!((table_sql(&conn), run_rows(&conn)), (before_sql, before_rows));
+        // The connection that tried is back to enforcing foreign keys.
+        assert!(migrate(&mut conn).is_err());
+        let fk: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
+        assert!(fk);
+    }
+
+    #[test]
+    fn rows_whose_foreign_keys_led_nowhere_before_do_not_block_an_upgrade() {
+        let path = temp_db("upgrade-old-orphan");
+        let conn = before_run_checks(&path);
+        // As a connection with foreign keys off may have left it.
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute(
+            "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at) VALUES (99, 'orphan', '{}', 'p', 'stopped', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let orphan = conn.last_insert_rowid();
+        let found = orphans(&conn).unwrap();
+        assert_eq!(found, [Orphan { table: "flow_runs".into(), rowid: Some(orphan), parent: "flows".into() }]);
+        drop(conn);
+        Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        // Still there, for the person (and the log) to see.
+        assert_eq!(orphans(&conn).unwrap(), found);
+    }
+
+    #[test]
+    fn a_migration_that_leaves_rows_leading_nowhere_fails_naming_them() {
+        let path = temp_db("upgrade-new-orphan");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        db.save_flow_graph(flow, &crate::flows::tests::runnable()).unwrap();
+        let mut runs = connect_existing(&path).unwrap();
+        let run = crate::runs::start(&mut runs, flow, &tid("t1")).unwrap().run_id;
+        crate::runs::stop(&runs, run).unwrap();
+        drop((db, runs));
+        let mut migrations = MIGRATIONS.to_vec();
+        migrations.push("DELETE FROM flows;");
+        let mut conn = Connection::open(&path).unwrap();
+        let e = migrate_with(&mut conn, &migrations).unwrap_err().to_string();
+        assert!(e.contains(&format!("migration {}", migrations.len())) && e.contains(&format!("flow_runs row {run} (no flows row)")), "{e}");
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len() as i64);
+        let flows: i64 = conn.query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0)).unwrap();
+        assert_eq!(flows, 1);
+        let fk: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
+        assert!(fk);
+    }
+
+    #[test]
+    fn after_upgrading_the_database_refuses_a_run_state_that_cannot_be() {
+        let path = temp_db("upgrade-run-checks-refuse");
+        Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        let graph = serde_json::to_string(&crate::flows::tests::runnable()).unwrap();
+        conn.execute("INSERT INTO flows (name, position, graph, created_at, updated_at) VALUES ('F', 0, ?1, 0, 0)", [graph]).unwrap();
+        let run = old_run(&conn, "t1", "status = 'running'");
+        for (set, check) in [
+            ("note = 'why'", "note_only_when_attention"),
+            ("status = 'attention'", "note_only_when_attention"),
+            ("status = 'manual', note = 'why'", "note_only_when_attention"),
+            ("resume = 'remind'", "resume_only_when_attention"),
+            ("status = 'manual', resume = 'prompt'", "resume_only_when_attention"),
+            ("status = 'manual', clear = 'pending'", "clear_only_when_running"),
+            ("status = 'attention', note = 'why', clear = 'done'", "clear_only_when_running"),
+            ("briefing = 1", "briefing_only_when_running"),
+            ("briefing = 1, briefing_at = 1, clear = 'pending'", "briefing_only_when_running"),
+            ("status = 'manual', briefing = 1, briefing_at = 1", "briefing_only_when_running"),
+            ("briefing_at = 1", "briefing_at_only_when_briefing"),
+            ("prefill = 1", "prefill_only_when_waiting"),
+            ("closing = 1", "closing_only_when_ended"),
+            ("status = 'manual', closing = 1", "closing_only_when_ended"),
+        ] {
+            let e = conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_err().to_string();
+            assert!(e.contains("CHECK constraint failed") && e.contains(check), "{set}: {e}");
+        }
+        let e = conn
+            .execute(
+                "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at, closing) VALUES (1, 't2', '{}', 'p', 'manual', 0, 0, 1)",
+                [],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("closing_only_when_ended"), "{e}");
+        // Every state Phase has is allowed, and an ended run keeps whatever it was left with.
+        for set in [
+            "clear = 'pending'",
+            "clear = 'done'",
+            "clear = NULL, briefing = 1, briefing_at = 1",
+            "briefing = 0, briefing_at = NULL",
+            "status = 'manual', prefill = 1",
+            "status = 'attention', note = 'why', resume = 'remind'",
+            "status = 'stopped', briefing = 1, clear = 'done', closing = 1",
+            "status = 'done', closing = 0, prefill = 1",
+        ] {
+            conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_or_else(|e| panic!("{set}: {e}"));
+        }
+    }
+
+    #[test]
+    fn after_upgrading_a_run_this_version_cannot_read_still_stops_and_its_note_owed_can_be_dropped() {
+        let path = temp_db("upgrade-run-checks-unreadable");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        db.save_flow_graph(flow, &crate::flows::tests::runnable()).unwrap();
+        let mut conn = connect_existing(&path).unwrap();
+        let run = crate::runs::start(&mut conn, flow, &tid("t1")).unwrap().run_id;
+        // As a newer version might store it, past the CHECKs, which are back for the stop.
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+        conn.execute("UPDATE flow_runs SET briefing = 0, briefing_at = NULL, briefed = 1, note = 'odd', resume = 'someday' WHERE id = ?1", [run])
+            .unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF").unwrap();
+        crate::runs::stop(&conn, run).unwrap();
+        let (status, closing): (String, bool) =
+            conn.query_row("SELECT status, closing FROM flow_runs WHERE id = ?1", [run], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((status.as_str(), closing), ("stopped", true));
+        // The next run in the tab drops the note the stopped one owed.
+        crate::runs::start(&mut conn, flow, &tid("t1")).unwrap();
+        let closing: bool = conn.query_row("SELECT closing FROM flow_runs WHERE id = ?1", [run], |r| r.get(0)).unwrap();
+        assert!(!closing);
     }
 }
