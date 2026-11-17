@@ -36,7 +36,10 @@ pub(super) fn log_failure(db_path: Option<&Path>, tab_id: Option<&TabId>, messag
     let Some(log) = db_path.and_then(Path::parent).map(|dir| dir.join(HOOK_LOG)) else { return };
     let file = crate::open_capped_log(&log, HOOK_LOG_LIMIT);
     let tab = tab_id.map_or(NO_TAB, TabId::as_str);
-    let written = file.and_then(|mut file| writeln!(file, "{} {tab} {message}", unix_secs(SystemTime::now())));
+    // One write of the whole line, so lines from hooks of other tabs, appending at
+    // the same time, cannot interleave with it.
+    let line = format!("{} {tab} {message}\n", unix_secs(SystemTime::now()));
+    let written = file.and_then(|mut file| file.write_all(line.as_bytes()));
     if let Err(e) = written {
         let _ = writeln!(std::io::stderr(), "misag: could not write {}: {e}", log.display());
     }
@@ -138,6 +141,33 @@ mod tests {
         let lines: Vec<_> = log.lines().map(|l| l.split_once(' ').unwrap().1).collect();
         assert_eq!(lines, ["tab-1 first problem", "- second problem"]);
         log_failure(None, None, "nowhere to log");
+    }
+
+    #[test]
+    fn entries_from_concurrent_hooks_do_not_interleave() {
+        let path = temp_db("hook-log-concurrent");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // About 48 KB in all, well under HOOK_LOG_LIMIT, so the log is not started over.
+        let (threads, entries) = (8, 200);
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let path = &path;
+                s.spawn(move || {
+                    let tab = tid(&format!("tab-{t}"));
+                    for i in 0..entries {
+                        log_failure(Some(path), Some(&tab), &format!("failure {t} {i}"));
+                    }
+                });
+            }
+        });
+        let log = fs::read_to_string(log_of(&path)).unwrap();
+        assert_eq!(log.lines().count(), threads * entries);
+        for line in log.lines() {
+            let parts: Vec<_> = line.split(' ').collect();
+            let well_formed = matches!(parts[..], [time, tab, "failure", t, _]
+                if time.parse::<u64>().is_ok() && tab == format!("tab-{t}"));
+            assert!(well_formed, "interleaved: {line:?}");
+        }
     }
 
     #[test]

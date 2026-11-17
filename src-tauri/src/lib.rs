@@ -334,9 +334,14 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Opens the log at `path` for appending, creating it, or starts it over when it
 /// has grown past `limit` bytes.
+/// Always in append mode, also when started over, so writers at once each add
+/// whole lines at the end and never write over another's.
 pub(crate) fn open_capped_log(path: &std::path::Path, limit: u64) -> std::io::Result<std::fs::File> {
-    let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > limit);
-    std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(path)
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    if file.metadata()?.len() > limit {
+        file.set_len(0)?;
+    }
+    Ok(file)
 }
 
 /// Sends stderr to `LOG_FILE` in `dir` unless a terminal shows it.
