@@ -594,8 +594,7 @@ fn log_failure(db_path: Option<&Path>, tab_id: Option<&TabId>, message: &str) {
     }
     let _ = writeln!(std::io::stderr(), "misag: {message}");
     let Some(log) = db_path.and_then(Path::parent).map(|dir| dir.join(HOOK_LOG)) else { return };
-    let too_big = std::fs::metadata(&log).is_ok_and(|m| m.len() > HOOK_LOG_LIMIT);
-    let file = std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(&log);
+    let file = crate::open_capped_log(&log, HOOK_LOG_LIMIT);
     let tab = tab_id.map_or(NO_TAB, TabId::as_str);
     let written = file.and_then(|mut file| writeln!(file, "{} {tab} {message}", unix_secs(SystemTime::now())));
     if let Err(e) = written {

@@ -10,6 +10,7 @@ pub mod runs;
 pub mod layout;
 #[cfg(unix)]
 mod login_path;
+pub mod panic_log;
 pub mod proc_tree;
 pub mod session;
 pub mod settings;
@@ -331,6 +332,13 @@ pub const LOG_FILE: &str = "misag.log";
 /// A log larger than this is started over at the next launch.
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
+/// Opens the log at `path` for appending, creating it, or starts it over when it
+/// has grown past `limit` bytes.
+pub(crate) fn open_capped_log(path: &std::path::Path, limit: u64) -> std::io::Result<std::fs::File> {
+    let too_big = std::fs::metadata(path).is_ok_and(|m| m.len() > limit);
+    std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(path)
+}
+
 /// Sends stderr to `LOG_FILE` in `dir` unless a terminal shows it.
 fn log_to_file(dir: &std::path::Path) {
     use std::io::IsTerminal;
@@ -338,10 +346,7 @@ fn log_to_file(dir: &std::path::Path) {
         return;
     }
     let path = dir.join(LOG_FILE);
-    let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES);
-    let file = std::fs::create_dir_all(dir).and_then(|()| {
-        std::fs::OpenOptions::new().create(true).append(!too_big).write(true).truncate(too_big).open(&path)
-    });
+    let file = std::fs::create_dir_all(dir).and_then(|()| open_capped_log(&path, LOG_MAX_BYTES));
     let file = match file {
         Ok(file) => file,
         Err(e) => {
@@ -426,6 +431,7 @@ pub fn run() {
             session::Sessions::default()
         }
     };
+    panic_log::install(sessions.killer());
     tauri::Builder::default()
         // First, so a second launch only focuses the running window: two instances
         // would overwrite each other's saved tabs.
@@ -447,6 +453,7 @@ pub fn run() {
             let dir = app.path().app_data_dir().map_err(|e| e.to_string());
             if let Ok(dir) = &dir {
                 log_to_file(&in_build(dir.clone()));
+                panic_log::set_dir(in_build(dir.clone()));
             }
             #[cfg(unix)]
             login_path::report();

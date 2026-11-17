@@ -561,16 +561,101 @@ impl Sessions {
         }
     }
 
+    /// What the panic hook kills the sessions' processes with (see `panic_log`).
+    pub fn killer(&self) -> SessionKiller {
+        SessionKiller { map: self.map.clone() }
+    }
+
     /// Clones the session out so the map lock is never held during PTY work.
     fn get(&self, id: u32) -> Result<Arc<Session>, String> {
         lock(&self.map).get(&id).cloned().ok_or_else(|| format!("no session {id}"))
     }
 }
 
-/// Locks a mutex, recovering the data if a previous holder panicked (possible
-/// only in debug builds; release builds abort on panic).
+/// Locks a mutex, recovering the data if a previous holder panicked. That is only
+/// possible when the panic unwinds (a debug build, on a thread outside webkit's
+/// callbacks); release builds abort.
 pub(crate) fn lock<T: ?Sized>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Locks a mutex without waiting, recovering the data like `lock`; None if another
+/// holder has it.
+#[cfg(unix)]
+fn try_lock<T: ?Sized>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Kills every session's processes at once, from the panic hook. It never waits
+/// for a lock: one the panicking thread holds would never be released.
+pub struct SessionKiller {
+    map: Arc<Mutex<HashMap<u32, Arc<Session>>>>,
+}
+
+/// What `SessionKiller::kill_now` did, for the panic log.
+#[derive(Debug, PartialEq)]
+pub enum KillReport {
+    /// The sessions were locked, so none was killed.
+    Locked,
+    /// Sessions whose processes were signalled, and running ones skipped because
+    /// their state was locked or they have no pid. Exited sessions count as neither.
+    Killed { killed: usize, skipped: usize },
+    /// Windows: each tab's job object kills its processes when the app ends.
+    LeftToJobs,
+}
+
+impl std::fmt::Display for KillReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KillReport::Locked => write!(f, "the sessions were locked, so no tab's processes were killed"),
+            KillReport::Killed { killed, skipped } => {
+                write!(f, "killed the processes of {killed} tab(s), skipped {skipped} whose state was locked")
+            }
+            KillReport::LeftToJobs => write!(f, "each tab's job object kills its processes"),
+        }
+    }
+}
+
+impl SessionKiller {
+    /// Best effort: on Unix SIGKILL to each session's process groups, skipping a
+    /// session whose state is locked or whose child was reaped (its pid may be
+    /// reused); the whole step is skipped if the sessions are locked. Locks a panic
+    /// poisoned are used anyway. On Windows nothing: each tab's job object kills
+    /// its processes when the app ends.
+    pub fn kill_now(&self) -> KillReport {
+        #[cfg(unix)]
+        {
+            let Some(map) = try_lock(&self.map) else { return KillReport::Locked };
+            let (mut killed, mut skipped) = (0, 0);
+            for session in map.values() {
+                let (Some(pid), Some(exited)) = (session.pid, try_lock(&session.exited.done)) else {
+                    skipped += 1;
+                    continue;
+                };
+                if *exited {
+                    continue;
+                }
+                let foreground = try_lock(&session.master).and_then(|master| master.process_group_leader());
+                // SAFETY: plain syscalls. Best effort, as in `Session::kill`: a child
+                // reaped but not yet flagged as exited can still be signalled, so its
+                // pid could in theory have been reused.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    if let Some(fg) = foreground.filter(|&fg| fg > 0 && fg != pid as libc::pid_t) {
+                        libc::kill(-fg, libc::SIGKILL);
+                    }
+                }
+                killed += 1;
+            }
+            KillReport::Killed { killed, skipped }
+        }
+        #[cfg(windows)]
+        KillReport::LeftToJobs
+    }
 }
 
 /// What the kernel says about a process, through `/proc` on Linux and libproc and
@@ -926,6 +1011,64 @@ mod unix_tests {
         p.exit_code();
         assert!(start.elapsed() >= Duration::from_millis(300), "exited before the grace period");
         assert!(!p.text().contains("survived"));
+    }
+
+    #[test]
+    fn the_panic_killer_kills_at_once_even_when_sighup_is_ignored() {
+        let s = sessions();
+        let p = spawn(&s, "trap '' HUP; echo ready; sleep 60; echo survived");
+        p.wait_for("ready");
+        let start = Instant::now();
+        assert_eq!(s.killer().kill_now(), KillReport::Killed { killed: 1, skipped: 0 });
+        p.exit_code();
+        assert!(start.elapsed() < Duration::from_millis(300), "waited for the grace period");
+        assert!(!p.text().contains("survived"));
+    }
+
+    #[test]
+    fn the_panic_killer_recovers_locks_a_panic_poisoned() {
+        let s = sessions();
+        let p = spawn(&s, "echo ready; sleep 60; echo survived");
+        p.wait_for("ready");
+        let session = s.get(p.id).unwrap();
+        let map = s.map.clone();
+        let _ = std::thread::spawn(move || {
+            let _map = lock(&map);
+            let _exited = lock(&session.exited.done);
+            let _master = lock(&session.master);
+            panic!("poisoning the session locks");
+        })
+        .join();
+        assert!(s.map.is_poisoned());
+        assert_eq!(s.killer().kill_now(), KillReport::Killed { killed: 1, skipped: 0 });
+        p.exit_code();
+        assert!(!p.text().contains("survived"));
+    }
+
+    #[test]
+    fn the_panic_killer_counts_a_session_it_skips() {
+        let s = sessions();
+        let p = spawn(&s, "echo ready; sleep 60");
+        p.wait_for("ready");
+        let session = s.get(p.id).unwrap();
+        let guard = lock(&session.exited.done);
+        assert_eq!(s.killer().kill_now(), KillReport::Killed { killed: 0, skipped: 1 });
+        drop(guard);
+        s.kill(p.id);
+        p.exit_code();
+    }
+
+    #[test]
+    fn the_panic_killer_skips_the_sessions_when_they_are_locked() {
+        let s = sessions();
+        let p = spawn(&s, "echo ready; sleep 60");
+        p.wait_for("ready");
+        let guard = lock(&s.map);
+        assert_eq!(s.killer().kill_now(), KillReport::Locked);
+        drop(guard);
+        assert!(!s.get(p.id).unwrap().exited.wait(Duration::from_millis(200)), "killed though the map was locked");
+        s.kill(p.id);
+        p.exit_code();
     }
 
     #[test]
