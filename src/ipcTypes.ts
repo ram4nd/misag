@@ -56,7 +56,7 @@ export type StoreStatus =
   | { state: "recovered"; notice: string }
   | { state: "notSaving"; reason: string };
 
-/** Mirrors `claude::HookProblem` in src-tauri/src/claude.rs. */
+/** Mirrors `claude::HookProblem` in src-tauri/src/claude/hook_log.rs. */
 export interface HookProblem {
   /** Identifies the failure, so a dismissed one stays dismissed. */
   at: number;
