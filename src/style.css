@@ -359,6 +359,9 @@ svg.lucide { display: block; flex: none; }
 #flows-box .flows > li.manual, #flows-box .flows > li.attention { flex-wrap: wrap; }
 #flows-box .flows > li > .picks { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 4px; padding-left: 20px; }
 #flows-box .flows > li > .picks button { padding: 1px 8px; font-weight: normal; color: #e8710a; }
+/* Why a run could not go on from its row's buttons. */
+#flows-box .flows > li.has-error { flex-wrap: wrap; }
+#flows-box .flows > li > .run-error { flex-basis: 100%; margin: 0; padding-left: 20px; color: #b3261e; font-weight: normal; }
 /* Where the active tab's run of this flow is. */
 .flow-editor .run-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--press); border-left: 3px solid var(--accent); }
 .flow-editor .run-bar.manual, .flow-editor .run-bar.attention { border-left-color: #e8710a; }

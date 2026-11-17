@@ -77,8 +77,9 @@ export interface FlowsOptions {
   /**
    * Goes on from a run waiting for you (a Pause, a Manual prompt, a step that needs
    * attention) as `output`: ▶ for its only output, else its buttons under the flow.
+   * Resolves to why it could not, shown in the run's row, or null.
    */
-  onContinue(run: Run, output: string): void;
+  onContinue(run: Run, output: string): Promise<string | null>;
 }
 
 export interface Flows {
@@ -249,86 +250,180 @@ export function createFlows(opts: FlowsOptions): Flows {
     boxEmpty.hidden = flows.some((f) => !f.archived) || !boxError.hidden;
   }
 
+  /** Why the run could not go on, by run id, for the step it was at: shown in its row. */
+  const rowErrors = new Map<number, { stepId: string; message: string }>();
+  /** Runs going on from a press in the toolbox right now, whose buttons stay off. */
+  const going = new Set<number>();
+  /** Each flow's toolbox row as last drawn, and what it was drawn from. */
+  const rows = new Map<number, { key: string; li: HTMLLIElement }>();
+
+  /** Goes on from `run`'s step as `output`, keeping its buttons off until done and its error in its row. */
+  async function goOn(run: Run, output: string) {
+    if (going.has(run.id)) return;
+    going.add(run.id);
+    rowErrors.delete(run.id);
+    let message: string | null;
+    try {
+      renderBox();
+      message = await opts.onContinue(run, output);
+    } catch (err) {
+      console.error("misag: could not go on with the run", err);
+      message = `Could not go on: ${opts.errorText(err)}`;
+    } finally {
+      going.delete(run.id);
+    }
+    if (message) {
+      // The runs were read again before the reply: the error is for the step the run
+      // is at now, which it may have moved on to before its prompt failed. A run no
+      // longer shown has no row, so its error goes in the toolbox's.
+      const now = here.find((r) => r.id === run.id);
+      if (now) rowErrors.set(run.id, { stepId: now.stepId, message });
+      else showBoxError(message);
+    }
+    renderBox();
+  }
+
+  /**
+   * All a toolbox row is drawn from. It is also the key a drawn row is kept by, so
+   * `boxRow` reads nothing else.
+   */
+  interface BoxRow {
+    flow: Flow;
+    /** This tab's run of the flow. */
+    mine: Run | undefined;
+    /** A run of the flow in a closed tab. */
+    orphan: Run | undefined;
+    /** The flow this tab runs, which keeps another from starting here. */
+    tabRuns: string | null;
+    /** The run is going on from a press here right now. */
+    busy: boolean;
+    error: string | null;
+  }
+
+  /** A row of the toolbox, for the flow and the run marked on it. */
+  function boxRow({ flow, mine, orphan, tabRuns, busy, error }: BoxRow): HTMLLIElement {
+    const li = document.createElement("li");
+    const run = mine ?? orphan;
+    li.title = mine
+      ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}${mine.total > 0 ? `, ${mine.done} of ${mine.total} steps done` : ""}${mine.note ? `. ${mine.note}` : ""}`
+      : orphan
+        ? `${flow.name}: running in a closed tab; ■ stops it`
+        : `Edit ${flow.name}`;
+    li.onclick = () => opts.onOpen(flow);
+    const action = run
+      ? button("stop-run", "square", "Stop this run", () => opts.onStop(run))
+      : button("run", "play", "Run in the active Claude tab", () => opts.onRun(flow));
+    action.addEventListener("click", (e) => e.stopPropagation());
+    if (!run && tabRuns !== null) {
+      // The backend would refuse it.
+      action.disabled = true;
+      action.title = `This tab runs ${tabRuns}; a tab runs one flow at a time`;
+    }
+    if (run) li.classList.add("running", orphan ? "orphan" : run.status);
+    const attention = mine?.status === "attention";
+    const mark = icon(attention ? "circle-alert" : flow.clear ? "eraser" : "workflow", 14);
+    if (attention) mark.classList.add("needs-attention");
+    else if (flow.clear) mark.classList.add("clears");
+    li.append(mark, nameSpan(flow));
+    // A run whose steps cannot be read has none to count.
+    if (run && run.total > 0) {
+      const progress = document.createElement("span");
+      progress.className = "progress";
+      progress.textContent = `${run.done}/${run.total}`;
+      li.append(progress);
+    }
+    li.append(action);
+    // A run waiting for you goes on to the next step from here; having Claude go
+    // on with a step that needs attention is the editor's Continue.
+    const waits = mine !== undefined && mine.status !== "running";
+    // A second press while the run goes on would send the next step too: `busy`.
+    const title = (run: Run) =>
+      awaitsPrompt(run)
+        ? `Skip "${run.step}" without sending a prompt`
+        : run.status === "attention"
+          ? `Go on from "${run.step}" to the next step`
+          : `Done with "${run.step}": go on`;
+    if (waits && mine.outputs.length === 1) {
+      // One way on (a Pause, a Manual prompt to skip, a one-output step): ▶ takes it.
+      const go = button("go-on", "play", title(mine), () => void goOn(mine, mine.outputs[0]));
+      go.disabled = busy;
+      go.addEventListener("click", (e) => e.stopPropagation());
+      li.insertBefore(go, action);
+    } else if (waits && mine.outputs.length > 1) {
+      // Several ways on (a step that needs attention, or an older flow's Pause): its outputs, on a line of their own.
+      const picks = document.createElement("div");
+      picks.className = "picks";
+      picks.append(
+        ...mine.outputs.map((output) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "pick";
+          b.textContent = output;
+          b.title = `Go on as "${output}"`;
+          b.disabled = busy;
+          b.onclick = (e) => {
+            e.stopPropagation();
+            void goOn(mine, output);
+          };
+          return b;
+        }),
+      );
+      li.append(picks);
+    }
+    if (error) {
+      const p = document.createElement("p");
+      p.className = "run-error";
+      p.setAttribute("role", "alert");
+      p.textContent = error;
+      li.classList.add("has-error");
+      li.append(p);
+    }
+    return li;
+  }
+
+  /**
+   * Draws the toolbox rows, keeping each row whose flow and run did not change: a
+   * row replaced between a button's press and release takes no click, so a redraw
+   * for another row must not swallow a press on this one.
+   */
+  function renderBox() {
+    const active = flows.filter((f) => !f.archived);
+    // An error is for the step it came from: it goes once the run is shown at another
+    // step. Runs not in `here` (another tab's, or ended) keep theirs.
+    for (const [id, e] of rowErrors) {
+      const run = here.find((r) => r.id === id);
+      if (run && run.stepId !== e.stepId) rowErrors.delete(id);
+    }
+    const lis = active.map((flow) => {
+      const mine = here.find((r) => r.flowId === flow.id);
+      const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
+      const props: BoxRow = {
+        flow,
+        mine,
+        orphan,
+        tabRuns: here[0]?.flowName ?? null,
+        busy: mine !== undefined && going.has(mine.id),
+        error: mine ? (rowErrors.get(mine.id)?.message ?? null) : null,
+      };
+      const key = JSON.stringify(props);
+      const row = rows.get(flow.id);
+      if (row?.key === key) return row.li;
+      const li = boxRow(props);
+      rows.set(flow.id, { key, li });
+      return li;
+    });
+    for (const id of rows.keys()) if (!active.some((f) => f.id === id)) rows.delete(id);
+    // Only rows that changed are put in; the others stay where they are.
+    lis.forEach((li, i) => {
+      if (boxList.children[i] !== li) boxList.insertBefore(li, boxList.children[i] ?? null);
+    });
+    while (boxList.children.length > lis.length) boxList.lastElementChild!.remove();
+  }
+
   function render() {
     const active = flows.filter((f) => !f.archived);
     const archived = flows.filter((f) => f.archived);
-    boxList.replaceChildren(
-      ...active.map((flow) => {
-        const li = document.createElement("li");
-        const mine = here.find((r) => r.flowId === flow.id);
-        const orphan = mine ? undefined : orphans.find((r) => r.flowId === flow.id);
-        const run = mine ?? orphan;
-        li.title = mine
-          ? `${flow.name}: ${statusLabel(mine).toLowerCase()} at ${mine.step}${mine.total > 0 ? `, ${mine.done} of ${mine.total} steps done` : ""}${mine.note ? `. ${mine.note}` : ""}`
-          : orphan
-            ? `${flow.name}: running in a closed tab; ■ stops it`
-            : `Edit ${flow.name}`;
-        li.onclick = () => opts.onOpen(flow);
-        const action = run
-          ? button("stop-run", "square", "Stop this run", () => opts.onStop(run))
-          : button("run", "play", "Run in the active Claude tab", () => opts.onRun(flow));
-        action.addEventListener("click", (e) => e.stopPropagation());
-        if (!run && here.length > 0) {
-          // The backend would refuse it.
-          action.disabled = true;
-          action.title = `This tab runs ${here[0].flowName}; a tab runs one flow at a time`;
-        }
-        if (run) li.classList.add("running", orphan ? "orphan" : run.status);
-        const attention = mine?.status === "attention";
-        const mark = icon(attention ? "circle-alert" : flow.clear ? "eraser" : "workflow", 14);
-        if (attention) mark.classList.add("needs-attention");
-        else if (flow.clear) mark.classList.add("clears");
-        li.append(mark, nameSpan(flow));
-        // A run whose steps cannot be read has none to count.
-        if (run && run.total > 0) {
-          const progress = document.createElement("span");
-          progress.className = "progress";
-          progress.textContent = `${run.done}/${run.total}`;
-          li.append(progress);
-        }
-        li.append(action);
-        // A run waiting for you goes on to the next step from here; having Claude go
-        // on with a step that needs attention is the editor's Continue.
-        const waits = mine !== undefined && mine.status !== "running";
-        const title = (run: Run) =>
-          awaitsPrompt(run)
-            ? `Skip "${run.step}" without sending a prompt`
-            : run.status === "attention"
-              ? `Go on from "${run.step}" to the next step`
-              : `Done with "${run.step}": go on`;
-        if (waits && mine.outputs.length === 1) {
-          // One way on (a Pause, a Manual prompt to skip, a one-output step): ▶ takes it.
-          const go = button("go-on", "play", title(mine), () => {
-            go.disabled = true; // A second click would send the next step too; the poll after it redraws the row.
-            opts.onContinue(mine, mine.outputs[0]);
-          });
-          go.addEventListener("click", (e) => e.stopPropagation());
-          li.insertBefore(go, action);
-        } else if (waits && mine.outputs.length > 1) {
-          // Several ways on (a step that needs attention, or an older flow's Pause): its outputs, on a line of their own.
-          const picks = document.createElement("div");
-          picks.className = "picks";
-          picks.append(
-            ...mine.outputs.map((output) => {
-              const b = document.createElement("button");
-              b.type = "button";
-              b.className = "pick";
-              b.textContent = output;
-              b.title = `Go on as "${output}"`;
-              b.onclick = (e) => {
-                e.stopPropagation();
-                // A second click would send the next step too; the poll after the pick redraws the row.
-                for (const other of picks.querySelectorAll("button")) other.disabled = true;
-                opts.onContinue(mine, output);
-              };
-              return b;
-            }),
-          );
-          li.append(picks);
-        }
-        return li;
-      }),
-    );
+    renderBox();
     boxEmpty.hidden = active.length > 0 || !boxError.hidden;
     activeList.replaceChildren(...active.map((f, i) => activeRow(f, i === 0, i === active.length - 1)));
     archivedList.replaceChildren(...archived.map(archivedRow));

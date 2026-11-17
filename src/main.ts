@@ -210,7 +210,7 @@ function build(lifetime: AbortController): () => void {
     onChange: (stored) => pageTabs.followFlows(stored),
     onRun: (flow) => void runs.start(flow),
     onStop: (run) => void runs.stop(run),
-    onContinue: async (run, output) => flows.showBoxError(await runs.proceed(run, output)),
+    onContinue: (run, output) => runs.proceed(run, output),
   });
   const runs = createRunController<Session>({
     flows,

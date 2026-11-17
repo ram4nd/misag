@@ -386,7 +386,7 @@ describe("reading the runs", () => {
     expect(shownRuns).toEqual([[]]);
     answerOld([{ id: 7, tabId: "t1", flowId: 1, stepId: "s", status: "manual", outputs: ["ok"] }]);
     await old;
-    // The run was stored as moved on (gone): the older reply does not bring it back.
+    // The newer reply no longer has the run (it moved on): the older reply must not bring it back.
     expect(shownRuns).toEqual([[]]);
     expect(runs.waiting(tab)).toBe(false);
   });

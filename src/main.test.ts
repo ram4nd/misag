@@ -271,6 +271,8 @@ let activeRuns: Run[];
 /** The prompt flow_start and flow_continue return; a string makes them fail with it. */
 let runPrompt: string | null;
 let runRefusal: string | null;
+/** What flow_continue and flow_resume wait on before they answer. */
+let continueGate: Promise<void>;
 /** Makes flow_prefill_text fail with it. */
 let prefillError: string | null;
 /** Makes flow_prefilled fail with it. */
@@ -456,8 +458,10 @@ function flowCommand(cmd: string, args: Record<string, unknown>) {
       return null;
     case "flow_continue":
     case "flow_resume":
-      if (runRefusal) throw { code: "failed", message: runRefusal };
-      return runPrompt === null ? null : { stepId: "p", prompt: runPrompt, briefs: false };
+      return continueGate.then(() => {
+        if (runRefusal) throw { code: "failed", message: runRefusal };
+        return runPrompt === null ? null : { stepId: "p", prompt: runPrompt, briefs: false };
+      });
     case "flow_runs":
       return activeRuns;
     case "flow_import_file": {
@@ -533,6 +537,7 @@ beforeEach(() => {
   activeRuns = [];
   runPrompt = null;
   runRefusal = null;
+  continueGate = Promise.resolve();
   prefills = [];
   prefillError = null;
   prefilledError = null;
@@ -4753,7 +4758,136 @@ describe("flow runs", () => {
     await poll();
     flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
     await settle();
-    expect(box().querySelector<HTMLElement>(".error")!.textContent).toContain("the run has moved on");
+    expect(flowRow("Deploy").querySelector<HTMLElement>(".run-error")!.textContent).toContain("the run has moved on");
+  });
+
+  test("a ▶ that could not go on can be pressed again", async () => {
+    runRefusal = "the run has moved on";
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    expect(flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.disabled).toBe(false);
+    runRefusal = null;
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    expect(callsOf("flow_continue")).toHaveLength(2);
+    // The error went with the press that worked.
+    expect(flowRow("Deploy").querySelector(".run-error")).toBeNull();
+  });
+
+  test("picks that could not go on can be pressed again", async () => {
+    runRefusal = "the run has moved on";
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["approve", "reject"] })];
+    await poll();
+    flowRow("Deploy").querySelector<HTMLButtonElement>(".picks button.pick")!.click();
+    await settle();
+    const picks = [...flowRow("Deploy").querySelectorAll<HTMLButtonElement>(".picks button.pick")];
+    expect(picks.map((b) => b.disabled)).toEqual([false, false]);
+    expect(flowRow("Deploy").querySelector<HTMLElement>(".run-error")!.textContent).toContain("the run has moved on");
+  });
+
+  test("▶ is held off while its run is going on, even across a redraw", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    let release!: () => void;
+    continueGate = new Promise((resolve) => (release = resolve));
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    // Another run shows up meanwhile, so the list is drawn again.
+    activeRuns = [...activeRuns, run({ id: 9, flowId: 2, flowName: "Review", tabId: "gone" })];
+    await poll();
+    expect(flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.disabled).toBe(true);
+    release();
+    await settle();
+  });
+
+  test("one tab's ▶ leaves the error another tab's run shows", async () => {
+    runPrompt = null;
+    await startApp();
+    await openClaudeTabs(2);
+    const [a, b] = spawns().map((c) => c.tabId);
+    activeRuns = [
+      run({ tabId: a, status: "manual", stepId: "m", step: "Check", outputs: ["ok"] }),
+      run({ id: 6, flowId: 2, flowName: "Review", tabId: b, status: "manual", stepId: "m", step: "Check", outputs: ["ok"] }),
+    ];
+    await poll();
+    // The second tab is active.
+    runRefusal = "the run has moved on";
+    flowRow("Review").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    expect(flowRow("Review").querySelector<HTMLElement>(".run-error")!.textContent).toContain("the run has moved on");
+    runRefusal = null;
+    tabs()[0].click();
+    await settle();
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    tabs()[1].click();
+    await settle();
+    expect(flowRow("Review").querySelector<HTMLElement>(".run-error")!.textContent).toContain("the run has moved on");
+  });
+
+  test("an error from after the run moved on shows in its row", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    // The run is at its next step by the time the action fails.
+    continueGate = Promise.resolve().then(() => {
+      activeRuns = [run({ tabId, status: "manual", stepId: "p", step: "Fix", outputs: ["ok"] })];
+      runRefusal = "the prompt was not sent";
+    });
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    expect(flowRow("Deploy").querySelector<HTMLElement>(".run-error")!.textContent).toContain("the prompt was not sent");
+  });
+
+  test("an error for a run no longer shown goes in the toolbox", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    continueGate = Promise.resolve().then(() => {
+      activeRuns = [];
+      runRefusal = "the run has ended";
+    });
+    flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.click();
+    await settle();
+    expect(box().querySelector<HTMLElement>(".error")!.textContent).toContain("the run has ended");
+  });
+
+  test("a row is drawn again when its run changes", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    const tabId = spawns()[0].tabId;
+    activeRuns = [run({ tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    const go = flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!;
+    activeRuns = [run({ tabId, status: "manual", stepId: "p", step: "Fix", outputs: ["ok"] })];
+    await poll();
+    const now = flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!;
+    expect(now).not.toBe(go);
+    expect(now.title).toBe('Done with "Fix": go on');
+  });
+
+  test("a redraw keeps the buttons of a row that did not change, so a press on one is not lost", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
+    await poll();
+    const go = flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!;
+    // A run in a closed tab shows up: only its row changes.
+    activeRuns = [...activeRuns, run({ id: 9, flowId: 2, flowName: "Review", tabId: "gone" })];
+    await poll();
+    expect(running()).toEqual(["Deploy", "Review"]);
+    expect(flowRow("Deploy").querySelector("button.go-on")).toBe(go);
   });
 
   test("Continue in the run bar has Claude go on with a step that needs attention", async () => {

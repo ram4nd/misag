@@ -497,9 +497,9 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       opts.markWaiting((tab) => waitingTabs.has(tab.tabId));
       for (const run of runs) if (run.prefill) void fill(run);
     } catch (err) {
+      console.error("misag: could not read the flow runs", err);
       if (seq < shownPoll) return;
       shownPoll = seq;
-      console.error("misag: could not read the flow runs", err);
       runsError = `Flow runs could not be read: ${opts.errorText(err)}`;
       flows.showBoxError(runsError);
     }
