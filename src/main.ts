@@ -457,6 +457,13 @@ async function start(s: Session, fallbackToHome: boolean) {
   };
   try {
     const started = await invoke<Spawned>("pty_spawn", { request, onData, onExit });
+    // Closed while it started, so close() had no id to kill, and its notices are gone.
+    if (s.closing) {
+      invoke("pty_kill", { id: started.id }).catch((err) =>
+        console.error(`misag: could not kill process ${started.id} of a closed tab`, err),
+      );
+      return;
+    }
     s.id = started.id;
     if (started.fellBackToHome) {
       const message = `${s.cwd} no longer exists, so “${s.name}” started in the home directory.`;
@@ -476,6 +483,8 @@ async function start(s: Session, fallbackToHome: boolean) {
       renderSessions();
     }
   } catch (err) {
+    // A closed tab has no terminal left to show it on.
+    if (s.closing) console.error("misag: could not start the process of a closed tab", err);
     markExited(s, `could not start: ${errorText(err)}`, true);
   }
   scheduleSave();

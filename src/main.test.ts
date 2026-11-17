@@ -2776,6 +2776,90 @@ describe("failures", () => {
     expect(callsOf("pty_write")).toHaveLength(0);
     expect(callsOf("pty_resize")).toHaveLength(0);
   });
+
+  test("a tab closed while its process starts has the process killed once it has", async () => {
+    let started!: (id: number) => void;
+    spawnBehaviour = () => new Promise((r) => (started = r));
+    await boot();
+    await clickClaude();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    started(7);
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 7 }]);
+  });
+
+  test("a tab closed while it restarts has the new process killed once it has started", async () => {
+    await boot();
+    await clickClaude();
+    spawns()[0].onExit.onmessage(0);
+    let started!: (id: number) => void;
+    spawnBehaviour = () => new Promise((r) => (started = r));
+    terms()[0].onData!("\r");
+    expect(spawns()).toHaveLength(2);
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    started(8);
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 8 }]);
+  });
+
+  test("a tab closed while its process fails to start only logs the failure", async () => {
+    let failed!: (err: unknown) => void;
+    spawnBehaviour = () => new Promise((_r, reject) => (failed = reject));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickClaude();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    const before = terms()[0].written.length;
+    failed("no pty");
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_kill")).toHaveLength(0);
+    expect(terms()[0].written).toHaveLength(before);
+    expect(error).toHaveBeenCalledWith("misag: could not start the process of a closed tab", "no pty");
+    error.mockRestore();
+  });
+
+  test("a failed kill of a tab closed while its process starts is only logged", async () => {
+    let started!: (id: number) => void;
+    spawnBehaviour = () => new Promise((r) => (started = r));
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await boot();
+    await clickClaude();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    failing.add("pty_kill");
+    started(7);
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 7 }]);
+    expect(error).toHaveBeenCalledWith("misag: could not kill process 7 of a closed tab", "pty_kill failed");
+    error.mockRestore();
+  });
+
+  test("a tab left open while its process starts gets the process, and closing it later kills it", async () => {
+    let started!: (id: number) => void;
+    spawnBehaviour = () => new Promise((r) => (started = r));
+    await boot();
+    await clickClaude();
+    started(7);
+    for (let i = 0; i < 3; i++) await flush();
+    expect(callsOf("pty_kill")).toHaveLength(0);
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 7 }]);
+  });
+
+  test("a restored tab closed while it starts in the home directory leaves no notice behind", async () => {
+    savedLayout = {
+      active: 0,
+      tabs: [{ tabId: "t8", kind: "claude", name: "old", renamed: true, cwd: "/gone", command: null, claudeSession: SESSION }],
+    };
+    missingDirs.add("/gone");
+    let started!: (id: number) => void;
+    spawnBehaviour = () => new Promise((r) => (started = r));
+    await boot();
+    tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
+    started(9);
+    for (let i = 0; i < 3; i++) await flush();
+    expect(noticeText()).not.toContain("no longer exists");
+    expect(callsOf("pty_kill").map((c) => c.args)).toEqual([{ id: 9 }]);
+  });
 });
 
 describe("terminal views", () => {
