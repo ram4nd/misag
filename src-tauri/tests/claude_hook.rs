@@ -110,7 +110,7 @@ fn never_fails_claude_and_logs_why() {
     assert_eq!(stored_session(&db_path, "t"), None);
     let log = std::fs::read_to_string(dir.join(claude::HOOK_LOG)).unwrap();
     let entries: Vec<_> = log.lines().map(|l| l.split_once(' ').unwrap().1).collect();
-    assert!(entries[0].starts_with("t could not record") && entries[0].contains("bad hook payload"), "{log}");
+    assert!(entries[0].starts_with("t SessionStart: ") && entries[0].contains("bad hook payload"), "{log}");
     assert!(entries[1].starts_with("- ") && entries[1].contains("MISAG_TAB"), "{log}");
     assert!(entries[2].starts_with("- "), "an invalid tab id is not logged as one: {log}");
     assert!(claude::hook_problem(&app).is_some(), "the app sees the failures");
