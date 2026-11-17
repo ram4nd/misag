@@ -370,8 +370,16 @@ impl Sessions {
             .openpty(PtySize { rows: req.rows.max(1), cols: req.cols.max(1), pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("could not open a PTY: {e:#}"))?;
         // Take both ends before spawning so a failure here cannot orphan a child.
-        let mut reader = pair.master.try_clone_reader().map_err(|e| format!("PTY reader: {e:#}"))?;
-        let mut writer = pair.master.take_writer().map_err(|e| format!("PTY writer: {e:#}"))?;
+        #[cfg(unix)]
+        let (mut reader, mut writer, end) = {
+            let fd = pair.master.as_raw_fd().ok_or_else(|| "the PTY has no descriptor".to_string())?;
+            pty_io::open(fd).map_err(|e| format!("PTY reader and writer: {e}"))?
+        };
+        #[cfg(windows)]
+        let (mut reader, mut writer) = (
+            pair.master.try_clone_reader().map_err(|e| format!("PTY reader: {e:#}"))?,
+            pair.master.take_writer().map_err(|e| format!("PTY writer: {e:#}"))?,
+        );
 
         let mut cmd = self.command(&req.launch)?;
         // Launcher state first; `req.env` may still set any of these on purpose.
@@ -419,17 +427,52 @@ impl Sessions {
             }),
         );
 
-        // Ends when the session is removed (sender dropped) or the PTY closes.
+        // Ends when the session is removed (sender dropped), the PTY closes, or (on
+        // Unix) the child exits, even while a job holds the PTY without reading it.
         std::thread::spawn(move || {
             for data in input_rx {
                 let written = writer.write_all(&data).and_then(|_| writer.flush());
                 queued.fetch_sub(data.len(), Ordering::Relaxed);
                 if let Err(e) = written {
-                    eprintln!("misag: session {id} write failed: {e}");
+                    #[cfg(unix)]
+                    let ended = pty_io::ended(&e);
+                    #[cfg(windows)]
+                    let ended = false;
+                    if !ended {
+                        eprintln!("misag: session {id} write failed: {e}");
+                    }
                     break;
                 }
             }
         });
+
+        // The session ends when its child exits, not when the PTY closes: a
+        // background job can hold the PTY open for good. The reader then gets what
+        // the child wrote last (on Unix, until the PTY is quiet; on Windows, until the
+        // console, closed by dropping the session, has passed on its last output).
+        let waiter = {
+            let exited = exited.clone();
+            #[cfg(windows)]
+            let map = self.map.clone();
+            std::thread::spawn(move || {
+                let code = match child.wait() {
+                    Ok(status) => status.exit_code() as i32,
+                    Err(e) => {
+                        eprintln!("misag: session {id} wait failed: {e}");
+                        -1
+                    }
+                };
+                exited.set();
+                #[cfg(unix)]
+                drop(end);
+                #[cfg(windows)]
+                {
+                    let session = lock(&map).remove(&id);
+                    drop(session);
+                }
+                code
+            })
+        };
 
         let map = self.map.clone();
         let grace = self.kill_grace;
@@ -470,14 +513,7 @@ impl Sessions {
                     s.kill(grace);
                 }
             }
-            let code = match child.wait() {
-                Ok(status) => status.exit_code() as i32,
-                Err(e) => {
-                    eprintln!("misag: session {id} wait failed: {e}");
-                    -1
-                }
-            };
-            exited.set();
+            let code = waiter.join().unwrap_or(-1);
             lock(&map).remove(&id);
             if !detached {
                 on_exit(code);
@@ -612,6 +648,146 @@ impl Sessions {
     /// Clones the session out so the map lock is never held during PTY work.
     fn get(&self, id: u32) -> Result<Arc<Session>, String> {
         lock(&self.map).get(&id).cloned().ok_or_else(|| format!("no session {id}"))
+    }
+}
+
+/// The PTY's reader and writer on Unix, which stop once the child has exited even
+/// while a background job keeps the PTY open: through their own descriptors,
+/// non-blocking, waiting in `poll` on the PTY and on a pipe whose write end the
+/// child's waiter drops once the child has exited.
+#[cfg(unix)]
+mod pty_io {
+    use std::fs::File;
+    use std::io::{Error, ErrorKind, Read, Result, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// After the child exits, output is read until the PTY has been quiet this long
+    /// (what the child wrote last can take a moment to arrive), ...
+    const DRAIN_QUIET: Duration = Duration::from_millis(100);
+    /// ... but no longer than this, in case a job keeps writing.
+    const DRAIN_MAX: Duration = Duration::from_secs(1);
+
+    /// The reader, the writer, and the end of the pipe to drop once the child exited.
+    pub fn open(master: RawFd) -> Result<(Reader, Writer, OwnedFd)> {
+        // SAFETY: plain calls on a descriptor the caller keeps open; results are checked.
+        let (reader, writer, ended, end) = unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            if flags < 0 || libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                return Err(Error::last_os_error());
+            }
+            let dup = || {
+                let fd = libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0);
+                if fd < 0 { Err(Error::last_os_error()) } else { Ok(File::from(OwnedFd::from_raw_fd(fd))) }
+            };
+            let (reader, writer) = (dup()?, dup()?);
+            // Close-on-exec, or a program started meanwhile could hold the write end
+            // open, and the session would never end. PTY children close it anyway.
+            let mut fds = [0; 2];
+            #[cfg(target_os = "linux")]
+            let made = libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) == 0;
+            #[cfg(not(target_os = "linux"))]
+            let made = libc::pipe(fds.as_mut_ptr()) == 0;
+            if !made {
+                return Err(Error::last_os_error());
+            }
+            let (ended, end) = (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]));
+            #[cfg(not(target_os = "linux"))]
+            for fd in fds {
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 {
+                    return Err(Error::last_os_error());
+                }
+            }
+            (reader, writer, Arc::new(ended), end)
+        };
+        Ok((Reader { file: reader, ended: ended.clone(), ended_at: None }, Writer { file: writer, ended }, end))
+    }
+
+    /// Whether a write failed because the child had exited.
+    pub fn ended(e: &Error) -> bool {
+        e.kind() == ErrorKind::BrokenPipe
+    }
+
+    /// Waits up to `timeout` (None: for good) for `fd` to be ready for `events`, or
+    /// for `ended` to close. Returns (fd ready, ended).
+    fn wait(fd: RawFd, events: libc::c_short, ended: Option<&OwnedFd>, timeout: Option<Duration>) -> Result<(bool, bool)> {
+        let mut fds = [
+            libc::pollfd { fd, events, revents: 0 },
+            libc::pollfd { fd: ended.map_or(-1, AsRawFd::as_raw_fd), events: libc::POLLIN, revents: 0 },
+        ];
+        let timeout = timeout.map_or(-1, |t| t.as_millis().try_into().unwrap_or(libc::c_int::MAX));
+        loop {
+            // SAFETY: two valid pollfd entries; a negative fd is skipped.
+            match unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) } {
+                n if n >= 0 => break,
+                _ if Error::last_os_error().kind() == ErrorKind::Interrupted => continue,
+                _ => return Err(Error::last_os_error()),
+            }
+        }
+        if fds[0].revents & libc::POLLNVAL != 0 {
+            return Err(Error::from_raw_os_error(libc::EBADF));
+        }
+        Ok((fds[0].revents != 0, fds[1].revents != 0))
+    }
+
+    pub struct Reader {
+        file: File,
+        ended: Arc<OwnedFd>,
+        /// When the child was seen to have exited.
+        ended_at: Option<Instant>,
+    }
+
+    impl Read for Reader {
+        /// Like a blocking read, with 0 (end of file) once the child has exited and
+        /// its output is drained.
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            loop {
+                let timeout = match self.ended_at {
+                    Some(at) if at.elapsed() >= DRAIN_MAX => return Ok(0),
+                    Some(_) => Some(DRAIN_QUIET),
+                    None => None,
+                };
+                let ended = self.ended_at.is_none().then_some(&*self.ended);
+                let (ready, now_ended) = wait(self.file.as_raw_fd(), libc::POLLIN, ended, timeout)?;
+                if now_ended {
+                    self.ended_at = Some(Instant::now());
+                    continue;
+                }
+                if !ready {
+                    return Ok(0);
+                }
+                match self.file.read(buf) {
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                    result => return result,
+                }
+            }
+        }
+    }
+
+    pub struct Writer {
+        file: File,
+        ended: Arc<OwnedFd>,
+    }
+
+    impl Write for Writer {
+        /// Like a blocking write, failing with `BrokenPipe` once the child has exited.
+        fn write(&mut self, buf: &[u8]) -> Result<usize> {
+            loop {
+                let (_, ended) = wait(self.file.as_raw_fd(), libc::POLLOUT, Some(&self.ended), None)?;
+                if ended {
+                    return Err(Error::new(ErrorKind::BrokenPipe, "the session's process has exited"));
+                }
+                match self.file.write(buf) {
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                    result => return result,
+                }
+            }
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -1014,6 +1190,21 @@ mod unix_tests {
         p.exit_code();
         assert!(s.foreground(p.id).is_err(), "gone with the session: unknown, not idle");
         assert_eq!(Sessions::process_args(pid), None, "gone");
+    }
+
+    #[test]
+    fn a_background_job_does_not_keep_the_tab_open() {
+        let s = sessions();
+        // The job ignores the hang-up and holds the terminal open after the shell exits.
+        let p = spawn(&s, "(trap '' HUP; exec sleep 30) & echo bg:$!; i=0; while [ $i -lt 2000 ]; do echo line$i; i=$((i+1)); done; echo last-line");
+        let start = Instant::now();
+        let code = p.exit.recv_timeout(Duration::from_secs(5));
+        let job: u32 = p.text().split("bg:").nth(1).unwrap().split_whitespace().next().unwrap().parse().unwrap();
+        // SAFETY: plain syscall; the job is this test's own process.
+        unsafe { libc::kill(job as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(code, Ok(0), "the tab ended only after {:?}", start.elapsed());
+        assert!(p.text().contains("last-line"), "the shell's last output was cut off: {:?}", p.text());
+        assert!(s.write(p.id, b"x".to_vec()).is_err(), "the session is gone");
     }
 
     #[test]
