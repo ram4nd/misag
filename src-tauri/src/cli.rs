@@ -216,10 +216,29 @@ fn command(args: Vec<OsString>, stdin: &mut impl Read, out: &mut impl Write) -> 
             let (flow, graph) = db.load_flow(find(&db, which)?)?;
             let file = flow_file::write(&flow.name, &graph) + "\n";
             let Some(path) = line.words.get(2).map(Path::new) else { return written(out.write_all(file.as_bytes())) };
-            if path.exists() && !line.force {
-                return Err(Failure::Failed(format!("{} already exists; add --force to replace it", path.display())));
-            }
-            std::fs::write(path, file).map_err(|e| Failure::Failed(format!("cannot write {}: {e}", path.display())))
+            // Without --force, created only if nothing is there, in one step, so nothing
+            // made in between is replaced and a symlink (even a dangling one) is not followed.
+            let opened = if line.force {
+                std::fs::File::create(path)
+            } else {
+                std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+            };
+            let mut target = opened.map_err(|e| match e.kind() {
+                std::io::ErrorKind::AlreadyExists if path.is_dir() => {
+                    Failure::Failed(format!("{} is a folder; give a file name", path.display()))
+                }
+                std::io::ErrorKind::AlreadyExists => {
+                    Failure::Failed(format!("{} already exists; add --force to replace it", path.display()))
+                }
+                _ => Failure::Failed(format!("cannot write {}: {e}", path.display())),
+            })?;
+            target.write_all(file.as_bytes()).map_err(|e| {
+                // A file this made and could not fill would be taken for an export next time.
+                if !line.force {
+                    let _ = std::fs::remove_file(path);
+                }
+                Failure::Failed(format!("cannot write {}: {e}", path.display()))
+            })
         }
         ("import", 2) => {
             let from = &line.words[1];
@@ -357,6 +376,33 @@ mod tests {
         assert_eq!(pick_db(both()).unwrap(), release);
         std::fs::write(&dev, "").unwrap();
         assert!(pick_db(both()).unwrap_err().contains("--db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_without_force_refuses_a_dangling_symlink_and_an_existing_file() {
+        let dir = crate::test_support::temp_dir("cli-export-symlink");
+        let db_path = dir.join("app.db");
+        let start = FLOW_HELP.find("{\n  \"misagFlow\"").unwrap();
+        let end = start + FLOW_HELP[start..].find("\n}\n").unwrap() + 2;
+        let (name, graph) = flow_file::parse(&FLOW_HELP[start..end]).unwrap();
+        db::Db::open(db_path.clone()).unwrap().import_flow(&name, &graph).unwrap();
+        let export = |to: &Path| {
+            let args = ["export", &name, to.to_str().unwrap(), "--db", db_path.to_str().unwrap()];
+            command(args.iter().map(OsString::from).collect(), &mut std::io::empty(), &mut Vec::new())
+        };
+        let (link, target) = (dir.join("link.json"), dir.join("target.json"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(export(&link), Err(Failure::Failed(why)) if why.contains("--force")));
+        assert!(!target.exists(), "the symlink was followed");
+        let existing = dir.join("existing.json");
+        std::fs::write(&existing, "kept").unwrap();
+        assert!(matches!(export(&existing), Err(Failure::Failed(why)) if why.contains("--force")));
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "kept");
+        assert!(matches!(export(&dir), Err(Failure::Failed(why)) if why.contains("folder")));
+        let fresh = dir.join("fresh.json");
+        assert!(export(&fresh).is_ok());
+        assert!(std::fs::read_to_string(&fresh).unwrap().contains("misagFlow"));
     }
 
     #[test]
