@@ -89,15 +89,31 @@ fn import(path: &Path, old: &Path) -> Option<String> {
 }
 
 /// In a fresh copy of raterm's database: forgets the Claude session of each tab
-/// whose Claude still runs (raterm is running, and has it open), so its tab starts
+/// whose Claude still runs (raterm is running, and has it open; told by a live pid
+/// whose process did not start after the report, see `started_after`), so its tab starts
 /// a new conversation rather than resuming one open in two places, and stops that
 /// tab's flow run, which raterm still drives. Returns how many were forgotten.
 fn release_open_sessions(conn: &Connection) -> Result<usize, String> {
     let has_pids = conn
-        .prepare("SELECT tab_id, claude_pid FROM claude_sessions WHERE claude_pid IS NOT NULL")
-        .and_then(|mut stmt| stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?.collect::<Result<Vec<_>, _>>());
+        .prepare("SELECT tab_id, claude_pid, updated_at FROM claude_sessions WHERE claude_pid IS NOT NULL")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))?
+                .collect::<Result<Vec<_>, _>>()
+        });
     let tabs = match has_pids {
-        Ok(rows) => rows.into_iter().filter(|&(_, pid)| alive(pid)).map(|(tab, _)| tab).collect::<Vec<_>>(),
+        // A process that started well after the report is likely not the Claude that
+        // sent it, but one that got its pid after that Claude (and raterm) quit.
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|&(ref tab, pid, at)| {
+                let reused = alive(pid) && started_after(pid, at);
+                if reused {
+                    eprintln!("misag: raterm's tab {tab} reported pid {pid} at {at}, which a later process has now; its conversation is not open");
+                }
+                alive(pid) && !reused
+            })
+            .map(|(tab, ..)| tab)
+            .collect::<Vec<_>>(),
         // A raterm too old to record pids: nothing to tell by.
         Err(e) => {
             eprintln!("misag: could not tell which of raterm's conversations are still open: {e}");
@@ -136,6 +152,42 @@ fn alive(pid: i64) -> bool {
     }
     // SAFETY: signal 0 only checks that the process exists; nothing is sent.
     (unsafe { libc::kill(pid, 0) } == 0) || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// How long after a report a process may have started and still count as the one
+/// that reported: the start is worked out from the wall clock now, so a clock set
+/// forward since the report moves it later. A pid reused that soon is rare.
+#[cfg(target_os = "linux")]
+const START_SLACK_SECS: i64 = 60;
+
+/// Whether process `pid` started more than `START_SLACK_SECS` after `at` (unix
+/// seconds); false, logged, when that cannot be told.
+#[cfg(target_os = "linux")]
+fn started_after(pid: i64, at: i64) -> bool {
+    let start = || -> Option<i64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // After the name in parentheses, which may hold spaces, the fields from the
+        // 3rd on; the 22nd is the start, in clock ticks since boot.
+        let ticks: i64 = stat[stat.rfind(')')? + 1..].split_whitespace().nth(19)?.parse().ok()?;
+        let boot: i64 = std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()?;
+        // SAFETY: sysconf only reads a configuration value.
+        let hz = i64::from(i32::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?);
+        (hz > 0).then(|| boot + ticks / hz)
+    };
+    match start() {
+        Some(start) => start > at + START_SLACK_SECS,
+        None => {
+            eprintln!("misag: could not tell when pid {pid} started, so it counts as the Claude that reported it");
+            false
+        }
+    }
+}
+
+/// Whether process `pid` started after `at`: not told here, so a live pid counts
+/// as the Claude that reported.
+#[cfg(not(target_os = "linux"))]
+fn started_after(_pid: i64, _at: i64) -> bool {
+    false
 }
 
 /// Removes those of `files` that exist, logging what could not be removed.
@@ -208,6 +260,23 @@ mod tests {
         assert!(notice.contains("1 Claude conversation"), "{notice}");
         // raterm's own database still has it.
         assert_eq!(raterm.load_layout().unwrap().tabs[0].kind, TabKind::Claude { claude_session: Some(sid(S1)) });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pid_reused_by_a_process_started_after_the_report_does_not_hold_the_conversation() {
+        let old = crate::test_support::temp_dir("import-reused-old").join(RATERM_FILE);
+        let raterm = Db::open(old.clone()).unwrap();
+        raterm.save_layout(Layout { active: 0, tabs: vec![claude_tab("a", Some(S1))] }).unwrap();
+        let conn = connect_existing(&old).unwrap();
+        let (tab_id, session_id) = (tid("a"), sid(S1));
+        record_claude_session(&conn, &SessionReport { claude_pid: Some(std::process::id()), ..report(&tab_id, &session_id) })
+            .unwrap();
+        // Reported long before this process, which now has the pid, started.
+        conn.execute("UPDATE claude_sessions SET updated_at = 1000", []).unwrap();
+        let path = crate::test_support::temp_dir("import-reused-new").join(FILE);
+        let db = Db::open_or_import(Ok(path), Some(old));
+        assert_eq!(db.load_layout().unwrap().tabs[0].kind, TabKind::Claude { claude_session: Some(sid(S1)) });
     }
 
     #[test]
