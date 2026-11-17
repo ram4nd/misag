@@ -259,12 +259,16 @@ const MIGRATIONS: &[&str] = &[r#"
     CREATE INDEX flow_runs_by_flow ON flow_runs (flow_id);
     CREATE INDEX flow_runs_closing ON flow_runs (tab_id) WHERE closing = 1;
 "#, r#"
-    -- 1 while a run runs a step whose prompt the app typed into the tab while Claude
-    -- may still have been answering the step before (see runs::Phase::Typed), until
-    -- Claude Code reports it submitted: a turn that ends before then is not its reply.
+    -- Not 0 while a run runs a step whose prompt the app typed into the tab while
+    -- Claude may still have been answering the step before (see runs::Phase::Typed),
+    -- until Claude Code reports that prompt submitted: a turn that ends before then
+    -- is not its reply. 1 until a turn ends, 2 after (a second one waits for the
+    -- person). Like the CHECKs above, it holds active runs only: an ended run keeps
+    -- what it was left with, as a raw stop of a run a version cannot read leaves the
+    -- rest of the row as it was, and runs::RunState::from_columns ignores it there.
     ALTER TABLE flow_runs ADD COLUMN typed INTEGER NOT NULL DEFAULT 0
         CONSTRAINT typed_only_when_running
-        CHECK (typed IN (0, 1) AND (status IN ('done', 'stopped') OR typed = 0
+        CHECK (typed IN (0, 1, 2) AND (status IN ('done', 'stopped') OR typed = 0
                OR (status = 'running' AND clear IS NULL AND briefing = 0)));
 "#];
 
@@ -1026,7 +1030,8 @@ mod tests {
             ("typed = 1, clear = 'pending'", "typed_only_when_running"),
             ("typed = 1, briefing = 1, briefing_at = 1", "typed_only_when_running"),
             ("status = 'manual', typed = 1", "typed_only_when_running"),
-            ("typed = 2", "typed_only_when_running"),
+            ("status = 'attention', note = 'why', typed = 2", "typed_only_when_running"),
+            ("typed = 3", "typed_only_when_running"),
         ] {
             let e = conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_err().to_string();
             assert!(e.contains("CHECK constraint failed") && e.contains(check), "{set}: {e}");
@@ -1046,10 +1051,11 @@ mod tests {
             "clear = NULL, briefing = 1, briefing_at = 1",
             "briefing = 0, briefing_at = NULL",
             "typed = 1",
+            "typed = 2",
             "typed = 0",
             "status = 'manual', prefill = 1",
             "status = 'attention', note = 'why', resume = 'remind'",
-            "status = 'stopped', briefing = 1, clear = 'done', closing = 1",
+            "status = 'stopped', briefing = 1, clear = 'done', closing = 1, typed = 2",
             "status = 'done', closing = 0, prefill = 1",
         ] {
             conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_or_else(|e| panic!("{set}: {e}"));

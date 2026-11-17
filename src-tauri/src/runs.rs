@@ -113,8 +113,10 @@ enum Resume {
     /// Claude still has the step in mind (it asked for a person, or its reply could
     /// not be followed): remind it to go on and how to end.
     Remind,
-    /// Claude no longer has the step in mind (the conversation was cleared, or the
-    /// step's prompt could not be typed; see `unsent`): send the step's prompt again.
+    /// Claude no longer has the step in mind (the conversation was cleared, the
+    /// step's prompt could not be typed, see `unsent`, or a prompt the app typed for
+    /// a run moved on by hand was lost, see `Phase::Typed`): send the step's prompt
+    /// again.
     Prompt,
 }
 
@@ -269,11 +271,22 @@ enum Phase {
     /// person's prompt at a manual prompt.
     Working,
     /// Running a prompt step whose prompt the app typed into the tab after the person
-    /// moved a running step on (see `transition::proceed`; status running, typed 1):
-    /// Claude may still be answering the step before, and Claude Code holds the
-    /// prompt until that turn ends, so a turn that ends before Claude Code reports the
-    /// prompt submitted (see `on_prompt`) is not this step's reply. Then `Working`.
-    Typed,
+    /// moved a running step on, entered from `Working` or from `Typed` itself (a
+    /// repeat pick; see `transition::proceed`). Claude may still be answering the
+    /// step before, so a turn that ends before Claude Code reports this step's own
+    /// prompt submitted (see `on_prompt` and `transition::prompt_sent`) is not its
+    /// reply; once it does, the run is `Working`. `turn_ended`: a turn has ended since
+    /// the prompt was typed, or since another prompt was submitted, with none
+    /// submitted after it (status running, typed 1 without, 2 with): one more turn
+    /// ending without the step's prompt means the prompt was not sent (folded into
+    /// the turn before, dropped by Esc, or edited away), and the run waits for the
+    /// person (see `transition::on_stop`).
+    ///
+    /// This rests on what Claude Code 2.1.326 was seen to do: a prompt typed during
+    /// a turn is held, and its UserPromptSubmit hook runs after that turn's Stop
+    /// hook. Moving on by hand into a step that clears or briefs Claude first (a
+    /// late reply landing on those) is out of scope: only prompt steps are `Typed`.
+    Typed { turn_ended: bool },
     /// Waiting for the person (status manual): at a pause to go on, at a manual prompt
     /// for their prompt; `prefill`, whether the app has yet to fill Claude's input for
     /// that prompt (prefill 1; see `prefill_text`).
@@ -289,7 +302,7 @@ enum Phase {
 impl Phase {
     fn status(&self) -> Status {
         match self {
-            Phase::Clearing { .. } | Phase::Briefing { .. } | Phase::Working | Phase::Typed => Status::Running,
+            Phase::Clearing { .. } | Phase::Briefing { .. } | Phase::Working | Phase::Typed { .. } => Status::Running,
             Phase::Waiting { .. } => Status::Manual,
             Phase::NeedsPerson { .. } => Status::Attention,
             Phase::Ended { stopped: true, .. } => Status::Stopped,
@@ -328,7 +341,8 @@ struct Columns {
     briefing: bool,
     briefing_at: Option<i64>,
     closing: bool,
-    typed: bool,
+    /// 0, or 1 or 2 for `Phase::Typed` (see there).
+    typed: i64,
 }
 
 impl Columns {
@@ -414,17 +428,22 @@ impl RunState {
                 if c.prefill {
                     return cannot("a paste owed");
                 }
-                match (clear, c.briefing, c.typed) {
+                let typed = match c.typed {
+                    0 => None,
+                    1 | 2 => Some(Phase::Typed { turn_ended: c.typed == 2 }),
+                    other => return Err(format!("a run has the typed state {other}, which this version does not know")),
+                };
+                match (clear, c.briefing, typed) {
                     (Some(_), true, _) => return cannot("both a clear and a briefing"),
-                    (Some(_), false, true) => return cannot("both a clear and a typed prompt"),
-                    (None, true, true) => return cannot("both a briefing and a typed prompt"),
-                    (Some(clear), false, false) => Phase::Clearing { done: clear == Clear::Done },
-                    (None, true, false) => match c.briefing_at {
+                    (Some(_), false, Some(_)) => return cannot("both a clear and a typed prompt"),
+                    (None, true, Some(_)) => return cannot("both a briefing and a typed prompt"),
+                    (Some(clear), false, None) => Phase::Clearing { done: clear == Clear::Done },
+                    (None, true, None) => match c.briefing_at {
                         Some(sent_at) => Phase::Briefing { sent_at },
                         None => return cannot("a briefing with no time it was sent"),
                     },
-                    (None, false, true) => Phase::Typed,
-                    (None, false, false) => Phase::Working,
+                    (None, false, Some(typed)) => typed,
+                    (None, false, None) => Phase::Working,
                 }
             }
             Status::Manual | Status::Attention => {
@@ -435,7 +454,7 @@ impl RunState {
                 if c.briefing {
                     return cannot("a briefing");
                 }
-                if c.typed {
+                if c.typed != 0 {
                     return cannot("a typed prompt");
                 }
                 if status == Status::Manual {
@@ -472,13 +491,13 @@ impl RunState {
             briefing: false,
             briefing_at: None,
             closing: false,
-            typed: false,
+            typed: 0,
         };
         match &self.phase {
             Phase::Clearing { done } => c.clear = Some(if *done { Clear::Done } else { Clear::Pending }.as_str().to_owned()),
             Phase::Briefing { sent_at } => (c.briefing, c.briefing_at) = (true, Some(*sent_at)),
             Phase::Working => {}
-            Phase::Typed => c.typed = true,
+            Phase::Typed { turn_ended } => c.typed = 1 + i64::from(*turn_ended),
             Phase::Waiting { prefill } => c.prefill = *prefill,
             Phase::NeedsPerson { why, resume, prefill } => {
                 (c.note, c.resume, c.prefill) = (Some(why.clone()), resume.map(|r| r.as_str().to_owned()), *prefill);
@@ -984,19 +1003,23 @@ pub fn prefilled(conn: &mut Connection, run_id: i64, step_id: &str, token: i64) 
 
 /// The person sent `prompt` to Claude in tab `tab_id` (the UserPromptSubmit hook):
 /// a run waiting at a manual prompt runs it, so Claude's answer moves it on (see
-/// `on_stop`). Claude has Start's base info if the prompt carried it. A command
-/// Claude Code handles itself is not a prompt to Claude (see `local_command`), and
-/// prompts at any other step change nothing.
+/// `on_stop`). Claude has Start's base info if the prompt carried it. A run moved
+/// on by hand (`Phase::Typed`) reacts to the step's own prompt, which the app
+/// typed: Claude's answer to it is the step's reply (see `transition::prompt_sent`).
+/// A command Claude Code handles itself is not a prompt to Claude (see
+/// `local_command`), and prompts at any other step change nothing.
 /// Returns what to add to Claude's context with the prompt: that a flow which ran
 /// in the tab is finished, owed since it ended (see `RunState::owes_closing`).
 pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<Option<String>, String> {
     if local_command(prompt) {
         return Ok(None);
     }
-    // Every prompt in every tab comes here: look before taking the write lock.
+    // Every prompt in every tab comes here: look before taking the write lock. The
+    // phases listed are those `transition::prompt_sent` changes: Waiting and
+    // NeedsPerson (manual, attention) and Typed (running, typed 1 or 2).
     let waiting = conn
         .query_row(
-            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND (status IN ('manual', 'attention') OR typed = 1)
+            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND (status IN ('manual', 'attention') OR (status = 'running' AND typed <> 0))
              UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
             [tab_id.as_str()],
             |_| Ok(()),
@@ -1016,7 +1039,7 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
         .map_err(sql)?;
     let closing = finished.map(|run| flow_name(&tx, run)).transpose()?.map(|name| flows::closing_text(&name));
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())?
-        && let Some(state) = transition::prompt_sent(&run.cx(NOTHING_TAKEN), &run.state)?
+        && let Some(state) = transition::prompt_sent(&run.cx(NOTHING_TAKEN), &run.state, prompt)?
     {
         state.save(&tx, run.id)?;
     }
@@ -1054,14 +1077,15 @@ fn local_command(prompt: &str) -> bool {
     LOCAL_COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
 
-/// The UserPromptSubmit hook could not record the person's prompt in tab `tab_id`:
-/// a run waiting at a manual prompt would never see Claude's answer, so it waits
-/// for the person, saying `why`, rather than for a prompt already sent. Its paste,
-/// if still owed, stays owed.
-fn prompt_unseen(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+/// The UserPromptSubmit hook could not record a prompt in tab `tab_id`, failing
+/// with `error`: a run waiting at a manual prompt, or for the prompt the app typed
+/// (`Phase::Typed`), would never see Claude's answer, so it waits for the person,
+/// saying why (see `transition::prompt_unseen`), rather than for a prompt already
+/// sent. Its paste, if still owed, stays owed.
+fn prompt_unseen(conn: &mut Connection, tab_id: &TabId, error: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(()) };
-    let Some(state) = transition::prompt_unseen(&run.cx(NOTHING_TAKEN), &run.state, why)? else { return Ok(()) };
+    let Some(state) = transition::prompt_unseen(&run.cx(NOTHING_TAKEN), &run.state, error)? else { return Ok(()) };
     state.save(&tx, run.id)?;
     tx.commit().map_err(sql)
 }
@@ -1078,16 +1102,13 @@ pub enum Hook {
 /// `hook` in tab `tab_id` failed with `error`, so the tab's run would wait for what
 /// it will never see: after the Stop hook, a running step waits for the person (see
 /// `pause_tab`); after the UserPromptSubmit hook, so does a manual prompt waiting
-/// for the person's prompt (see `prompt_unseen`). Best effort: returns `error`,
-/// with why the run could not be marked if it could not.
+/// for the person's prompt, or a run waiting for the prompt the app typed (see
+/// `prompt_unseen`). Best effort: returns `error`, with why the run could not be
+/// marked if it could not.
 pub fn hook_failed(conn: &mut Connection, tab_id: &TabId, hook: Hook, error: String) -> String {
     let marked = match hook {
         Hook::Stop => pause_tab(conn, tab_id, &format!("The Stop hook could not move the run on ({error}). Pick an output to go on.")),
-        Hook::Prompt => prompt_unseen(
-            conn,
-            tab_id,
-            &format!("misag could not record your prompt ({error}), so Claude's answer will not move the run on. Pick an output to go on."),
-        ),
+        Hook::Prompt => prompt_unseen(conn, tab_id, &error),
     };
     match marked {
         Ok(()) => error,
@@ -1150,17 +1171,18 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
     tx.commit().map_err(sql)
 }
 
-/// Makes the tab's running run wait for the person, saying why: Claude will not
-/// reply to its step (the conversation was cleared, or the hook failed), so
-/// Continue sends the step's prompt again, except while the run reads its briefing,
-/// where the person picks an output, and while it runs a manual prompt, where the
-/// person sends their prompt again or picks one (see `transition::answer_lost`). A
-/// run still at Start waiting for its clear has no step to reply to, and is left
-/// alone.
+/// The Stop hook failed in tab `tab_id`: makes the tab's running run wait for the
+/// person, saying why, as Claude's reply to its step was not seen (see
+/// `transition::stop_failed`), so Continue sends the step's prompt again, except
+/// while the run reads its briefing, where the person picks an output, and while it
+/// runs a manual prompt, where the person sends their prompt again or picks one
+/// (see `transition::answer_lost`). A run still at Start waiting for its clear has
+/// no step to reply to, and one waiting for the prompt the app typed lost no reply
+/// of its step: both are left alone.
 fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
-        run.save(&tx, &transition::pause(&run.cx(NOTHING_TAKEN), run.state.clone(), why)?)?;
+        run.save(&tx, &transition::stop_failed(&run.cx(NOTHING_TAKEN), run.state.clone(), why)?)?;
     }
     tx.commit().map_err(sql)
 }
@@ -1170,7 +1192,8 @@ fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), Str
 /// (`RunState::stopped`). One it cannot read (a resume or clear state from a newer
 /// version, which `RunState::from_columns` refuses) must still stop, so it is one
 /// raw UPDATE of the status, which works out what it owes Claude from the row
-/// (`OWES_CLOSING`) as a best guess, and leaves the rest as it was.
+/// (`OWES_CLOSING`) as a best guess, drops a typed prompt's wait (`typed`, which
+/// `on_prompt` looks for), and leaves the rest as it was.
 fn stop_run(conn: &Connection, run_id: i64, tab_open: bool) -> Result<bool, String> {
     match RunState::load_active(conn, run_id)? {
         None => Ok(false),
@@ -1185,7 +1208,7 @@ fn stop_run(conn: &Connection, run_id: i64, tab_open: bool) -> Result<bool, Stri
         Some(Err(why)) => {
             eprintln!("misag: run {run_id} is stopped by its row alone, as {why}");
             conn.execute(
-                &format!("UPDATE flow_runs SET status = 'stopped', closing = ?3 AND ({OWES_CLOSING}), updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
+                &format!("UPDATE flow_runs SET status = 'stopped', closing = ?3 AND ({OWES_CLOSING}), typed = 0, updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
                 params![run_id, now(), tab_open],
             )
             .map_err(sql)?;
@@ -2280,9 +2303,10 @@ mod tests {
         let g = manual_prompt_first("");
         let (_db, mut conn, flow) = setup("runs-manual-prompt-unseen", &g);
         begin(&mut conn, flow, &tab("t1")).unwrap();
-        prompt_unseen(&mut conn, &tab("t1"), "Your prompt could not be recorded.").unwrap();
+        prompt_unseen(&mut conn, &tab("t1"), "bad").unwrap();
         let waiting = only_run(&conn);
-        assert_eq!((waiting.status, waiting.note.as_deref()), (Status::Attention, Some("Your prompt could not be recorded.")));
+        assert_eq!(waiting.status, Status::Attention);
+        assert!(waiting.note.as_deref().unwrap().starts_with("misag could not record your prompt (bad)"), "{:?}", waiting.note);
         // A run at any other step is left as it is.
         let (_db2, mut conn2, flow2) = setup("runs-pause-unseen", &manual_first());
         begin(&mut conn2, flow2, &tab("t1")).unwrap();
@@ -2355,6 +2379,112 @@ mod tests {
         pick(&mut conn, run, "ok").unwrap();
         on_stop(&mut conn, &tab("t1"), Some("FLOW: done")).unwrap();
         assert!(active(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_the_step_s_own_prompt_counts_for_a_run_moved_on_by_hand() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-typed-own-prompt", &g);
+        let t = tab("t1");
+        begin(&mut conn, flow, &t).unwrap();
+        let run = only_run(&conn);
+        let typed = pick(&mut conn, run.id, "fail").unwrap().unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: fail")).unwrap(), None, "the late reply");
+        // A message the person queued before the pick goes first: its answer is not the step's reply.
+        on_prompt(&mut conn, &t, "Also check the logs.").unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: pass")).unwrap(), None);
+        assert_eq!(only_run(&conn).status, Status::Running);
+        // The step's prompt, however Claude Code spaces it, is.
+        on_prompt(&mut conn, &t, &format!("{}\n", typed.replace('\n', "\r\n"))).unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: pass")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty(), "the reply ended the run");
+    }
+
+    #[test]
+    fn a_second_pick_while_the_first_prompt_waits_counts_only_the_second_prompt() {
+        let g = review_loop();
+        let (_db, mut conn, flow) = setup("runs-typed-two-picks", &g);
+        let t = tab("t1");
+        begin(&mut conn, flow, &t).unwrap();
+        let run = only_run(&conn).id;
+        assert_eq!(pick(&mut conn, run, "issues").unwrap(), prompt_of(&g, "fix"));
+        assert_eq!(pick(&mut conn, run, "done").unwrap(), prompt_of(&g, "review"));
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: clean")).unwrap(), None, "the late reply to the first review");
+        // Claude Code sends the first pick's prompt; its answer is not the review's.
+        on_prompt(&mut conn, &t, &prompt_of(&g, "fix").unwrap()).unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: done")).unwrap(), None);
+        let still = only_run(&conn);
+        assert_eq!((still.status, still.step_id.as_str()), (Status::Running, "review"));
+        on_prompt(&mut conn, &t, &prompt_of(&g, "review").unwrap()).unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: clean")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty(), "the review's reply ended the run");
+    }
+
+    #[test]
+    fn a_typed_prompt_never_seen_sent_waits_for_the_person_and_continue_sends_it_again() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-typed-lost", &g);
+        let t = tab("t1");
+        begin(&mut conn, flow, &t).unwrap();
+        let run = only_run(&conn).id;
+        pick(&mut conn, run, "fail").unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: fail")).unwrap(), None, "the late reply");
+        assert_eq!(only_run(&conn).status, Status::Running);
+        // Another turn ends with no prompt of the step's sent: it was folded into the
+        // turn before, dropped by Esc, or edited away.
+        assert_eq!(on_stop(&mut conn, &t, Some("Done.")).unwrap(), None);
+        let waiting = only_run(&conn);
+        assert_eq!((waiting.status, waiting.resumable), (Status::Attention, true));
+        assert!(waiting.note.as_deref().unwrap().contains("not seen being sent"), "{:?}", waiting.note);
+        assert_eq!(go_on(&mut conn, run).unwrap(), prompt_of(&g, "p").unwrap());
+    }
+
+    #[test]
+    fn a_failed_stop_hook_while_a_typed_prompt_waits_keeps_waiting_for_it() {
+        let g = runnable();
+        let (_db, mut conn, flow) = setup("runs-typed-stop-failed", &g);
+        let t = tab("t1");
+        begin(&mut conn, flow, &t).unwrap();
+        let run = only_run(&conn).id;
+        let typed = pick(&mut conn, run, "fail").unwrap().unwrap();
+        // That Stop was the late reply to the step before: Continue would type the prompt twice.
+        hook_failed(&mut conn, &t, Hook::Stop, "boom".into());
+        assert_eq!(only_run(&conn).status, Status::Running);
+        on_prompt(&mut conn, &t, &typed).unwrap();
+        assert_eq!(on_stop(&mut conn, &t, Some("FLOW: pass")).unwrap(), None);
+        assert!(active(&conn).unwrap().is_empty(), "the reply ended the run");
+    }
+
+    #[test]
+    fn a_stopped_run_moved_on_by_hand_takes_no_lock_for_a_prompt() {
+        let g = runnable();
+        let path = db::test_util::temp_db("runs-typed-stopped");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        db.save_flow_graph(flow, &g).unwrap();
+        let mut conn = db::connect_existing(&path).unwrap();
+        for (t, unreadable) in [("t1", false), ("t2", true)] {
+            let t = tab(t);
+            let run = begin(&mut conn, flow, &t).unwrap().run_id;
+            pick(&mut conn, run, "fail").unwrap();
+            assert_eq!(column::<i64>(&conn, run, "typed"), 1);
+            if unreadable {
+                // As a newer version might store it, so the stop is a raw UPDATE.
+                conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+                conn.execute("UPDATE flow_runs SET resume = 'someday' WHERE id = ?1", [run]).unwrap();
+                conn.execute_batch("PRAGMA ignore_check_constraints = OFF").unwrap();
+            }
+            // A closed tab owes no finished flow's note, which a prompt would carry.
+            stop_tab(&conn, &t).unwrap();
+            assert_eq!(column::<i64>(&conn, run, "typed"), 0, "unreadable: {unreadable}");
+            // The hook, say, holds the write lock.
+            let writer = db::connect_existing(&path).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let begun = std::time::Instant::now();
+            assert_eq!(on_prompt(&mut conn, &t, &prompt_of(&g, "p").unwrap()).unwrap(), None);
+            assert!(begun.elapsed() < std::time::Duration::from_secs(1), "{:?}", begun.elapsed());
+            writer.execute_batch("ROLLBACK").unwrap();
+        }
     }
 
     #[test]
@@ -2935,6 +3065,8 @@ mod tests {
             Phase::Clearing { done: true },
             Phase::Briefing { sent_at: 1234 },
             Phase::Working,
+            Phase::Typed { turn_ended: false },
+            Phase::Typed { turn_ended: true },
             Phase::Waiting { prefill: false },
             Phase::Waiting { prefill: true },
             needs("why", Some(Resume::Prompt), true),
@@ -2977,12 +3109,17 @@ mod tests {
             (Columns { prefill: true, ..running.clone() }, "running with a paste owed"),
             (Columns { clear: Some("pending".into()), briefing: true, briefing_at: Some(1), ..running.clone() }, "both a clear and a briefing"),
             (Columns { briefing: true, ..running.clone() }, "a briefing with no time"),
+            (Columns { clear: Some("done".into()), typed: 1, ..running.clone() }, "both a clear and a typed prompt"),
+            (Columns { briefing: true, briefing_at: Some(1), typed: 2, ..running.clone() }, "both a briefing and a typed prompt"),
+            (Columns { typed: 3, ..running.clone() }, "typed state 3"),
             (Columns { closing: true, ..running }, "running with a finished flow's note owed"),
             (Columns { note: Some("why".into()), ..manual.clone() }, "manual with a note"),
             (Columns { resume: Some("prompt".into()), ..manual.clone() }, "manual with a way to continue"),
+            (Columns { typed: 1, ..manual.clone() }, "manual with a typed prompt"),
             (Columns { clear: Some("done".into()), ..manual }, "manual with a clear"),
             (Columns { note: None, ..attention.clone() }, "attention with no note"),
             (Columns { briefing: true, briefing_at: Some(1), ..attention.clone() }, "attention with a briefing"),
+            (Columns { typed: 2, ..attention.clone() }, "attention with a typed prompt"),
             (Columns { clear: Some("pending".into()), ..attention }, "attention with a clear"),
         ];
         for (columns, named) in cases {
@@ -3004,6 +3141,7 @@ mod tests {
             briefing_at: Some(5),
             prefill: true,
             closing: true,
+            typed: 7,
             ..working_columns()
         };
         let state = RunState::from_columns(stopped).unwrap();
@@ -3186,14 +3324,16 @@ mod tests {
         let token = before.prefill_token.unwrap();
         assert_eq!(before.phase, Phase::Waiting { prefill: true });
         // The paste stays owed, under the same token.
-        prompt_unseen(&mut conn, &tab("t1"), "Your prompt could not be recorded.").unwrap();
+        prompt_unseen(&mut conn, &tab("t1"), "bad").unwrap();
         let after = state(&conn, run);
-        assert_eq!(after, RunState { phase: needs("Your prompt could not be recorded.", None, true), ..before.clone() });
+        let Phase::NeedsPerson { why, .. } = &after.phase else { panic!("{after:?}") };
+        let why = why.clone();
+        assert_eq!(after, RunState { phase: needs(&why, None, true), ..before.clone() });
         // A paste recorded under another token changes nothing.
         prefilled(&mut conn, run, "mp", token + 1).unwrap();
         assert_eq!(state(&conn, run), after);
         prefilled(&mut conn, run, "mp", token).unwrap();
-        assert_eq!(state(&conn, run), RunState { phase: needs("Your prompt could not be recorded.", None, false), ..after });
+        assert_eq!(state(&conn, run), RunState { phase: needs(&why, None, false), ..after });
         // A pause leaves a run that waits for the person as it is.
         let (_db, mut conn, flow) = setup("runs-state-pause-waiting", &manual_first());
         let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
@@ -3217,7 +3357,7 @@ mod tests {
         conn.pragma_update(None, "ignore_check_constraints", false).unwrap();
         let (mut stored_any, mut refused_any) = (false, false);
         // Every active status, with each column the CHECKs name set or not.
-        for i in 0..3 * 2 * 2 * 3 * 2 * 2 * 2 * 2 {
+        for i in 0..3 * 2 * 2 * 3 * 2 * 2 * 2 * 2 * 4 {
             let mut left = i;
             let mut pick = |n: usize| {
                 let picked = left % n;
@@ -3233,16 +3373,17 @@ mod tests {
                 briefing_at: (pick(2) == 1).then_some(5),
                 prefill: pick(2) == 1,
                 closing: pick(2) == 1,
+                typed: [0, 1, 2, 3][pick(4)],
                 ..working_columns()
             };
             let tx = conn.transaction().unwrap();
             let inserted = tx.execute(
                 "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, note, started_at, updated_at, resume, clear,
-                                        briefed, prefill, prefill_token, briefing, briefing_at, closing)
-                 VALUES (?1, 't1', '{}', ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                                        briefed, prefill, prefill_token, briefing, briefing_at, closing, typed)
+                 VALUES (?1, 't1', '{}', ?2, ?3, ?4, ?5, 0, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     flow, c.node_id, c.status, c.steps, c.note, c.resume, c.clear, c.briefed, c.prefill, c.prefill_token, c.briefing,
-                    c.briefing_at, c.closing
+                    c.briefing_at, c.closing, c.typed
                 ],
             );
             drop(tx);
