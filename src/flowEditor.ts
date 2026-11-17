@@ -47,6 +47,8 @@ const MAX_TEXT = 20000;
 const MAX_INFO = 4000;
 const MAX_OUTPUTS = 8;
 const MAX_RUNS = 100;
+/** How many changes Ctrl+Z can take back. */
+const MAX_UNDO = 100;
 /** The steps the toolbar adds. An End marks where the flow ends; an output with no next step ends it too. */
 const NEW_STEPS: Record<"prompt" | "manual" | "manual_prompt" | "end", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
@@ -153,6 +155,14 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   let saving = Promise.resolve();
   /** Whether the last save worked, so a tab is not closed on unsaved changes. */
   let saved = true;
+  /** The graph as JSON before each change Ctrl+Z can take back, newest last. */
+  let undoStack: string[] = [];
+  /** The graph as JSON as it was when each change was taken back, for Ctrl+Y. */
+  let redoStack: string[] = [];
+  /** The graph as JSON as of the last change, which the next one is taken back to. */
+  let current = JSON.stringify(graph);
+  /** The field the last change typed into, so typing on in it stays one change to take back. */
+  let lastGroup: string | null = null;
 
   const canvas = createCanvas($(".canvas"), {
     moved(id, x, y) {
@@ -182,6 +192,8 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
         commitMaxRuns();
       }
       selected = id;
+      // Typing in a field after coming back to it is a change of its own.
+      lastGroup = null;
       showPanel();
     },
   });
@@ -208,6 +220,8 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
 
   function showPanel() {
     const s = find(selected);
+    // A press in the panel that hides it (Delete step) would leave the keys nowhere.
+    if (!s && panel.contains(document.activeElement)) el.focus({ preventScroll: true });
     panel.hidden = !s;
     invalid.hidden = true;
     invalidRuns.hidden = true;
@@ -237,8 +251,51 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
 
-  /** Records a change to the graph: redraws the canvas if what it shows changed, and saves soon. */
-  function changed(redraw: boolean) {
+  /** Takes back the last change (Ctrl+Z), or puts back the last one taken back (redo), and saves. */
+  function travel(redo: boolean) {
+    // A field edit not yet committed is a change of its own, so it is taken back
+    // first and there is no redo after it; one that is not valid stays to be fixed.
+    if (!commitOutputs() || !commitMaxRuns()) return;
+    const [from, to] = redo ? [redoStack, undoStack] : [undoStack, redoStack];
+    const next = from.pop();
+    if (next === undefined) return;
+    to.push(current);
+    current = next;
+    graph = JSON.parse(next) as Graph;
+    lastGroup = null;
+    showPanel();
+    changed(true);
+  }
+
+  el.addEventListener("keydown", (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+    // A field undoes its own typing; a checkbox has none.
+    const t = e.target;
+    if (t instanceof HTMLTextAreaElement || (t instanceof HTMLInputElement && t.type !== "checkbox")) return;
+    // By the letter, or by the key's place where the layout has no Latin letters.
+    const key = /^[a-z]$/i.test(e.key) ? e.key.toLowerCase() : e.code === "KeyZ" ? "z" : e.code === "KeyY" ? "y" : "";
+    const redo = (key === "z" && e.shiftKey) || (key === "y" && !e.shiftKey);
+    if (!redo && !(key === "z" && !e.shiftKey)) return;
+    e.preventDefault();
+    travel(redo);
+  });
+
+  /**
+   * Marks the graph changed: keeps what it was before for Ctrl+Z, redraws the canvas
+   * if what it shows changed, and saves soon. Changes with the same `group` one after
+   * another (typing in one field) are taken back as one.
+   */
+  function changed(redraw: boolean, group?: string) {
+    const now = JSON.stringify(graph);
+    if (now !== current) {
+      if (group === undefined || group !== lastGroup) {
+        undoStack.push(current);
+        if (undoStack.length > MAX_UNDO) undoStack.shift();
+      }
+      redoStack = [];
+      current = now;
+    }
+    lastGroup = group ?? null;
     if (redraw) canvas.render(graph);
     showWhere();
     status.textContent = "Saving…";
@@ -311,7 +368,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     if (!s) return;
     s.title = title.value;
     canvas.retitle(s.id, s.title);
-    changed(false);
+    changed(false, `title:${s.id}`);
   };
   text.oninput = () => {
     const s = find(selected);
@@ -319,12 +376,12 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     // The canvas marks a Start with base info.
     const marked = s.kind === "start" && s.text.trim() !== "";
     s.text = text.value;
-    changed(s.kind === "start" && marked !== (s.text.trim() !== ""));
+    changed(s.kind === "start" && marked !== (s.text.trim() !== ""), `text:${s.id}`);
   };
-  /** Applies the outputs field to the selected step, or says why it cannot. */
-  function commitOutputs() {
+  /** Applies the outputs field to the selected step, or says why it cannot (and is false). */
+  function commitOutputs(): boolean {
     const s = find(selected);
-    if (!s || s.kind === "start" || s.kind === "end" || outputs.value === s.outputs.join(", ")) return;
+    if (!s || s.kind === "start" || s.kind === "end" || outputs.value === s.outputs.join(", ")) return true;
     const words = [...new Set(outputs.value.split(",").map((w) => w.trim().toLowerCase()).filter((w) => w !== ""))];
     const bad = words.filter((w) => !OUTPUT.test(w) || w === "attention");
     const why =
@@ -341,7 +398,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
                 : null;
     invalid.hidden = why === null;
     invalid.textContent = why ?? "";
-    if (why !== null) return;
+    if (why !== null) return false;
     s.outputs = words;
     // Connections from outputs that are gone go with them, saying so.
     const gone = graph.edges.filter((e) => e.from === s.id && !s.outputs.includes(e.output)).map((e) => `"${e.output}"`);
@@ -350,8 +407,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     removed.textContent = gone.length === 0 ? "" : `Removed the connection${gone.length > 1 ? "s" : ""} from ${gone.join(", ")}.`;
     outputs.value = s.outputs.join(", ");
     changed(true);
+    return true;
   }
-  outputs.onchange = commitOutputs;
+  outputs.onchange = () => void commitOutputs();
   clear.onchange = () => {
     const s = find(selected);
     if (!s || s.kind !== "start") return;
@@ -360,9 +418,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     changed(true);
   };
   /** Applies the run limit field to the selected prompt step, or says why it cannot. */
-  function commitMaxRuns() {
+  function commitMaxRuns(): boolean {
     const s = find(selected);
-    if (!s || s.kind !== "prompt") return;
+    if (!s || s.kind !== "prompt") return true;
     const value = maxRuns.value.trim();
     const n = Number(value);
     // A number field reads text it cannot parse ("e", "-") as empty: that is not "no limit".
@@ -370,18 +428,23 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     invalidRuns.hidden = ok;
     invalidRuns.textContent = ok ? "" : `A step runs 1 to ${MAX_RUNS} times; leave it empty for no limit.`;
     const next = value === "" ? undefined : n;
-    if (!ok || next === s.maxRuns) return;
+    if (!ok || next === s.maxRuns) return ok;
     if (next === undefined) delete s.maxRuns;
     else s.maxRuns = next;
     // The canvas shows the limit.
     changed(true);
+    return true;
   }
-  maxRuns.onchange = commitMaxRuns;
+  maxRuns.onchange = () => void commitMaxRuns();
 
   async function load(): Promise<boolean> {
     try {
       const flow = await invoke<FlowDetail>("flow_load", { id: flowId });
       graph = flow.graph;
+      current = JSON.stringify(graph);
+      undoStack = [];
+      redoStack = [];
+      lastGroup = null;
       canvas.render(graph);
       showWhere();
       showProblems(flow.problems);

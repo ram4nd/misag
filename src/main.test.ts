@@ -4140,6 +4140,198 @@ describe("flow editor", () => {
     expect(saved()!.nodes.find((n) => n.id === "e")).toMatchObject({ x: 30, y: 40 });
   });
 
+  describe("undo and redo", () => {
+    /** Presses a key with Ctrl on `target`, the canvas's first child unless given. */
+    async function ctrl(key: string, shiftKey = false, target: Element = editor().querySelector(".canvas")!.firstElementChild!, code?: string) {
+      target.dispatchEvent(new KeyboardEvent("keydown", { key, code, ctrlKey: true, shiftKey, bubbles: true, cancelable: true }));
+      await settle();
+    }
+
+    test("Ctrl+Z takes back added steps, and Ctrl+Shift+Z or Ctrl+Y puts them back, saved as usual", async () => {
+      storedFlows = flows("Deploy");
+      await startApp();
+      await openFromBox("Deploy");
+      tool("add-prompt").click();
+      tool("add-pause").click();
+      await settle();
+      await ctrl("z");
+      expect(titles()).toEqual(["Start", "Prompt"]);
+      await ctrl("z");
+      await ctrl("z");
+      expect(titles()).toEqual(["Start"]);
+      await afterSave();
+      expect(saved()!.nodes.map((n) => n.id)).toEqual(["start"]);
+      await ctrl("Z", true);
+      expect(titles()).toEqual(["Start", "Prompt"]);
+      await ctrl("y");
+      await ctrl("y");
+      expect(titles()).toEqual(["Start", "Prompt", "Pause"]);
+      await afterSave();
+      expect(saved()!.nodes.map((n) => n.kind)).toEqual(["start", "prompt", "manual"]);
+    });
+
+    test("typing in a field is taken back as one step, and the panel shows it", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("title", "F");
+      await edit("title", "Fi");
+      await edit("title", "Fix");
+      await edit("text", "new");
+      await ctrl("z");
+      expect(field("text").value).toBe("do it");
+      expect(titles()).toEqual(["Start", "Fix", "E"]);
+      await ctrl("z");
+      expect(titles()).toEqual(["Start", "P", "E"]);
+      expect(field("title").value).toBe("P");
+      await afterSave();
+      expect(saved()!.nodes.find((n) => n.id === "p")).toMatchObject({ title: "P", text: "do it" });
+    });
+
+    test("a deleted step comes back with its connections, and a connection is taken back", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
+      await settle();
+      expect(connections()).toBe(0);
+      await ctrl("z");
+      expect(titles()).toEqual(["Start", "P", "E"]);
+      expect(connections()).toBe(3);
+      await connect("Start", 1, "E");
+      await ctrl("z");
+      await afterSave();
+      expect(saved()!.edges).toEqual(runnable().edges);
+    });
+
+    test("outputs, run limits and /clear are taken back too", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("outputs", "pass");
+      await edit("maxRuns", "3");
+      await select("Start");
+      const clear = field("clear") as HTMLInputElement;
+      clear.checked = true;
+      clear.dispatchEvent(new Event("change", { bubbles: true }));
+      await settle();
+      await ctrl("z");
+      await ctrl("z");
+      await ctrl("z");
+      await afterSave();
+      expect(saved()).toEqual(runnable());
+    });
+
+    test("an outputs edit not yet committed is committed first, so Ctrl+Z takes back that edit", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("title", "Fix");
+      field("outputs").value = "pass";
+      await ctrl("z");
+      expect(field("outputs").value).toBe("pass, fail");
+      expect(field("title").value).toBe("Fix");
+    });
+
+    test("a new change after Ctrl+Z drops what Ctrl+Y would have put back", async () => {
+      storedFlows = flows("Deploy");
+      await startApp();
+      await openFromBox("Deploy");
+      tool("add-prompt").click();
+      await settle();
+      await ctrl("z");
+      tool("add-end").click();
+      await settle();
+      await ctrl("y");
+      expect(titles()).toEqual(["Start", "End"]);
+    });
+
+    test("an outputs edit that is not valid stays to be fixed, and nothing is taken back", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("title", "Fix");
+      field("outputs").value = "no good!";
+      await ctrl("z");
+      expect(field("outputs").value).toBe("no good!");
+      expect(panel().querySelector<HTMLElement>(".invalid")!.hidden).toBe(false);
+      expect(titles()).toEqual(["Start", "Fix", "E"]);
+    });
+
+    test("a change that changes nothing is not a step to take back", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("title", "Fix");
+      await edit("maxRuns", "");
+      await ctrl("z");
+      expect(titles()).toEqual(["Start", "P", "E"]);
+    });
+
+    test("typing in a field again after leaving it is a change of its own", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("title", "Fix");
+      await select("Start");
+      await select("Fix");
+      await edit("title", "Fix it");
+      await ctrl("z");
+      expect(titles()).toEqual(["Start", "Fix", "E"]);
+    });
+
+    test("Ctrl+Z after the Delete step button reaches the editor", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      const del = panel().querySelector<HTMLButtonElement>("button.delete-step")!;
+      del.focus();
+      del.click();
+      await settle();
+      await ctrl("z", false, document.activeElement!);
+      expect(titles()).toEqual(["Start", "P", "E"]);
+    });
+
+    test("the keys work by their place on a layout without Latin letters", async () => {
+      storedFlows = flows("Deploy");
+      await startApp();
+      await openFromBox("Deploy");
+      tool("add-prompt").click();
+      await settle();
+      await ctrl("я", false, undefined, "KeyZ");
+      expect(titles()).toEqual(["Start"]);
+      await ctrl("н", false, undefined, "KeyY");
+      expect(titles()).toEqual(["Start", "Prompt"]);
+    });
+
+    test("the keys in a field are the field's own", async () => {
+      storedFlows = flows("Deploy");
+      storedGraphs[1] = runnable();
+      await startApp();
+      await openFromBox("Deploy");
+      await select("P");
+      await edit("title", "Fix");
+      await ctrl("z", false, field("title"));
+      expect(titles()).toEqual(["Start", "Fix", "E"]);
+    });
+  });
+
   test("what keeps the flow from running is listed until it is ready", async () => {
     storedFlows = flows("Deploy");
     flowProblems = ["Start is not connected to a step."];
