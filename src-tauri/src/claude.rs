@@ -494,31 +494,28 @@ fn context(event: &str, text: &str) -> String {
 
 /// After Claude ended a turn, records whether it waits on background tasks, then
 /// moves the tab's flow run on, returning the hook output that hands Claude the
-/// next prompt, if there is one.
+/// next prompt, if there is one. If it cannot (a payload it cannot read, too), a
+/// running step waits for the person instead (see `runs::hook_failed`).
 fn stopped(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String>, String> {
-    let event: Stop = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
     // Across an upgrade (the app not yet restarted) runs cannot be read; every turn
     // of every tab ends here, so that is not logged each time.
     let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(None) };
-    // So the tab keeps showing Claude working while it waits on background tasks.
-    // A failure is logged rather than returned, so the flow run still moves on.
-    let recorded = match &event.session_id {
-        Some(session) => db::record_background(&conn, tab_id, session, event.waits()),
-        None => Err("the Stop payload had no session id".into()),
-    };
-    if let Err(e) = recorded {
-        log_failure(Some(db_path), Some(tab_id), &format!("could not record background tasks: {e}"));
-    }
-    match crate::runs::on_stop(&mut conn, tab_id, event.last_assistant_message.as_deref()) {
-        Ok(prompt) => Ok(prompt.as_deref().map(continuation)),
-        Err(e) => {
-            // Best effort: show the run as waiting rather than running forever.
-            let why = format!("The Stop hook could not move the run on ({e}). Pick an output to go on.");
-            if let Err(also) = crate::runs::pause_tab(&mut conn, tab_id, &why) {
-                return Err(format!("{e}; and could not mark the run: {also}"));
-            }
-            Err(e)
+    let moved = serde_json::from_str::<Stop>(input).map_err(|e| format!("bad hook payload: {e}")).and_then(|event| {
+        // So the tab keeps showing Claude working while it waits on background tasks.
+        // A failure is logged rather than returned, so the flow run still moves on.
+        let recorded = match &event.session_id {
+            Some(session) => db::record_background(&conn, tab_id, session, event.waits()),
+            None => Err("the Stop payload had no session id".into()),
+        };
+        if let Err(e) = recorded {
+            log_failure(Some(db_path), Some(tab_id), &format!("could not record background tasks: {e}"));
         }
+        crate::runs::on_stop(&mut conn, tab_id, event.last_assistant_message.as_deref())
+    });
+    match moved {
+        Ok(prompt) => Ok(prompt.as_deref().map(continuation)),
+        // hook_failed marks the run waiting so it does not show as running forever.
+        Err(e) => Err(crate::runs::hook_failed(&mut conn, tab_id, crate::runs::Hook::Stop, e)),
     }
 }
 
@@ -539,14 +536,9 @@ fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Option<String
     let told = serde_json::from_str::<PromptSubmit>(input)
         .map_err(|e| format!("bad hook payload: {e}"))
         .and_then(|event| crate::runs::on_prompt(&mut conn, tab_id, &event.prompt));
-    let e = match told {
-        Ok(note) => return Ok(note.map(|note| context("UserPromptSubmit", &note))),
-        Err(e) => e,
-    };
-    let why = format!("misag could not record your prompt ({e}), so Claude's answer will not move the run on. Pick an output to go on.");
-    match crate::runs::prompt_unseen(&mut conn, tab_id, &why) {
-        Ok(()) => Err(e),
-        Err(also) => Err(format!("{e}; and could not mark the run: {also}")),
+    match told {
+        Ok(note) => Ok(note.map(|note| context("UserPromptSubmit", &note))),
+        Err(e) => Err(crate::runs::hook_failed(&mut conn, tab_id, crate::runs::Hook::Prompt, e)),
     }
 }
 
@@ -1203,6 +1195,24 @@ mod tests {
         let run = &crate::runs::active(&conn).unwrap()[0];
         assert_eq!(run.status, crate::runs::Status::Attention);
         assert!(run.note.as_deref().unwrap().contains("Pick an output"), "{:?}", run.note);
+    }
+
+    #[test]
+    fn a_stop_the_hook_cannot_read_makes_the_running_step_wait_for_the_person() {
+        let path = temp_db("hook-stop-unreadable");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        db.save_flow_graph(flow, &crate::flows::tests::runnable()).unwrap();
+        let mut conn = db::connect_existing(&path).unwrap();
+        crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
+        crate::runs::on_stop(&mut conn, &tid("tab-1"), Some("Ready")).unwrap();
+        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"Stop","last_assistant_message":7}}"#);
+        let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
+        assert!(err.contains("bad hook payload"), "{err}");
+        // Not left running, waiting for a reply the hook could not read.
+        let run = &crate::runs::active(&conn).unwrap()[0];
+        assert_eq!(run.status, crate::runs::Status::Attention);
+        assert!(run.note.as_deref().unwrap().contains("The Stop hook could not move the run on"), "{:?}", run.note);
     }
 
     #[test]

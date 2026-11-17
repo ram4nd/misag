@@ -5,9 +5,10 @@
 //! reply, "Ready", which takes the first step (see `on_stop`); a flow that leads
 //! straight to its end skips that. A briefing with no reply within
 //! `BRIEFING_TIMEOUT_SECS` (Claude was interrupted, or crashed) waits for the
-//! person (see `expire`). A prompt step sends its text to Claude; when Claude ends its turn, the Stop hook
-//! (`misag --claude-hook`, a separate process) reads the `FLOW: <output>` line
-//! Claude ended with and moves on, handing Claude the next prompt as hook context.
+//! person (see `expire`). A prompt step sends its text to Claude; when Claude ends
+//! its turn, the Stop hook (`misag --claude-hook`, a separate process) reads the
+//! `FLOW: <output>` line Claude ended with and moves on, handing Claude the next
+//! prompt as hook context.
 //! A pause waits for the person, who goes on by its one output (▶ in the Flows
 //! box) or stops the run. A manual prompt has the app put the step's draft (led by
 //! Start's base info after a clear) into Claude's input without sending it
@@ -37,7 +38,7 @@ use crate::flows::{self, Graph, Kind, Node};
 use crate::layout::TabId;
 use rusqlite::{named_params, params, Connection, ErrorCode, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
@@ -45,13 +46,14 @@ use std::time::SystemTime;
 pub const MAX_RUN_STEPS: i64 = 50;
 
 /// How long a run whose Start clears may stay at Start before it waits for the
-/// person: the app's own 30 seconds (`CLEAR_TIMEOUT_MS` in src/main.ts, after which
-/// it stops the run, saying why), and a little more, so its stop comes first.
+/// person: the app's own 30 seconds (`CLEAR_TIMEOUT_MS` in src/runController.ts,
+/// after which it stops the run, saying why), and a little more, so its stop comes
+/// first.
 pub const CLEAR_TIMEOUT_SECS: i64 = 35;
 
 /// How long a run waits at Start for Claude's reply to its briefing, which asks
 /// only for "Ready", before it waits for the person: Claude was interrupted (which
-/// runs no Stop hook) or failed. `expire`'s note gives it in minutes.
+/// runs no Stop hook) or failed. `transition::timed_out`'s note gives it in minutes.
 pub const BRIEFING_TIMEOUT_SECS: i64 = 120;
 
 /// Its active statuses are mirrored by `RunStatus` in src/flows.ts.
@@ -241,87 +243,263 @@ fn parse_graph(json: &str) -> Result<Graph, String> {
     serde_json::from_str(json).map_err(|e| format!("the run's steps cannot be read ({e})"))
 }
 
+/// A new token naming a paste (see `prefilled`), kept within what JavaScript
+/// numbers hold exactly (2^53 - 1), as the app hands it back.
+fn new_token() -> i64 {
+    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+    i64::try_from(uuid::Uuid::new_v4().as_u64_pair().0 % MAX_SAFE_INTEGER).unwrap_or(0)
+}
+
+/// Where a run is with its step, and what only that place has. Each phase has one
+/// status (see `Phase::status`); `RunState::from_columns` and `RunState::columns`
+/// map it to and from `flow_runs`' columns.
+#[derive(Clone, Debug, PartialEq)]
+enum Phase {
+    /// Running at Start, whose step clears: the app types `/clear` (status running,
+    /// clear "pending"), and once Claude reports it (`done`; clear "done") sends the
+    /// briefing (see `cleared`).
+    Clearing { done: bool },
+    /// Running at Start, waiting for Claude's reply to the briefing sent at `sent_at`
+    /// (see `expire`; status running, briefing 1, briefing_at).
+    Briefing { sent_at: i64 },
+    /// Running a step (status running): Claude works on a prompt step, or answers the
+    /// person's prompt at a manual prompt.
+    Working,
+    /// Waiting for the person (status manual): at a pause to go on, at a manual prompt
+    /// for their prompt; `prefill`, whether the app has yet to fill Claude's input for
+    /// that prompt (prefill 1; see `prefill_text`).
+    Waiting { prefill: bool },
+    /// Needing a person (status attention), saying `why` (note), with how Continue
+    /// goes on (`resume`; None, it cannot help), and `prefill` as for `Waiting`.
+    NeedsPerson { why: String, resume: Option<Resume>, prefill: bool },
+    /// Done, or `stopped` (status done or stopped), with whether Claude has yet to be
+    /// told its flow is finished (closing 1; see `RunState::owes_closing`).
+    Ended { stopped: bool, owes_closing: bool },
+}
+
+impl Phase {
+    fn status(&self) -> Status {
+        match self {
+            Phase::Clearing { .. } | Phase::Briefing { .. } | Phase::Working => Status::Running,
+            Phase::Waiting { .. } => Status::Manual,
+            Phase::NeedsPerson { .. } => Status::Attention,
+            Phase::Ended { stopped: true, .. } => Status::Stopped,
+            Phase::Ended { stopped: false, .. } => Status::Done,
+        }
+    }
+
+    /// Whether the app has yet to fill Claude's input for the manual prompt the run
+    /// waits at (see `prefill_text`).
+    fn prefill(&self) -> bool {
+        matches!(self, Phase::Waiting { prefill: true } | Phase::NeedsPerson { prefill: true, .. })
+    }
+
+    /// The same phase, owing a paste or not; a phase that cannot owe one is as it is.
+    fn with_prefill(self, owed: bool) -> Self {
+        match self {
+            Phase::Waiting { .. } => Phase::Waiting { prefill: owed },
+            Phase::NeedsPerson { why, resume, .. } => Phase::NeedsPerson { why, resume, prefill: owed },
+            other => other,
+        }
+    }
+}
+
+/// A run's state as `flow_runs` stores it, column by column (see `RunState::COLUMNS`).
+#[derive(Clone, Debug, PartialEq)]
+struct Columns {
+    node_id: String,
+    status: String,
+    steps: i64,
+    note: Option<String>,
+    resume: Option<String>,
+    clear: Option<String>,
+    briefed: bool,
+    prefill: bool,
+    prefill_token: Option<i64>,
+    briefing: bool,
+    briefing_at: Option<i64>,
+    closing: bool,
+}
+
+impl Columns {
+    /// `row`'s `RunState::COLUMNS`, read by name.
+    fn read(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Columns {
+            node_id: row.get("node_id")?,
+            status: row.get("status")?,
+            steps: row.get("steps")?,
+            note: row.get("note")?,
+            resume: row.get("resume")?,
+            clear: row.get("clear")?,
+            briefed: row.get("briefed")?,
+            prefill: row.get("prefill")?,
+            prefill_token: row.get("prefill_token")?,
+            briefing: row.get("briefing")?,
+            briefing_at: row.get("briefing_at")?,
+            closing: row.get("closing")?,
+        })
+    }
+}
+
 /// What changes about a run as it goes: every column of `flow_runs` but its `id`,
 /// the ones fixed when it starts (its flow, tab, steps' copy and start time), and
-/// `updated_at`, which `RunState::save` stamps. Every state change loads it, makes the
-/// whole new state and saves it in one write (`RunState::save`), in the transaction
-/// that read it, so no write depends on another's order. (Stopping, and dropping the
-/// note owed for an ended run, stay raw UPDATEs; see `stop_in` and `drop_closing`.)
+/// `updated_at`, which `RunState::save` stamps. Every state change loads it, works
+/// out the whole new state (see `transition`) and saves it in one write
+/// (`RunState::save`), in the transaction that read it, so no write depends on
+/// another's order. The raw UPDATEs that remain: stopping a run this version cannot
+/// read (in `stop` and in `stop_in`), dropping the note owed for an ended run
+/// (`drop_closing`, and `on_prompt`'s `closing` UPDATE ... RETURNING), and stopping
+/// the runs of tabs a raterm import leaves behind (in db.rs). Every other state
+/// change is a load and a save.
 #[derive(Clone, Debug, PartialEq)]
 struct RunState {
     node_id: String,
-    status: Status,
     steps: i64,
-    /// Why the run waits, when it needs attention.
-    note: Option<String>,
-    resume: Option<Resume>,
-    clear: Option<Clear>,
     /// Whether Claude has the run's rules and Start's base info (see `first_turn` and
-    /// `prompt_for`): false until the briefing is sent, and after a clear.
+    /// `RunState::prompt`): false until the briefing is sent, and after a clear.
     briefed: bool,
-    /// Whether the app has yet to fill Claude's input for the manual prompt.
-    prefill: bool,
-    /// Names that paste (see `prefilled`).
+    /// Names the last paste owed (see `prefilled`). It outlives the paste, so a
+    /// record of an earlier one that arrives late cannot cancel one owed since.
     prefill_token: Option<i64>,
-    /// Whether the run waits at Start for Claude's reply to its briefing, sent at
-    /// `briefing_at` (see `expire`).
-    briefing: bool,
-    briefing_at: Option<i64>,
-    /// Whether the ended run has yet to tell Claude its flow is finished (see `RunState::owes_closing`).
-    closing: bool,
+    phase: Phase,
 }
 
 impl RunState {
     /// The columns `from_row` reads.
     const COLUMNS: &str = "node_id, status, steps, note, resume, clear, briefed, prefill, prefill_token, briefing, briefing_at, closing";
 
-    /// The state in `row`'s `COLUMNS`, read by name. The inner error is a value this
-    /// version does not know.
-    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Result<Self, String>> {
-        let status: String = row.get("status")?;
-        let resume: Option<String> = row.get("resume")?;
-        let clear: Option<String> = row.get("clear")?;
-        let (node_id, steps, note) = (row.get("node_id")?, row.get("steps")?, row.get("note")?);
-        let (briefed, prefill, prefill_token) = (row.get("briefed")?, row.get("prefill")?, row.get("prefill_token")?);
-        let (briefing, briefing_at, closing) = (row.get("briefing")?, row.get("briefing_at")?, row.get("closing")?);
-        Ok((|| {
-            Ok(RunState {
-                node_id,
-                status: Status::parse(&status)?,
-                steps,
-                note,
-                resume: Resume::parse(resume)?,
-                clear: Clear::parse(clear)?,
-                briefed,
-                prefill,
-                prefill_token,
-                briefing,
-                briefing_at,
-                closing,
-            })
-        })())
+    /// The state in `row`'s `COLUMNS`; an error for a state this version cannot read
+    /// (see `from_columns`), including a column of the wrong type, so one such run
+    /// does not fail a query over the others.
+    fn from_row(row: &rusqlite::Row) -> Result<Self, String> {
+        Self::from_columns(Columns::read(row).map_err(|e| format!("the run's state cannot be read ({e})"))?)
+    }
+
+    /// The state the columns `c` store. An error for a value this version does not
+    /// know (a run from a newer version is not driven on a guess) and for columns
+    /// the status leaves no room for, naming them; except what versions before this
+    /// one left behind, which is dropped: everything but `closing` on an ended run
+    /// (a raw stop, as for an unreadable run, leaves the rest as it was), and a
+    /// `briefing_at` the briefing has outlived.
+    fn from_columns(c: Columns) -> Result<Self, String> {
+        let status = Status::parse(&c.status)?;
+        let cannot = |what: &str| Err(format!("the run is {} with {what}, which cannot be", status.as_str()));
+        // Resume and clear are read only where they can be, so an ended run's are not.
+        let phase = match status {
+            Status::Done | Status::Stopped => Phase::Ended { stopped: status == Status::Stopped, owes_closing: c.closing },
+            _ if c.closing => return cannot("a finished flow's note owed"),
+            Status::Running => {
+                let (resume, clear) = (Resume::parse(c.resume)?, Clear::parse(c.clear)?);
+                if c.note.is_some() {
+                    return cannot("a note");
+                }
+                if resume.is_some() {
+                    return cannot("a way to continue");
+                }
+                if c.prefill {
+                    return cannot("a paste owed");
+                }
+                match (clear, c.briefing) {
+                    (Some(_), true) => return cannot("both a clear and a briefing"),
+                    (Some(clear), false) => Phase::Clearing { done: clear == Clear::Done },
+                    (None, true) => match c.briefing_at {
+                        Some(sent_at) => Phase::Briefing { sent_at },
+                        None => return cannot("a briefing with no time it was sent"),
+                    },
+                    (None, false) => Phase::Working,
+                }
+            }
+            Status::Manual | Status::Attention => {
+                let (resume, clear) = (Resume::parse(c.resume)?, Clear::parse(c.clear)?);
+                if clear.is_some() {
+                    return cannot("a clear");
+                }
+                if c.briefing {
+                    return cannot("a briefing");
+                }
+                if status == Status::Manual {
+                    if c.note.is_some() {
+                        return cannot("a note");
+                    }
+                    if resume.is_some() {
+                        return cannot("a way to continue");
+                    }
+                    Phase::Waiting { prefill: c.prefill }
+                } else {
+                    match c.note {
+                        Some(why) => Phase::NeedsPerson { why, resume, prefill: c.prefill },
+                        None => return cannot("no note saying why"),
+                    }
+                }
+            }
+        };
+        Ok(RunState { node_id: c.node_id, steps: c.steps, briefed: c.briefed, prefill_token: c.prefill_token, phase })
+    }
+
+    /// The columns that store this state.
+    fn columns(&self) -> Columns {
+        let mut c = Columns {
+            node_id: self.node_id.clone(),
+            status: self.phase.status().as_str().to_owned(),
+            steps: self.steps,
+            note: None,
+            resume: None,
+            clear: None,
+            briefed: self.briefed,
+            prefill: false,
+            prefill_token: self.prefill_token,
+            briefing: false,
+            briefing_at: None,
+            closing: false,
+        };
+        match &self.phase {
+            Phase::Clearing { done } => c.clear = Some(if *done { Clear::Done } else { Clear::Pending }.as_str().to_owned()),
+            Phase::Briefing { sent_at } => (c.briefing, c.briefing_at) = (true, Some(*sent_at)),
+            Phase::Working => {}
+            Phase::Waiting { prefill } => c.prefill = *prefill,
+            Phase::NeedsPerson { why, resume, prefill } => {
+                (c.note, c.resume, c.prefill) = (Some(why.clone()), resume.map(|r| r.as_str().to_owned()), *prefill);
+            }
+            Phase::Ended { owes_closing, .. } => c.closing = *owes_closing,
+        }
+        c
+    }
+
+    /// A new run of a flow whose Start is `start`: at Start, clearing first if
+    /// `clears`, otherwise about to take its first turn (see `first_turn`). Claude
+    /// lacks the run's rules until then.
+    fn initial(start: &Node, clears: bool) -> Self {
+        RunState {
+            node_id: start.id.clone(),
+            steps: 0,
+            briefed: false,
+            prefill_token: None,
+            phase: if clears { Phase::Clearing { done: false } } else { Phase::Working },
+        }
     }
 
     /// The state of run `run_id`, whatever its status; None for no such run.
+    #[cfg(test)]
     fn load(conn: &Connection, run_id: i64) -> Result<Option<Self>, String> {
-        Self::load_where(conn, "id = ?1", run_id)
+        Self::load_where(conn, "id = ?1", run_id)?.transpose()
     }
 
-    /// The state of run `run_id` if it is active; None otherwise.
-    fn load_active(conn: &Connection, run_id: i64) -> Result<Option<Self>, String> {
+    /// The state of run `run_id` if it is active; None otherwise. The inner error is
+    /// a state this version cannot read.
+    fn load_active(conn: &Connection, run_id: i64) -> Result<Option<Result<Self, String>>, String> {
         Self::load_where(conn, &format!("id = ?1 AND status IN {ACTIVE}"), run_id)
     }
 
-    fn load_where(conn: &Connection, filter: &str, run_id: i64) -> Result<Option<Self>, String> {
-        conn.query_row(&format!("SELECT {} FROM flow_runs WHERE {filter}", Self::COLUMNS), [run_id], Self::from_row)
+    fn load_where(conn: &Connection, filter: &str, run_id: i64) -> Result<Option<Result<Self, String>>, String> {
+        conn.query_row(&format!("SELECT {} FROM flow_runs WHERE {filter}", Self::COLUMNS), [run_id], |r| Ok(Self::from_row(r)))
             .optional()
-            .map_err(sql)?
-            .transpose()
+            .map_err(sql)
     }
 
     /// Makes this run `run_id`'s state, in one write that also stamps `updated_at`.
     /// An error if there is no run `run_id`.
     fn save(&self, conn: &Connection, run_id: i64) -> Result<(), String> {
+        let c = self.columns();
         let changed = conn
             .execute(
                 "UPDATE flow_runs SET node_id = :node_id, status = :status, steps = :steps, note = :note, resume = :resume,
@@ -329,18 +507,18 @@ impl RunState {
                  briefing_at = :briefing_at, closing = :closing, updated_at = :updated_at WHERE id = :id",
                 named_params! {
                     ":id": run_id,
-                    ":node_id": self.node_id,
-                    ":status": self.status.as_str(),
-                    ":steps": self.steps,
-                    ":note": self.note,
-                    ":resume": self.resume.map(Resume::as_str),
-                    ":clear": self.clear.map(Clear::as_str),
-                    ":briefed": self.briefed,
-                    ":prefill": self.prefill,
-                    ":prefill_token": self.prefill_token,
-                    ":briefing": self.briefing,
-                    ":briefing_at": self.briefing_at,
-                    ":closing": self.closing,
+                    ":node_id": c.node_id,
+                    ":status": c.status,
+                    ":steps": c.steps,
+                    ":note": c.note,
+                    ":resume": c.resume,
+                    ":clear": c.clear,
+                    ":briefed": c.briefed,
+                    ":prefill": c.prefill,
+                    ":prefill_token": c.prefill_token,
+                    ":briefing": c.briefing,
+                    ":briefing_at": c.briefing_at,
+                    ":closing": c.closing,
                     ":updated_at": now(),
                 },
             )
@@ -351,67 +529,154 @@ impl RunState {
         Ok(())
     }
 
-    /// The run at `node_id` with `status`, `steps` and `note`, owing nothing there
-    /// yet: no Continue, clear, paste or briefing (nor its time). What Claude has
-    /// (`briefed`), the last paste's token, and the `closing` flag of an ended run
-    /// carry over.
-    fn moved(&self, node_id: &str, status: Status, steps: i64, note: Option<String>) -> Self {
-        RunState {
-            node_id: node_id.to_owned(),
-            status,
-            steps,
-            note,
-            resume: None,
-            clear: None,
-            briefed: self.briefed,
-            prefill: false,
-            prefill_token: self.prefill_token,
-            briefing: false,
-            briefing_at: None,
-            closing: self.closing,
-        }
+    /// The run at `node_id` in `phase` with `steps`. What Claude has (`briefed`) and
+    /// the last paste's token carry over.
+    fn moved(&self, node_id: &str, phase: Phase, steps: i64) -> Self {
+        RunState { node_id: node_id.to_owned(), steps, phase, ..self.clone() }
     }
 
     /// The run waiting at `node_id` for the person, saying why, and how Continue goes
     /// on from there (None: it cannot help, and the person picks an output).
     fn waiting(&self, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Self {
-        RunState { resume, ..self.moved(node_id, Status::Attention, steps, Some(why.to_owned())) }
+        self.moved(node_id, Phase::NeedsPerson { why: why.to_owned(), resume, prefill: false }, steps)
     }
 
     /// The run waiting where it is for the person, saying why, and how Continue goes on
-    /// from there (see `waiting`); the rest of its state carries over.
+    /// from there (see `waiting`); a paste it owes stays owed.
     fn waiting_here(&self, why: &str, resume: Option<Resume>) -> Self {
-        RunState { status: Status::Attention, note: Some(why.to_owned()), resume, ..self.clone() }
+        let phase = Phase::NeedsPerson { why: why.to_owned(), resume, prefill: self.phase.prefill() };
+        RunState { phase, ..self.clone() }
     }
 
     /// The run, at Start reading its briefing, waiting there for the person, saying
     /// why: Claude may not have read the briefing, so the first step carries it again,
     /// and Continue has no step prompt to send (see `continue_offered`).
     fn briefing_lost(&self, why: &str) -> Self {
-        RunState { briefed: false, briefing: false, briefing_at: None, ..self.waiting_here(why, None) }
+        RunState { briefed: false, ..self.waiting_here(why, None) }
     }
 
     /// The run, still at Start waiting for its clear, waiting there for the person
     /// to go on without it, saying why.
     fn clear_lost(&self, why: &str) -> Self {
-        RunState { clear: None, ..self.waiting_here(why, None) }
+        self.waiting_here(why, None)
     }
 
     /// The run done at `node_id`; Claude, if it has the run's rules, is told it no
     /// longer needs to end its replies with a FLOW line, with the person's next
     /// prompt (see `RunState::owes_closing`).
     fn finished(&self, node_id: &str, steps: i64) -> Self {
-        RunState { closing: self.closing || self.owes_closing(), ..self.moved(node_id, Status::Done, steps, None) }
+        self.moved(node_id, Phase::Ended { stopped: false, owes_closing: self.owes_closing() }, steps)
+    }
+
+    /// The run stopped where it is (see `finished`).
+    fn stopped(&self) -> Self {
+        RunState { phase: Phase::Ended { stopped: true, owes_closing: self.owes_closing() }, ..self.clone() }
     }
 
     /// Whether the run, ending, owes Claude the note that its flow is finished: Claude
     /// has the run's rules (`briefed`; not after a clear, or while the run clears at
     /// its start). Nothing is typed and no turn is spent: stopping must not send into
-    /// a turn or a permission prompt. `OWES_CLOSING` says the same in SQL.
+    /// a turn or a permission prompt. `OWES_CLOSING` says the same in SQL, for a run
+    /// this version cannot read.
     fn owes_closing(&self) -> bool {
-        self.briefed && self.clear.is_none()
+        self.briefed && !matches!(self.phase, Phase::Clearing { .. })
+    }
+
+    /// The run owing the app a paste named by `token` (see `prefilled`).
+    fn with_prefill(self, token: i64) -> Self {
+        RunState { prefill_token: Some(token), phase: self.phase.with_prefill(true), ..self }
+    }
+
+    /// Has Claude get `node`'s prompt, led by the run's rules and Start's base info if
+    /// it lacks them (after a clear), which it then has.
+    fn prompt(&mut self, node: &Node) -> Say {
+        let briefs = !self.briefed;
+        self.briefed = true;
+        Say::Prompt { node_id: node.id.clone(), briefs }
     }
 }
+
+/// What a change to a run has the app or hook send Claude. Its text is made at the
+/// edge (see `render`), which looks up the flow's name.
+#[derive(Clone, Debug, PartialEq)]
+enum Say {
+    /// The run's briefing: its rules and Start's base info.
+    Briefing,
+    /// Step `node_id`'s prompt, led by the run's rules and Start's base info if `briefs`.
+    Prompt { node_id: String, briefs: bool },
+    /// The reminder to go on with step `node_id` (see `Resume::Remind`).
+    Remind { node_id: String },
+}
+
+/// A change to a run: its new state, the step it left and the output it left by, to
+/// record (see `left`), and what to send Claude.
+#[derive(Clone, Debug, PartialEq)]
+struct Change {
+    state: RunState,
+    left: Option<(String, String)>,
+    say: Option<Say>,
+}
+
+impl Change {
+    /// A change of state alone.
+    fn to(state: RunState) -> Self {
+        Change { state, left: None, say: None }
+    }
+}
+
+/// How often a run has left each step so far (`flow_run_events`), for `max_runs`.
+#[derive(Default)]
+struct Taken(BTreeMap<String, i64>);
+
+/// For a run that has left no step: one at Start, which it leaves only once.
+const NOTHING_TAKEN: &Taken = &Taken(BTreeMap::new());
+
+/// How often run `run_id` has left each step.
+fn taken(conn: &Connection, run_id: i64) -> Result<Taken, String> {
+    let mut stmt = conn.prepare_cached("SELECT node_id, COUNT(*) FROM flow_run_events WHERE run_id = ?1 GROUP BY node_id").map_err(sql)?;
+    let counts = stmt.query_map([run_id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?;
+    Ok(Taken(counts))
+}
+
+/// Who moves a run on.
+#[derive(Clone, Copy, Debug)]
+enum By {
+    /// The flow itself: Claude's reply, or the start.
+    Flow,
+    /// The person, who is not held back by a step's `max_runs`. (Their picks also
+    /// restart the count toward `MAX_RUN_STEPS`, through the `steps` they pass.)
+    Person,
+}
+
+/// Why a run waits when Claude Code does not report Claude's replies.
+const NO_REPLY: &str = "Claude Code did not report Claude's reply to Mischief of Agents; update Claude Code to run flows.";
+
+/// The step `id` of `graph`.
+fn node_of<'g>(graph: &'g Graph, id: &str) -> Result<&'g Node, String> {
+    graph.nodes.iter().find(|n| n.id == id).ok_or_else(|| format!("the run is at a missing step {id:?}"))
+}
+
+/// Whether Continue is offered for a run in `phase` at a step of `kind`, and how it
+/// goes on (see `resume`): only at a prompt step that needs attention, where Claude
+/// going on can help. A reply that ends with one of the step's outputs moves such a
+/// run on too (see `on_stop`).
+fn continue_offered(phase: &Phase, kind: Kind) -> Option<Resume> {
+    match phase {
+        Phase::NeedsPerson { resume, .. } if kind == Kind::Prompt => *resume,
+        _ => None,
+    }
+}
+
+/// Whether the run waits for the person at a manual prompt (`node`, where it is):
+/// for their prompt, or, once Claude's answer to it was lost, for it again or an
+/// output.
+fn awaits_prompt(state: &RunState, node: &Node) -> bool {
+    node.kind == Kind::ManualPrompt && matches!(state.phase, Phase::Waiting { .. } | Phase::NeedsPerson { .. })
+}
+
+mod transition;
+
+use transition::Cx;
 
 /// An active run as stored.
 struct Stored {
@@ -421,18 +686,10 @@ struct Stored {
 }
 
 impl Stored {
-    /// Fails unless the run is at `step_id`, the step the person saw it at.
-    fn at(&self, step_id: &str) -> Result<(), String> {
-        if self.state.node_id == step_id {
-            return Ok(());
-        }
-        let name = |id: &str| self.graph.nodes.iter().find(|n| n.id == id).map_or(id.to_owned(), |n| n.name().to_owned());
-        Err(format!("the run has moved on from \"{}\" to \"{}\"; pick again for where it is now", name(step_id), name(&self.state.node_id)))
-    }
-
-    fn node(&self) -> Result<&Node, String> {
-        let id = &self.state.node_id;
-        self.graph.nodes.iter().find(|n| &n.id == id).ok_or_else(|| format!("the run is at a missing step {id:?}"))
+    /// What its changes are worked out from (see `transition::Cx`), with a fresh
+    /// paste token, and `taken` for how often it took each step.
+    fn cx<'a>(&'a self, taken: &'a Taken) -> Cx<'a> {
+        Cx { graph: &self.graph, taken, token: new_token() }
     }
 
     /// Saves `state` as the run's; skips the write (and its `updated_at` stamp) when
@@ -443,25 +700,52 @@ impl Stored {
         }
         state.save(conn, self.id)
     }
+
+    /// Makes `change` the run's: records the step it left, saves its new state, and
+    /// returns what to send Claude.
+    fn apply(&self, tx: &Transaction, change: Change) -> Result<Option<StepPrompt>, String> {
+        if let Some((node_id, output)) = &change.left {
+            left(tx, self.id, node_id, output)?;
+        }
+        change.state.save(tx, self.id)?;
+        change.say.map(|say| render(tx, self.id, &self.graph, say)).transpose()
+    }
+}
+
+/// Why an active run could not be loaded.
+#[derive(Debug)]
+enum LoadError {
+    /// The database failed (busy, corrupt, ...): the run itself may be fine.
+    Sql(String),
+    /// The run cannot be read by this version: its state or steps (see
+    /// `RunState::from_columns`), or a step it names that its steps lack.
+    Unreadable(String),
+}
+
+impl From<LoadError> for String {
+    fn from(e: LoadError) -> Self {
+        match e {
+            LoadError::Sql(e) | LoadError::Unreadable(e) => e,
+        }
+    }
 }
 
 /// The active run matching `filter` (`tab_id = ?1` or `id = ?1`).
-fn active_run(conn: &Connection, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, String> {
+fn active_run(conn: &Connection, filter: &str, key: &dyn rusqlite::ToSql) -> Result<Option<Stored>, LoadError> {
     let row = conn
         .query_row(
             &format!("SELECT id, graph, {} FROM flow_runs WHERE {filter} AND status IN {ACTIVE}", RunState::COLUMNS),
             [key],
-            |r| Ok((r.get::<_, i64>("id")?, r.get::<_, String>("graph")?, RunState::from_row(r)?)),
+            |r| {
+                let graph = r.get::<_, String>("graph").map_err(|e| format!("the run's steps cannot be read ({e})"));
+                Ok((r.get::<_, i64>("id")?, graph, RunState::from_row(r)))
+            },
         )
         .optional()
-        .map_err(sql)?;
-    row.map(|(id, graph, state)| Ok(Stored { id, graph: parse_graph(&graph)?, state: state? })).transpose()
-}
-
-/// Makes the run wait at `node_id` for the person (see `RunState::waiting`).
-fn wait_for_person<T>(tx: &Transaction, run: &Stored, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Result<Option<T>, String> {
-    run.state.waiting(node_id, steps, why, resume).save(tx, run.id)?;
-    Ok(None)
+        .map_err(|e| LoadError::Sql(sql(e)))?;
+    let Some((id, graph, state)) = row else { return Ok(None) };
+    let stored = graph.and_then(|graph| Ok(Stored { id, graph: parse_graph(&graph)?, state: state? }));
+    stored.map(Some).map_err(LoadError::Unreadable)
 }
 
 /// Records that the run left `node_id` by `output`.
@@ -474,25 +758,8 @@ fn left(tx: &Transaction, run: i64, node_id: &str, output: &str) -> Result<(), S
     .map_err(sql)
 }
 
-/// Who moves a run on.
-#[derive(Clone, Copy)]
-enum By {
-    /// The flow itself: Claude's reply, or the start.
-    Flow,
-    /// The person, who is not held back by a step's `max_runs`. (Their picks also
-    /// restart the count toward `MAX_RUN_STEPS`, through the `steps` they pass.)
-    Person,
-}
-
-/// How often the run has taken `step` so far, counting a visit it is on now.
-fn runs_of(tx: &Transaction, run: &Stored, step: &str) -> Result<i64, String> {
-    let earlier: i64 = tx
-        .query_row("SELECT COUNT(*) FROM flow_run_events WHERE run_id = ?1 AND node_id = ?2", params![run.id, step], |r| r.get(0))
-        .map_err(sql)?;
-    Ok(earlier + i64::from(run.state.node_id == step))
-}
-
-/// `RunState::owes_closing` in SQL, for `stop`, which works on the row itself.
+/// `RunState::owes_closing` in SQL, for `stop_run` on a run this version cannot read,
+/// which it works out from the row itself.
 const OWES_CLOSING: &str = "briefed = 1 AND clear IS NULL";
 
 /// Drops the note owed to Claude in tab `tab_id` that a flow is finished. Kept as
@@ -508,81 +775,23 @@ fn flow_name(conn: &Connection, run_id: i64) -> Result<String, String> {
         .map_err(sql)
 }
 
-/// The prompt of `node` for the run, led by the run's rules and Start's base info
-/// if Claude lacks them (after a clear), which it then has (in `state`, the run's
-/// state to be).
-fn prompt_for(tx: &Transaction, run: &Stored, state: &mut RunState, node: &Node) -> Result<StepPrompt, String> {
-    let briefs = !state.briefed;
-    let prompt = if briefs { flows::first_prompt_text(&run.graph, &flow_name(tx, run.id)?, node) } else { flows::prompt_text(node) };
-    state.briefed = true;
-    Ok(StepPrompt { step_id: node.id.clone(), prompt, briefs })
+/// The text of `say` for run `run_id`, whose steps are `graph`.
+fn render(conn: &Connection, run_id: i64, graph: &Graph, say: Say) -> Result<StepPrompt, String> {
+    Ok(match say {
+        Say::Briefing => {
+            let start = graph.nodes.iter().find(|n| n.kind == Kind::Start).ok_or("the flow has no Start step")?;
+            StepPrompt { step_id: start.id.clone(), prompt: flows::briefing_text(graph, &flow_name(conn, run_id)?), briefs: true }
+        }
+        Say::Prompt { node_id, briefs } => {
+            let node = node_of(graph, &node_id)?;
+            let prompt = if briefs { flows::first_prompt_text(graph, &flow_name(conn, run_id)?, node) } else { flows::prompt_text(node) };
+            StepPrompt { step_id: node_id, prompt, briefs }
+        }
+        Say::Remind { node_id } => StepPrompt { prompt: flows::resume_text(node_of(graph, &node_id)?), step_id: node_id, briefs: false },
+    })
 }
 
-/// The run's first turn, from Start: its briefing (the run's rules and Start's base
-/// info), the run then waiting at Start for Claude's reply (see `on_stop`); or, for a
-/// flow that leads straight to its end, nothing, the run being done. Returns what to
-/// send Claude.
-fn first_turn(tx: &Transaction, run: &Stored, start: &Node) -> Result<Option<String>, String> {
-    let next = flows::next_step(&run.graph, &start.id, flows::START_OUTPUT);
-    if next.is_none_or(|n| n.kind == Kind::End) {
-        return go(tx, run, start, flows::START_OUTPUT, 0, By::Flow).map(texts);
-    }
-    let briefing = RunState {
-        briefed: true,
-        briefing: true,
-        briefing_at: Some(now()),
-        ..run.state.moved(&start.id, Status::Running, 0, None)
-    };
-    briefing.save(tx, run.id)?;
-    Ok(Some(flows::briefing_text(&run.graph, &flow_name(tx, run.id)?)))
-}
-
-/// Moves the run from `from` along `output` to the step it leads to, if any, with
-/// the run's step count at `steps`; returns the prompt to send when that is a
-/// prompt step (a run that ends sends nothing; see `RunState::finished`). The run instead waits at `from` for the person when going on
-/// would pass `MAX_RUN_STEPS` (into a prompt step) or, for `By::Flow` only, when
-/// the next step has already run its `max_runs`.
-fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by: By) -> Result<Option<StepPrompt>, String> {
-    let next = flows::next_step(&run.graph, &from.id, output);
-    // Going on with `from` would only redo it and stop here again.
-    let wait = |why: String| wait_for_person(tx, run, &from.id, steps, &why, None);
-    if next.is_some_and(|n| n.kind == Kind::Prompt) && steps >= MAX_RUN_STEPS {
-        return wait(format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on."));
-    }
-    if let (Some(next), By::Flow) = (next, by)
-        && let Some(max) = next.max_runs
-        && runs_of(tx, run, &next.id)? >= i64::from(max)
-    {
-        let name = next.name();
-        let times = if max == 1 { "once".to_string() } else { format!("{max} times") };
-        return wait(format!(
-            "\"{name}\" has already run {times}, its limit. Pick \"{output}\" to run it once more, or another output."
-        ));
-    }
-    left(tx, run.id, &from.id, output)?;
-    let (state, prompt) = match next {
-        // The output leads nowhere: the flow is done.
-        None => (run.state.finished(&from.id, steps), None),
-        Some(next) => match next.kind {
-            Kind::Prompt => {
-                let mut state = run.state.moved(&next.id, Status::Running, steps + 1, None);
-                let prompt = prompt_for(tx, run, &mut state, next)?;
-                (state, Some(prompt))
-            }
-            Kind::Pause => (run.state.moved(&next.id, Status::Manual, steps, None), None),
-            Kind::ManualPrompt => {
-                let mut state = run.state.moved(&next.id, Status::Manual, steps, None);
-                owe_prefill(tx, &mut state, &run.graph, next)?;
-                (state, None)
-            }
-            Kind::End | Kind::Start => (run.state.finished(&next.id, steps), None),
-        },
-    };
-    state.save(tx, run.id)?;
-    Ok(prompt)
-}
-
-/// The text of the prompt `go` returned, for where no step id goes along.
+/// The text of the prompt a change returned, for where no step id goes along.
 fn texts(next: Option<StepPrompt>) -> Option<String> {
     next.map(|n| n.prompt)
 }
@@ -610,15 +819,16 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
     drop_closing(&tx, tab_id)?;
     let now = now();
     let clear = flows::clears(&graph);
+    let initial = RunState::initial(&start, clear);
+    // The row's run state is saved whole below; this takes the tab (the one-run index).
     let inserted = tx.execute(
-        "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, steps, clear, briefed, started_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, 0, ?6, ?6)",
+        "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         params![
             flow_id,
             tab_id.as_str(),
             serde_json::to_string(&graph).map_err(|e| e.to_string())?,
-            start.id,
-            clear.then_some("pending"),
+            initial.node_id,
+            initial.phase.status().as_str(),
             now
         ],
     );
@@ -629,15 +839,16 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
         }
         other => other.map_err(sql)?,
     };
-    let run_id = tx.last_insert_rowid();
-    if clear {
-        tx.commit().map_err(sql)?;
-        return Ok(Started { run_id, clear, prompt: None });
-    }
-    let state = RunState::load(&tx, run_id)?.ok_or("the new run is gone")?;
-    let prompt = first_turn(&tx, &Stored { id: run_id, graph, state }, &start)?;
+    let run = Stored { id: tx.last_insert_rowid(), graph, state: initial };
+    let prompt = if clear {
+        run.state.save(&tx, run.id)?;
+        None
+    } else {
+        let change = transition::first_turn(&run.cx(NOTHING_TAKEN), &run.state, &start, now);
+        texts(run.apply(&tx, change)?)
+    };
     tx.commit().map_err(sql)?;
-    Ok(Started { run_id, clear, prompt })
+    Ok(Started { run_id: run.id, clear, prompt })
 }
 
 /// How run `run_id`, which clears at its start, is getting on; once Claude has
@@ -645,35 +856,25 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
 pub fn cleared(conn: &mut Connection, run_id: i64) -> Result<Cleared, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "id = ?1", &run_id)? else { return Ok(Cleared::Gone) };
-    match run.state.clear {
-        None => Ok(Cleared::Gone),
-        Some(Clear::Pending) => Ok(Cleared::Pending),
-        Some(Clear::Done) => {
-            let prompt = first_turn(&tx, &run, run.node()?)?;
+    match run.state.phase {
+        Phase::Clearing { done: false } => Ok(Cleared::Pending),
+        Phase::Clearing { done: true } => {
+            let change = transition::first_turn(&run.cx(NOTHING_TAKEN), &run.state, node_of(&run.graph, &run.state.node_id)?, now());
+            let prompt = texts(run.apply(&tx, change)?);
             tx.commit().map_err(sql)?;
             Ok(Cleared::Ready { prompt })
         }
+        _ => Ok(Cleared::Gone),
     }
 }
-
-/// Whether Continue is offered for a run with `status` at a step of `kind`
-/// (see `resume`): only at a prompt step that needs attention, where Claude
-/// going on can help. A reply that ends with one of the step's outputs moves
-/// such a run on too (see `on_stop`).
-fn continue_offered(status: Status, kind: Kind, resume: Option<Resume>) -> bool {
-    status == Status::Attention && kind == Kind::Prompt && resume.is_some()
-}
-
-/// Why a run waits when Claude Code does not report Claude's replies.
-const NO_REPLY: &str = "Claude Code did not report Claude's reply to Mischief of Agents; update Claude Code to run flows.";
 
 /// Claude in tab `tab_id` ended its turn with `reply` (None when Claude Code did
 /// not report it): moves the tab's run on. Returns the next prompt to send, if
 /// any. A tab with no run is left alone. A run that waits for the person at a
 /// prompt step is left alone too, unless Claude's reply ends with one of the
 /// step's outputs and Continue is offered there (see `continue_offered`); one
-/// that waits at Start or a manual prompt always is. A manual prompt the person
-/// sent goes on by its one output, whatever the reply.
+/// that waits at Start, a pause or a manual prompt always is. A manual prompt the
+/// person sent goes on by its one output, whatever the reply.
 pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Result<Option<String>, String> {
     // Every turn of every tab ends here: most tabs run no flow, so look before
     // taking the write lock.
@@ -690,79 +891,11 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(None) };
-    let state = &run.state;
-    // A turn that ends before the clear (one Claude was in when ▶ was pressed) is
-    // not the reply to any step.
-    if state.clear.is_some() {
-        return Ok(None);
-    }
-    let node = run.node()?.clone();
-    if node.kind == Kind::Start {
-        // Only Claude's reply to the run's briefing ends it (a turn after a clear or a
-        // restart is not one): "Ready" takes the first step. A reply that did more,
-        // as Claude may start on the job, waits for the person to look first.
-        if state.status != Status::Running || !state.briefing {
-            return Ok(None);
-        }
-        let prompt = match reply {
-            None => wait_for_person(&tx, &run, &node.id, 0, NO_REPLY, None)?,
-            Some(reply) if !flows::says_ready(reply) => wait_for_person(
-                &tx,
-                &run,
-                &node.id,
-                0,
-                "Claude did more than reply \"Ready\" to the flow's briefing. Read its reply, then pick an output to go on, or stop the run.",
-                None,
-            )?,
-            Some(_) => go(&tx, &run, &node, flows::START_OUTPUT, 0, By::Flow)?,
-        };
-        tx.commit().map_err(sql)?;
-        return Ok(texts(prompt));
-    }
-    if node.kind == Kind::ManualPrompt {
-        // Running only once the person sent their prompt (see `on_prompt`): this is
-        // Claude's answer to it. Waiting for the person, any turn is left alone.
-        let Some(output) = node.outputs.first().filter(|_| state.status == Status::Running) else {
-            return Ok(None);
-        };
-        // The person stepped in, which restarts the count toward MAX_RUN_STEPS.
-        let prompt = go(&tx, &run, &node, output, 0, By::Flow)?;
-        tx.commit().map_err(sql)?;
-        return Ok(texts(prompt));
-    }
-    if state.status == Status::Attention {
-        // The person may be chatting with Claude while the run waits. Only a reply
-        // that ends with one of the step's outputs moves it on, and only where
-        // Continue is offered: at a step limit only a pick passes the wait. Any other
-        // turn leaves the wait, its note and Continue as they were.
-        let Some(output) = reply
-            .and_then(flows::parse_marker)
-            .filter(|m| continue_offered(state.status, node.kind, state.resume) && m != flows::ATTENTION && node.outputs.contains(m))
-        else {
-            return Ok(None);
-        };
-        let prompt = go(&tx, &run, &node, &output, state.steps, By::Flow)?;
-        tx.commit().map_err(sql)?;
-        return Ok(texts(prompt));
-    }
-    let wait = |why: String| wait_for_person(&tx, &run, &node.id, state.steps, &why, Some(Resume::Remind));
-    let Some(reply) = reply else {
-        // Its next reply would not be reported either.
-        wait_for_person::<()>(&tx, &run, &node.id, state.steps, NO_REPLY, None)?;
-        tx.commit().map_err(sql)?;
-        return Ok(None);
-    };
-    let prompt = match flows::parse_marker(reply) {
-        None => wait("Claude's reply did not end with a FLOW line, so the flow cannot tell how to go on.".into()),
-        Some(m) if m == flows::ATTENTION => wait("Claude asked for a person; see its last reply.".into()),
-        Some(m) if !node.outputs.contains(&m) => wait(format!(
-            "Claude ended with \"FLOW: {m}\", which is not an output of \"{}\".",
-            node.name()
-        )),
-        Some(m) => go(&tx, &run, &node, &m, state.steps, By::Flow),
-    }?;
+    let taken = taken(&tx, run.id)?;
+    let Some(change) = transition::on_stop(&run.cx(&taken), &run.state, reply)? else { return Ok(None) };
+    let next = run.apply(&tx, change)?;
     tx.commit().map_err(sql)?;
-    Ok(texts(prompt))
+    Ok(texts(next))
 }
 
 /// The person picked `output` for `step_id`, the step they saw the run at; returns
@@ -775,43 +908,11 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
 pub fn proceed(conn: &mut Connection, run_id: i64, step_id: &str, output: &str) -> Result<Option<StepPrompt>, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
-    run.at(step_id)?;
-    if run.state.clear.is_some() {
-        return Err("the run is clearing the conversation before its first step; wait for it, or stop the run".into());
-    }
-    if run.state.briefing {
-        // The first step would land behind the briefing, whose reply would be taken for the step's.
-        return Err("Claude is reading the flow's briefing; wait for its reply, or stop the run".into());
-    }
-    let node = run.node()?.clone();
-    if !node.outputs.iter().any(|o| o == output) {
-        return Err(format!("\"{}\" has no output {output:?}", node.name()));
-    }
-    let next = go(&tx, &run, &node, output, 0, By::Person)?;
+    // The person is not held back by `max_runs`, so how often each step ran does not count.
+    let change = transition::proceed(&run.cx(NOTHING_TAKEN), &run.state, step_id, output)?;
+    let next = run.apply(&tx, change)?;
     tx.commit().map_err(sql)?;
     Ok(next)
-}
-
-/// Has the app put the manual prompt `node`'s text into Claude's input (see
-/// `prefill_text`), if there is any: Start's base info unless Claude has it
-/// (`briefed`), then the step's draft. Each time with a new token, so the record of
-/// an earlier paste cannot cancel it (see `prefilled`).
-fn owe_prefill(conn: &Connection, state: &mut RunState, graph: &Graph, node: &Node) -> Result<(), String> {
-    if flows::prefill_text(graph, node, !state.briefed).is_empty() {
-        return Ok(());
-    }
-    // Kept within what JavaScript numbers hold exactly.
-    let token = conn.query_row("SELECT abs(random() % 9007199254740991)", [], |r| r.get(0)).map_err(sql)?;
-    state.prefill = true;
-    state.prefill_token = Some(token);
-    Ok(())
-}
-
-/// Whether the run waits for the person at a manual prompt (`node`, where it is):
-/// for their prompt, or, once Claude's answer to it was lost, for it again or an
-/// output.
-fn awaits_prompt(state: &RunState, node: &Node) -> bool {
-    node.kind == Kind::ManualPrompt && matches!(state.status, Status::Manual | Status::Attention)
 }
 
 /// What the app puts into Claude's input for a manual prompt (see `prefill_text`).
@@ -830,10 +931,14 @@ pub struct Prefill {
 pub fn prefill_text(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Option<Prefill>, String> {
     let Some(run) = active_run(conn, "id = ?1", &run_id)? else { return Ok(None) };
     let state = &run.state;
-    if state.node_id != step_id || !state.prefill || !awaits_prompt(state, run.node()?) {
+    if state.node_id != step_id || !state.phase.prefill() {
         return Ok(None);
     }
-    let text = flows::prefill_text(&run.graph, run.node()?, !state.briefed);
+    let node = node_of(&run.graph, &state.node_id)?;
+    if !awaits_prompt(state, node) {
+        return Ok(None);
+    }
+    let text = flows::prefill_text(&run.graph, node, !state.briefed);
     Ok(Some(Prefill { text, token: state.prefill_token.unwrap_or(0) }).filter(|p| !p.text.is_empty()))
 }
 
@@ -842,11 +947,9 @@ pub fn prefill_text(conn: &mut Connection, run_id: i64, step_id: &str) -> Result
 /// the base info only once the person sends it (see `on_prompt`).
 pub fn prefilled(conn: &mut Connection, run_id: i64, step_id: &str, token: i64) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-    let Some(state) = RunState::load_active(&tx, run_id)? else { return Ok(()) };
-    if state.node_id != step_id || state.prefill_token != Some(token) {
-        return Ok(());
-    }
-    RunState { prefill: false, ..state }.save(&tx, run_id)?;
+    let Some(state) = RunState::load_active(&tx, run_id)?.transpose()? else { return Ok(()) };
+    let Some(state) = transition::prefilled(&state, step_id, token) else { return Ok(()) };
+    state.save(&tx, run_id)?;
     tx.commit().map_err(sql)
 }
 
@@ -882,13 +985,10 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
         .optional()
         .map_err(sql)?;
     let closing = finished.map(|run| flow_name(&tx, run)).transpose()?.map(|name| flows::closing_text(&name));
-    if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
-        let node = run.node()?;
-        if awaits_prompt(&run.state, node) {
-            // The prompt may carry Start's base info, but never the run's rules: after a
-            // clear, the next prompt step still briefs Claude again.
-            run.state.moved(&node.id, Status::Running, run.state.steps, None).save(&tx, run.id)?;
-        }
+    if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())?
+        && let Some(state) = transition::prompt_sent(&run.cx(NOTHING_TAKEN), &run.state)?
+    {
+        state.save(&tx, run.id)?;
     }
     tx.commit().map_err(sql)?;
     Ok(closing)
@@ -898,38 +998,41 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
 /// a run waiting at a manual prompt would never see Claude's answer, so it waits
 /// for the person, saying `why`, rather than for a prompt already sent. Its paste,
 /// if still owed, stays owed.
-pub fn prompt_unseen(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+fn prompt_unseen(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(()) };
-    if run.state.status != Status::Manual || run.node()?.kind != Kind::ManualPrompt {
-        return Ok(());
-    }
-    run.state.waiting_here(why, None).save(&tx, run.id)?;
+    let Some(state) = transition::prompt_unseen(&run.cx(NOTHING_TAKEN), &run.state, why)? else { return Ok(()) };
+    state.save(&tx, run.id)?;
     tx.commit().map_err(sql)
 }
 
-/// Claude's answer to the person's manual prompt `run` runs (its state being
-/// `state`) will not be seen (`why`: the conversation was cleared, misag
-/// restarted): the run waits for the prompt again, or an output. Continue has no
-/// step prompt to remind Claude of. None unless `state` is running (no clear
-/// pending) a manual prompt.
-fn answer_lost(run: &Stored, state: &RunState, why: &str) -> Result<Option<RunState>, String> {
-    if state.status != Status::Running || state.clear.is_some() || run.node()?.kind != Kind::ManualPrompt {
-        return Ok(None);
-    }
-    let note = format!("{why} Claude's answer to your prompt will not be seen: send your prompt again, or pick an output to go on.");
-    Ok(Some(state.waiting_here(&note, None)))
+/// A hook of misag's that reports to the tab's run (see `hook_failed`).
+#[derive(Clone, Copy, Debug)]
+pub enum Hook {
+    /// The Stop hook, which moves the run on (see `on_stop`).
+    Stop,
+    /// The UserPromptSubmit hook, which tells it of the person's prompt (see `on_prompt`).
+    Prompt,
 }
 
-/// `state` for `run`, owing the app a fill of Claude's input again if the run waits
-/// at a manual prompt, as that input was lost (a clear, a restart): with the base
-/// info, if Claude lacks it now. Otherwise `state` as it is.
-fn refill(conn: &Connection, run: &Stored, mut state: RunState) -> Result<RunState, String> {
-    let node = run.node()?;
-    if awaits_prompt(&state, node) {
-        owe_prefill(conn, &mut state, &run.graph, node)?;
+/// `hook` in tab `tab_id` failed with `error`, so the tab's run would wait for what
+/// it will never see: after the Stop hook, a running step waits for the person (see
+/// `pause_tab`); after the UserPromptSubmit hook, so does a manual prompt waiting
+/// for the person's prompt (see `prompt_unseen`). Best effort: returns `error`,
+/// with why the run could not be marked if it could not.
+pub fn hook_failed(conn: &mut Connection, tab_id: &TabId, hook: Hook, error: String) -> String {
+    let marked = match hook {
+        Hook::Stop => pause_tab(conn, tab_id, &format!("The Stop hook could not move the run on ({error}). Pick an output to go on.")),
+        Hook::Prompt => prompt_unseen(
+            conn,
+            tab_id,
+            &format!("misag could not record your prompt ({error}), so Claude's answer will not move the run on. Pick an output to go on."),
+        ),
+    };
+    match marked {
+        Ok(()) => error,
+        Err(also) => format!("{error}; and could not mark the run: {also}"),
     }
-    Ok(state)
 }
 
 /// The person has seen to a prompt step that needs attention (answered Claude, or
@@ -941,28 +1044,18 @@ fn refill(conn: &Connection, run: &Stored, mut state: RunState) -> Result<RunSta
 pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<StepPrompt, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let run = active_run(&tx, "id = ?1", &run_id)?.ok_or_else(|| format!("there is no active run {run_id}"))?;
-    run.at(step_id)?;
-    let node = run.node()?;
-    if run.state.status != Status::Attention || node.kind != Kind::Prompt {
-        return Err(format!("\"{}\" does not need attention; pick an output instead", node.name()));
-    }
-    let Some(how) = run.state.resume.filter(|_| continue_offered(run.state.status, node.kind, run.state.resume)) else {
-        return Err(format!("Claude going on with \"{}\" would not help; pick an output instead", node.name()));
-    };
+    let change = transition::resume(&run.cx(NOTHING_TAKEN), &run.state, step_id)?;
     // Logged with why it waited, which going on clears.
+    let why = match &run.state.phase {
+        Phase::NeedsPerson { why, .. } => Some(why),
+        _ => None,
+    };
     tx.execute(
         "INSERT INTO flow_run_resumes (run_id, node_id, note, at) VALUES (?1, ?2, ?3, ?4)",
-        params![run.id, node.id, run.state.note, now()],
+        params![run.id, run.state.node_id, why, now()],
     )
     .map_err(sql)?;
-    let mut state = run.state.moved(&node.id, Status::Running, run.state.steps, None);
-    let next = match how {
-        Resume::Remind => StepPrompt { step_id: node.id.clone(), prompt: flows::resume_text(node), briefs: false },
-        // With the rules and base info, if Claude lacks them (after a clear, or an
-        // unsent prompt that carried them).
-        Resume::Prompt => prompt_for(&tx, &run, &mut state, node)?,
-    };
-    state.save(&tx, run.id)?;
+    let next = run.apply(&tx, change)?.ok_or("going on sends Claude nothing")?;
     tx.commit().map_err(sql)?;
     Ok(next)
 }
@@ -977,11 +1070,8 @@ pub fn resume(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<StepP
 pub fn unsent(conn: &mut Connection, run_id: i64, step_id: &str, briefs: bool, why: &str) -> Result<bool, String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "id = ?1", &run_id)? else { return Ok(false) };
-    if run.state.node_id != step_id || run.state.status != Status::Running {
-        return Ok(false);
-    }
-    let waiting = run.state.waiting(step_id, run.state.steps, why, Some(Resume::Prompt));
-    RunState { briefed: waiting.briefed && !briefs, ..waiting }.save(&tx, run.id)?;
+    let Some(state) = transition::unsent(&run.state, step_id, briefs, why) else { return Ok(false) };
+    state.save(&tx, run.id)?;
     tx.commit().map_err(sql)?;
     Ok(true)
 }
@@ -995,13 +1085,7 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     drop_closing(&tx, tab_id)?;
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
-        let lost = RunState { briefed: false, ..run.state.clone() };
-        let state = if lost.status == Status::Running && lost.clear == Some(Clear::Pending) {
-            RunState { clear: Some(Clear::Done), ..lost }
-        } else {
-            pause(&run, lost, why)?
-        };
-        run.save(&tx, &refill(&tx, &run, state)?)?;
+        run.save(&tx, &transition::cleared_tab(&run.cx(NOTHING_TAKEN), &run.state, why)?)?;
     }
     tx.commit().map_err(sql)
 }
@@ -1009,51 +1093,69 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
 /// Makes the tab's running run wait for the person, saying why: Claude will not
 /// reply to its step (the conversation was cleared, or the hook failed), so
 /// Continue sends the step's prompt again, except while the run reads its briefing,
-/// where the person picks an output. A run still at Start waiting for its clear has
-/// no step to reply to, and is left alone.
-pub fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
+/// where the person picks an output, and while it runs a manual prompt, where the
+/// person sends their prompt again or picks one (see `transition::answer_lost`). A
+/// run still at Start waiting for its clear has no step to reply to, and is left
+/// alone.
+fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
-        run.save(&tx, &pause(&run, run.state.clone(), why)?)?;
+        run.save(&tx, &transition::pause(&run.cx(NOTHING_TAKEN), run.state.clone(), why)?)?;
     }
     tx.commit().map_err(sql)
 }
 
-/// `state` for `run` once Claude will not reply to its running step (see
-/// `pause_tab`); unchanged unless it runs a step Claude was to reply to (see
-/// `answer_lost` for a manual prompt).
-fn pause(run: &Stored, state: RunState, why: &str) -> Result<RunState, String> {
-    if let Some(lost) = answer_lost(run, &state, why)? {
-        return Ok(lost);
+/// Stops active run `run_id` (see `stop`), in the caller's transaction; false if
+/// there is no such run. A run this version can read is saved stopped
+/// (`RunState::stopped`). One it cannot read (a resume or clear state from a newer
+/// version, which `RunState::from_columns` refuses) must still stop, so it is one
+/// raw UPDATE of the status, which works out what it owes Claude from the row
+/// (`OWES_CLOSING`) as a best guess, and leaves the rest as it was.
+fn stop_run(conn: &Connection, run_id: i64, tab_open: bool) -> Result<bool, String> {
+    match RunState::load_active(conn, run_id)? {
+        None => Ok(false),
+        Some(Ok(state)) => {
+            let mut stopped = state.stopped();
+            // A tab that is gone sends no next prompt to carry the note.
+            if !tab_open {
+                stopped.phase = Phase::Ended { stopped: true, owes_closing: false };
+            }
+            stopped.save(conn, run_id).map(|()| true)
+        }
+        Some(Err(why)) => {
+            eprintln!("misag: run {run_id} is stopped by its row alone, as {why}");
+            conn.execute(
+                &format!("UPDATE flow_runs SET status = 'stopped', closing = ?3 AND ({OWES_CLOSING}), updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
+                params![run_id, now(), tab_open],
+            )
+            .map_err(sql)?;
+            Ok(true)
+        }
     }
-    if state.status != Status::Running || state.clear.is_some() {
-        return Ok(state);
-    }
-    Ok(if state.briefing { state.briefing_lost(why) } else { state.waiting_here(why, Some(Resume::Prompt)) })
 }
 
-/// Stops the active run of tab `tab_id`, if it has one, owing Claude nothing, as
-/// the tab is gone. Stopping stays one UPDATE of the status rather than a
-/// `RunState` save: it must work on a run this version cannot read (its steps, or
-/// a resume or clear state from a newer version), which `RunState::load` refuses.
+/// Stops the active run of tab `tab_id`, which is gone, if it has one: as `stop` does,
+/// but owing Claude no closing note, as no prompt of that tab will carry it; in the
+/// caller's transaction.
 fn stop_in(conn: &Connection, tab_id: &str) -> Result<(), String> {
-    conn.execute(
-        &format!("UPDATE flow_runs SET status = 'stopped', updated_at = ?2 WHERE tab_id = ?1 AND status IN {ACTIVE}"),
-        params![tab_id, now()],
-    )
-    .map(drop)
-    .map_err(sql)
+    let run: Option<i64> = conn
+        .query_row(&format!("SELECT id FROM flow_runs WHERE tab_id = ?1 AND status IN {ACTIVE}"), [tab_id], |r| r.get(0))
+        .optional()
+        .map_err(sql)?;
+    run.map_or(Ok(()), |run| stop_run(conn, run, false).map(drop))
 }
 
 /// Stops the tab's active run, if it has one: the tab is closing.
 pub fn stop_tab(conn: &Connection, tab_id: &TabId) -> Result<(), String> {
-    stop_in(conn, tab_id.as_str())
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(sql)?;
+    stop_in(&tx, tab_id.as_str())?;
+    tx.commit().map_err(sql)
 }
 
 /// At startup: stops the runs of tabs that are no longer open, and makes running
 /// ones wait, as their Claude was stopped with misag and will not reply. A run this
 /// version cannot read is logged and left for the person to stop (see `active`),
-/// without holding up the others.
+/// without holding up the others; a database error fails the whole restart.
 pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     // One per tab (see `ACTIVE`).
@@ -1066,53 +1168,35 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
             stop_in(&tx, &tab)?;
             continue;
         }
-        let restarted = active_run(&tx, "id = ?1", &id)
-            .and_then(|run| run.map(|run| Ok::<_, String>((restarted(&tx, &run)?, run))).transpose());
-        match restarted {
-            Ok(Some((state, run))) => run.save(&tx, &state)?,
-            Ok(None) => {}
-            Err(e) => eprintln!("misag: run {id} was left as it was after the restart, as {e}"),
+        let left = |e: String| eprintln!("misag: run {id} was left as it was after the restart, as {e}");
+        let run = match active_run(&tx, "id = ?1", &id) {
+            Ok(Some(run)) => run,
+            Ok(None) => continue,
+            Err(LoadError::Unreadable(e)) => {
+                left(e);
+                continue;
+            }
+            Err(LoadError::Sql(e)) => return Err(e),
+        };
+        // An error here is a step its steps lack: the run cannot be read either.
+        match transition::restarted(&run.cx(NOTHING_TAKEN), &run.state) {
+            Ok(state) => run.save(&tx, &state)?,
+            Err(e) => left(e),
         }
     }
     tx.commit().map_err(sql)
 }
 
-/// `run`'s state once misag has restarted (see `after_restart`).
-fn restarted(conn: &Connection, run: &Stored) -> Result<RunState, String> {
-    let state = &run.state;
-    let state = if state.status != Status::Running {
-        state.clone()
-    } else if state.clear.is_some() {
-        // The app that would have sent the briefing after the clear is gone.
-        state.clear_lost("Mischief of Agents was restarted before the conversation was cleared. Pick an output to go on without clearing, or stop the run and press ▶ again.")
-    } else if let Some(lost) = answer_lost(run, state, "Mischief of Agents was restarted while Claude answered your prompt.")? {
-        lost
-    } else if state.briefing {
-        state.briefing_lost("Mischief of Agents was restarted while Claude read the flow's briefing. Pick an output to go on; the first step briefs Claude again.")
-    } else {
-        // Claude comes back in its conversation, so it can be reminded.
-        state.waiting_here(
-            "Mischief of Agents was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.",
-            Some(Resume::Remind),
-        )
-    };
-    refill(conn, run, state)
-}
-
 /// Stops run `run_id`; Claude is then told the flow is finished with the person's
-/// next prompt (see `RunState::owes_closing`). A run whose steps cannot be read can
-/// still be stopped, so this stays one UPDATE, as `stop_in` does.
+/// next prompt (see `RunState::owes_closing`). A run this version cannot read can
+/// still be stopped, by one UPDATE whose `closing` is then a best guess from the
+/// row (see `stop_run`); why it could not be read is logged.
 pub fn stop(conn: &Connection, run_id: i64) -> Result<(), String> {
-    let changed = conn
-        .execute(
-            &format!("UPDATE flow_runs SET status = 'stopped', closing = ({OWES_CLOSING}), updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
-            params![run_id, now()],
-        )
-        .map_err(sql)?;
-    if changed != 1 {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(sql)?;
+    if !stop_run(&tx, run_id, true)? {
         return Err(format!("there is no active run {run_id}"));
     }
-    Ok(())
+    tx.commit().map_err(sql)
 }
 
 /// How many of `graph`'s steps (all but Start and End, and steps Start cannot
@@ -1139,67 +1223,54 @@ fn progress(conn: &Connection, run: i64, graph: &Graph) -> Result<(i64, i64), St
 /// Makes the runs that have timed out at Start wait for the person: one still
 /// waiting for its clear `CLEAR_TIMEOUT_SECS` after it began (the app no longer
 /// sees it through), as after a restart; and one whose briefing has had no reply
-/// `BRIEFING_TIMEOUT_SECS` after it was sent. The app calls this before each look
-/// at the runs (see `flow_runs`), so a run waits for you a few seconds after its
-/// time is up. Takes the write lock only when a run it can read has timed out. A
-/// run whose state this version cannot read is logged once and left to be stopped.
+/// `BRIEFING_TIMEOUT_SECS` after it was sent (see `transition::timed_out`). The app
+/// calls this before each look at the runs (see `commands::flow_runs`), so a run waits for
+/// you a few seconds after its time is up. Takes the write lock only when a run it
+/// can read has timed out. A running run whose state this version cannot read is
+/// logged once and left to be stopped.
 pub fn expire(conn: &mut Connection) -> Result<(), String> {
+    let now = now();
     // Look before taking the write lock.
-    let timed_out = expired(conn)?;
-    if !timed_out.into_iter().any(|(id, _, state)| readable(id, state).is_some()) {
+    if timed_out(conn, now)?.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-    for (id, clear_expired, state) in expired(&tx)? {
-        let Some(state) = readable(id, state) else { continue };
-        let state = if clear_expired {
-            // The 30 seconds are the app's own timeout, which the person sees, not the
-            // longer `CLEAR_TIMEOUT_SECS`.
-            state.clear_lost("Claude did not clear the conversation within 30 seconds. Pick an output to go on without clearing, or stop the run and press ▶ again.")
-        } else {
-            state.briefing_lost(&format!(
-                "Claude did not reply to the flow's briefing within {} minutes (it may have been interrupted). Pick an output to go on; the first step briefs Claude again.",
-                BRIEFING_TIMEOUT_SECS / 60
-            ))
-        };
+    for (id, state) in timed_out(&tx, now)? {
         state.save(&tx, id)?;
     }
     tx.commit().map_err(sql)
 }
 
-/// A run that has timed out at Start: its id, whether its clear (rather than its
-/// briefing) timed out, and its state, if this version can read it.
-type Expired = (i64, bool, Result<RunState, String>);
-
-/// The runs that have timed out at Start (see `expire`).
-fn expired(conn: &Connection) -> Result<Vec<Expired>, String> {
-    const CLEAR_EXPIRED: &str = "status = 'running' AND clear IS NOT NULL AND started_at <= ?1 - ?2";
-    const BRIEFING_EXPIRED: &str = "status = 'running' AND briefing = 1 AND briefing_at <= ?1 - ?3";
+/// The runs that have timed out at Start at `now`, with the state each goes to
+/// (see `expire`). Only a running run can.
+fn timed_out(conn: &Connection, now: i64) -> Result<Vec<(i64, RunState)>, String> {
     let mut stmt = conn
-        .prepare(&format!(
-            "SELECT id, ({CLEAR_EXPIRED}) AS clear_expired, {} FROM flow_runs WHERE ({CLEAR_EXPIRED}) OR ({BRIEFING_EXPIRED})",
-            RunState::COLUMNS
-        ))
+        .prepare_cached(&format!("SELECT id, started_at, {} FROM flow_runs WHERE status = 'running'", RunState::COLUMNS))
         .map_err(sql)?;
-    stmt.query_map(params![now(), CLEAR_TIMEOUT_SECS, BRIEFING_TIMEOUT_SECS], |r| {
-        Ok((r.get("id")?, r.get("clear_expired")?, RunState::from_row(r)?))
-    })
-    .map_err(sql)?
-    .collect::<Result<_, _>>()
-    .map_err(sql)
+    let runs = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>("id")?, r.get::<_, i64>("started_at")?, RunState::from_row(r))))
+        .map_err(sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql)?;
+    Ok(runs
+        .into_iter()
+        .filter_map(|(id, started_at, state)| readable(id, state).and_then(|s| transition::timed_out(&s, started_at, now)).map(|s| (id, s)))
+        .collect())
 }
 
-/// The state of timed-out run `id`, or None, logged once per process (`expire` runs
-/// on every look at the runs), if this version cannot read it.
+/// The state of running run `id`, or None, logged once (see `log_once`), if this
+/// version cannot read it.
 fn readable(id: i64, state: Result<RunState, String>) -> Option<RunState> {
-    static LOGGED: Mutex<BTreeSet<i64>> = Mutex::new(BTreeSet::new());
-    state
-        .inspect_err(|e| {
-            if LOGGED.lock().unwrap_or_else(PoisonError::into_inner).insert(id) {
-                eprintln!("misag: run {id} has timed out at Start, but {e}");
-            }
-        })
-        .ok()
+    state.inspect_err(|e| log_once("unreadable", id, || format!("run {id} cannot be read, so its timeouts are skipped: {e}"))).ok()
+}
+
+/// Logs `message` about run `id` once per process for each `what`: the runs are
+/// looked at on every poll (`expire`, `active`), which would repeat it.
+fn log_once(what: &'static str, id: i64, message: impl FnOnce() -> String) {
+    static LOGGED: Mutex<BTreeSet<(&str, i64)>> = Mutex::new(BTreeSet::new());
+    if LOGGED.lock().unwrap_or_else(PoisonError::into_inner).insert((what, id)) {
+        eprintln!("misag: {}", message());
+    }
 }
 
 /// Every active run, oldest first. Writes nothing: timeouts are `expire`'s, so
@@ -1207,40 +1278,37 @@ fn readable(id: i64, state: Result<RunState, String>) -> Option<RunState> {
 pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume, r.clear, r.prefill, r.briefing
-             FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE r.status IN {ACTIVE} ORDER BY r.id"
+            "SELECT r.id AS id, r.flow_id AS flow_id, f.name AS flow_name, r.tab_id AS tab_id, r.graph AS graph, {}
+             FROM flow_runs r JOIN flows f ON f.id = r.flow_id WHERE r.status IN {ACTIVE} ORDER BY r.id",
+            RunState::COLUMNS
         ))
         .map_err(sql)?;
-    type Row = (i64, i64, String, String, String, String, String, Option<String>, i64, Option<String>, Option<String>, bool, bool);
+    type Row = (i64, i64, String, String, Result<String, String>, String, String, Result<RunState, String>);
     let rows = stmt
         .query_map([], |r| {
             Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-                r.get(11)?,
-                r.get(12)?,
+                r.get("id")?,
+                r.get("flow_id")?,
+                r.get("flow_name")?,
+                r.get("tab_id")?,
+                r.get("graph").map_err(|e| format!("the run's steps cannot be read ({e})")),
+                // Of the wrong type, it is only shown blank: the state's error says why.
+                r.get("node_id").unwrap_or_default(),
+                r.get("status")?,
+                RunState::from_row(r),
             ))
         })
         .map_err(sql)?
         .collect::<Result<Vec<Row>, _>>()
         .map_err(sql)?;
     rows.into_iter()
-        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, note, steps, resume, clear, prefill, briefing)| {
+        .map(|(id, flow_id, flow_name, tab_id, graph, step_id, status, state)| {
             // A run that cannot be read is still listed, saying why, so it can be stopped.
-            let graph = parse_graph(&graph);
+            let graph = graph.and_then(|graph| parse_graph(&graph));
             // Only shown, so a failure to count leaves the run listed, and stoppable.
             let (done, total) = match &graph {
                 Ok(graph) => progress(conn, id, graph).unwrap_or_else(|e| {
-                    eprintln!("misag: could not count the steps run {id} has done: {e}");
+                    log_once("progress", id, || format!("could not count the steps run {id} has done: {e}"));
                     (0, 0)
                 }),
                 Err(_) => (0, 0),
@@ -1249,20 +1317,24 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
                 let node = graph.nodes.into_iter().find(|n| n.id == step_id);
                 node.ok_or_else(|| format!("the run is at a missing step {step_id:?}"))
             });
+            // Only active statuses are selected, so this one is known.
             let status = Status::parse(&status)?;
-            let states = Resume::parse(resume).and_then(|resume| Ok((resume, Clear::parse(clear)?)));
-            let (step, outputs, note, resumable, step_kind) = match node.and_then(|node| states.map(|states| (node, states))) {
-                Ok((node, (resume, clear))) => {
-                    let resumable = continue_offered(status, node.kind, resume);
-                    if clear.is_some() || briefing {
+            let (step, outputs, note, resumable, step_kind, prefill, briefing, steps) = match node.and_then(|node| state.map(|state| (node, state))) {
+                Ok((node, state)) => {
+                    let resumable = continue_offered(&state.phase, node.kind).is_some();
+                    let (prefill, steps) = (state.phase.prefill(), state.steps);
+                    match state.phase {
                         // Nothing to pick until the first step is taken (see `proceed`).
-                        let note = clear.is_some().then(|| "Clearing the conversation before the first step.".to_owned());
-                        (node.name().to_owned(), Vec::new(), note, false, Some(node.kind))
-                    } else {
-                        (node.name().to_owned(), node.outputs, note, resumable, Some(node.kind))
+                        Phase::Clearing { .. } => {
+                            let note = Some("Clearing the conversation before the first step.".to_owned());
+                            (node.name().to_owned(), Vec::new(), note, false, Some(node.kind), prefill, false, steps)
+                        }
+                        Phase::Briefing { .. } => (node.name().to_owned(), Vec::new(), None, false, Some(node.kind), prefill, true, steps),
+                        Phase::NeedsPerson { why, .. } => (node.name().to_owned(), node.outputs, Some(why), resumable, Some(node.kind), prefill, false, steps),
+                        _ => (node.name().to_owned(), node.outputs, None, resumable, Some(node.kind), prefill, false, steps),
                     }
                 }
-                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false, None),
+                Err(e) => (step_id.clone(), Vec::new(), Some(format!("This run cannot be read: {e}. Stop it.")), false, None, false, false, 0),
             };
             Ok(Run { id, flow_id, flow_name, tab_id, step, outputs, step_id, status, note, steps, done, total, resumable, prefill, step_kind, briefing })
         })
@@ -1290,14 +1362,14 @@ mod tests {
         (db, db::connect_existing(&path).unwrap(), id)
     }
 
-    fn graph(nodes: Vec<Node>, edges: Vec<Edge>) -> Graph {
+    pub(super) fn graph(nodes: Vec<Node>, edges: Vec<Edge>) -> Graph {
         let mut all = vec![node("start", Kind::Start, &["next"])];
         all.extend(nodes);
         Graph { version: 1, nodes: all, edges }
     }
 
     /// Start → a pause → a prompt.
-    fn manual_first() -> Graph {
+    pub(super) fn manual_first() -> Graph {
         graph(
             vec![node("m", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
             vec![edge("start", "next", "m"), edge("m", "ok", "p")],
@@ -1572,7 +1644,7 @@ mod tests {
         };
         let before = row(&conn);
         expire(&mut conn).unwrap();
-        assert_eq!(state(&conn, readable).status, Status::Attention);
+        assert_eq!(state(&conn, readable).phase.status(), Status::Attention);
         assert_eq!(row(&conn), before);
         // With only the unreadable run timed out, the poll does not wait for the write lock.
         let writer = db::connect_existing(&path).unwrap();
@@ -1898,7 +1970,7 @@ mod tests {
     }
 
     /// Start (with base info) → a manual prompt with a draft → a prompt.
-    fn manual_prompt_first(draft: &str) -> Graph {
+    pub(super) fn manual_prompt_first(draft: &str) -> Graph {
         let mut mp = node("mp", Kind::ManualPrompt, &["sent"]);
         mp.text = draft.into();
         briefing(
@@ -2055,10 +2127,11 @@ mod tests {
         stop(&conn, run).unwrap();
         // Even one whose state this version cannot read (as a newer version might store it).
         conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
-        conn.execute("UPDATE flow_runs SET resume = 'someday' WHERE id = ?1", [run]).unwrap();
+        conn.execute("UPDATE flow_runs SET resume = 'someday', prefill = 1 WHERE id = ?1", [run]).unwrap();
+        let row = |conn: &Connection| (column::<bool>(conn, run, "prefill"), column::<i64>(conn, run, "updated_at"));
+        let before = row(&conn);
         prefilled(&mut conn, run, "mp", token).unwrap();
-        let prefill: bool = conn.query_row("SELECT prefill FROM flow_runs WHERE id = ?1", [run], |r| r.get(0)).unwrap();
-        assert!(prefill);
+        assert_eq!(row(&conn), before);
     }
 
     #[test]
@@ -2461,7 +2534,7 @@ mod tests {
     }
 
     /// Start → Review, whose issues go to Fix and back, at most twice; clean ends.
-    fn review_loop() -> Graph {
+    pub(super) fn review_loop() -> Graph {
         let mut review = node("review", Kind::Prompt, &["clean", "issues"]);
         review.max_runs = Some(2);
         graph(
@@ -2714,49 +2787,111 @@ mod tests {
         RunState::load(conn, run).unwrap().unwrap()
     }
 
+
+    /// Run `run`'s column `name`, as stored.
+    fn column<T: rusqlite::types::FromSql>(conn: &Connection, run: i64, name: &str) -> T {
+        conn.query_row(&format!("SELECT {name} FROM flow_runs WHERE id = ?1"), [run], |r| r.get(0)).unwrap()
+    }
+
+    /// A run at `node_id` in `phase`, having taken 3 steps, whose Claude has the rules.
+    pub(super) fn at_step(node_id: &str, phase: Phase) -> RunState {
+        RunState { node_id: node_id.into(), steps: 3, briefed: true, prefill_token: None, phase }
+    }
+
+    pub(super) fn needs(why: &str, resume: Option<Resume>, prefill: bool) -> Phase {
+        Phase::NeedsPerson { why: why.into(), resume, prefill }
+    }
+
+    /// Every phase, each in a way that shows its data.
+    fn phases() -> Vec<Phase> {
+        vec![
+            Phase::Clearing { done: false },
+            Phase::Clearing { done: true },
+            Phase::Briefing { sent_at: 1234 },
+            Phase::Working,
+            Phase::Waiting { prefill: false },
+            Phase::Waiting { prefill: true },
+            needs("why", Some(Resume::Prompt), true),
+            needs("why", Some(Resume::Remind), false),
+            needs("why", None, false),
+            Phase::Ended { stopped: true, owes_closing: true },
+            Phase::Ended { stopped: false, owes_closing: false },
+        ]
+    }
+
     #[test]
     fn a_run_s_state_is_saved_and_loaded_whole() {
         let (_db, mut conn, flow) = setup("runs-state-round-trip", &manual_first());
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
-        let set = RunState {
-            node_id: "m".into(),
-            status: Status::Attention,
-            steps: 7,
-            note: Some("why".into()),
-            resume: Some(Resume::Prompt),
-            clear: Some(Clear::Done),
-            briefed: false,
-            prefill: true,
-            prefill_token: Some(42),
-            briefing: true,
-            briefing_at: Some(1234),
-            closing: true,
-        };
-        set.save(&conn, run).unwrap();
-        assert_eq!(state(&conn, run), set);
-        let other = RunState {
-            node_id: "p".into(),
-            status: Status::Done,
-            steps: 0,
-            note: None,
-            resume: Some(Resume::Remind),
-            clear: Some(Clear::Pending),
-            briefed: true,
-            prefill: false,
-            prefill_token: None,
-            briefing: false,
-            briefing_at: None,
-            closing: false,
-        };
-        other.save(&conn, run).unwrap();
-        assert_eq!(state(&conn, run), other);
-        let unset = RunState { status: Status::Stopped, resume: None, clear: None, ..other };
-        unset.save(&conn, run).unwrap();
-        assert_eq!(state(&conn, run), unset);
+        for (i, phase) in phases().into_iter().enumerate() {
+            let set = RunState { node_id: "m".into(), steps: 7, briefed: i % 2 == 0, prefill_token: (i % 3 == 0).then_some(42), phase };
+            set.save(&conn, run).unwrap();
+            assert_eq!(state(&conn, run), set);
+        }
         assert_eq!(RunState::load(&conn, run + 1).unwrap(), None);
         // Saving a run that is not there is an error naming it.
-        let missing = set.save(&conn, run + 1).unwrap_err();
+        let missing = state(&conn, run).save(&conn, run + 1).unwrap_err();
         assert!(missing.contains(&format!("run {}", run + 1)), "{missing}");
+    }
+
+    /// Columns as a running run with nothing else to it stores them.
+    fn working_columns() -> Columns {
+        at_step("p", Phase::Working).columns()
+    }
+
+    #[test]
+    fn columns_the_status_leaves_no_room_for_are_refused_and_named() {
+        let running = working_columns();
+        let manual = Columns { status: "manual".into(), ..working_columns() };
+        let attention = Columns { status: "attention".into(), note: Some("why".into()), ..working_columns() };
+        let cases = [
+            (Columns { note: Some("stale".into()), ..running.clone() }, "running with a note"),
+            (Columns { resume: Some("remind".into()), ..running.clone() }, "running with a way to continue"),
+            (Columns { prefill: true, ..running.clone() }, "running with a paste owed"),
+            (Columns { clear: Some("pending".into()), briefing: true, briefing_at: Some(1), ..running.clone() }, "both a clear and a briefing"),
+            (Columns { briefing: true, ..running.clone() }, "a briefing with no time"),
+            (Columns { closing: true, ..running }, "running with a finished flow's note owed"),
+            (Columns { note: Some("why".into()), ..manual.clone() }, "manual with a note"),
+            (Columns { resume: Some("prompt".into()), ..manual.clone() }, "manual with a way to continue"),
+            (Columns { clear: Some("done".into()), ..manual }, "manual with a clear"),
+            (Columns { note: None, ..attention.clone() }, "attention with no note"),
+            (Columns { briefing: true, briefing_at: Some(1), ..attention.clone() }, "attention with a briefing"),
+            (Columns { clear: Some("pending".into()), ..attention }, "attention with a clear"),
+        ];
+        for (columns, named) in cases {
+            let e = RunState::from_columns(columns.clone()).unwrap_err();
+            assert!(e.contains(named), "{columns:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn what_older_versions_left_behind_is_dropped_on_load() {
+        // A stop leaves the other columns as they were (and always has), so an ended
+        // run is read by its status and `closing` alone.
+        let stopped = Columns {
+            status: "stopped".into(),
+            note: Some("why".into()),
+            resume: Some("prompt".into()),
+            clear: Some("pending".into()),
+            briefing: true,
+            briefing_at: Some(5),
+            prefill: true,
+            closing: true,
+            ..working_columns()
+        };
+        let state = RunState::from_columns(stopped).unwrap();
+        assert_eq!(state.phase, Phase::Ended { stopped: true, owes_closing: true });
+        // A briefing's time, which versions before this one kept after the briefing.
+        let stale = Columns { briefing_at: Some(5), ..working_columns() };
+        let state = RunState::from_columns(stale).unwrap();
+        assert_eq!(state.phase, Phase::Working);
+        assert_eq!(state.columns(), working_columns());
+        // Nor are an ended run's resume and clear read, even ones this version does not know.
+        let odd = Columns { status: "done".into(), resume: Some("someday".into()), clear: Some("later".into()), ..working_columns() };
+        assert_eq!(RunState::from_columns(odd).unwrap().phase, Phase::Ended { stopped: false, owes_closing: false });
+        // A value this version does not know is still an error on an active run.
+        let odd = Columns { resume: Some("someday".into()), ..working_columns() };
+        assert!(RunState::from_columns(odd).unwrap_err().contains("someday"));
     }
 
     #[test]
@@ -2764,13 +2899,108 @@ mod tests {
         let (_db, mut conn, flow) = setup("runs-owes-closing", &runnable());
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
         for briefed in [false, true] {
-            for clear in [None, Some(Clear::Pending), Some(Clear::Done)] {
-                let s = RunState { briefed, clear, ..state(&conn, run) };
+            for phase in phases().into_iter().filter(|p| !matches!(p, Phase::Ended { .. })) {
+                let s = RunState { briefed, ..at_step("p", phase) };
                 s.save(&conn, run).unwrap();
                 let owes: bool =
                     conn.query_row(&format!("SELECT {OWES_CLOSING} FROM flow_runs WHERE id = ?1"), [run], |r| r.get(0)).unwrap();
-                assert_eq!(owes, s.owes_closing(), "briefed {briefed}, clear {clear:?}");
+                assert_eq!(owes, s.owes_closing(), "{s:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_run_this_version_cannot_read_can_still_be_stopped_and_owes_what_its_row_says() {
+        let (_db, mut conn, flow) = setup("runs-stop-unreadable", &runnable());
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+        for (tab_id, odd, owes) in [("t1", "clear = 'later'", false), ("t2", "resume = 'someday'", true)] {
+            let run = begin(&mut conn, flow, &tab(tab_id)).unwrap().run_id;
+            conn.execute(&format!("UPDATE flow_runs SET {odd} WHERE id = ?1"), [run]).unwrap();
+            stop(&conn, run).unwrap();
+            assert_eq!((column::<String>(&conn, run, "status"), column::<bool>(&conn, run, "closing")), ("stopped".into(), owes), "{odd}");
+        }
+        assert!(stop(&conn, 999).unwrap_err().contains("no active run 999"));
+    }
+
+    /// The stored columns a stop clears or sets: status, note, resume, prefill and closing.
+    fn stop_columns(conn: &Connection, run: i64) -> (String, Option<String>, Option<String>, bool, bool) {
+        conn.query_row("SELECT status, note, resume, prefill, closing FROM flow_runs WHERE id = ?1", [run], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn every_way_of_stopping_a_readable_run_leaves_the_same_row() {
+        for how in ["stop", "stop_tab", "after_restart"] {
+            let (_db, mut conn, flow) = setup(&format!("runs-stop-shape-{how}"), &runnable());
+            let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+            let needing = RunState { prefill_token: Some(5), ..at_step("p", needs("why", Some(Resume::Prompt), true)) };
+            needing.save(&conn, run).unwrap();
+            match how {
+                "stop" => stop(&conn, run).unwrap(),
+                "stop_tab" => stop_tab(&conn, &tab("t1")).unwrap(),
+                _ => after_restart(&mut conn, &[]).unwrap(),
+            }
+            // Claude has the run's rules, so ■ owes it the note that the flow is finished;
+            // a tab that is gone sends no prompt to carry it.
+            let owes = how == "stop";
+            assert_eq!(stop_columns(&conn, run), ("stopped".into(), None, None, false, owes), "{how}");
+            let want = RunState { phase: Phase::Ended { stopped: true, owes_closing: owes }, ..needing.stopped() };
+            assert_eq!(state(&conn, run), want, "{how}");
+        }
+    }
+
+    #[test]
+    fn a_run_whose_columns_have_the_wrong_type_does_not_hold_up_the_others() {
+        let (_db, mut conn, flow) = setup("runs-bad-type", &runnable());
+        let odd = start(&mut conn, flow, &tab("odd")).unwrap().run_id;
+        let fine = start(&mut conn, flow, &tab("fine")).unwrap().run_id;
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+        conn.execute("UPDATE flow_runs SET steps = 'many', briefed = 'yes' WHERE id = ?1", [odd]).unwrap();
+        conn.execute("UPDATE flow_runs SET briefing_at = briefing_at - ?1", [BRIEFING_TIMEOUT_SECS + 1]).unwrap();
+        expire(&mut conn).unwrap();
+        assert_eq!(state(&conn, fine).phase.status(), Status::Attention);
+        let runs = active(&conn).unwrap();
+        let summary: Vec<_> = runs.iter().map(|r| (r.id, r.status)).collect();
+        assert_eq!(summary, [(odd, Status::Running), (fine, Status::Attention)]);
+        assert!(runs[0].note.as_deref().unwrap().contains("cannot be read"), "{:?}", runs[0].note);
+        after_restart(&mut conn, &[tab("odd"), tab("fine")]).unwrap();
+        assert_eq!(column::<String>(&conn, odd, "status"), "running");
+        // It can still be stopped.
+        stop(&conn, odd).unwrap();
+        assert_eq!(column::<String>(&conn, odd, "status"), "stopped");
+    }
+
+    #[test]
+    fn after_a_restart_a_database_error_is_returned_not_skipped() {
+        let (_db, mut conn, flow) = setup("runs-restart-sql-error", &runnable());
+        begin(&mut conn, flow, &tab("t1")).unwrap();
+        // A column the run's state is read from is gone: the database, not the run, is at fault.
+        conn.execute_batch("ALTER TABLE flow_runs DROP COLUMN briefing_at").unwrap();
+        let e = after_restart(&mut conn, &[tab("t1")]).unwrap_err();
+        assert!(e.contains("briefing_at"), "{e}");
+    }
+
+    #[test]
+    fn loading_a_run_tells_a_database_error_from_a_run_this_version_cannot_read() {
+        let (_db, mut conn, flow) = setup("runs-load-error", &runnable());
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        conn.execute("UPDATE flow_runs SET graph = 'broken' WHERE id = ?1", [run]).unwrap();
+        assert!(matches!(active_run(&conn, "id = ?1", &run), Err(LoadError::Unreadable(_))));
+        assert!(matches!(active_run(&conn, "no_such_column = ?1", &run), Err(LoadError::Sql(_))));
+    }
+
+    #[test]
+    fn rows_older_versions_wrote_load_and_save_back_unchanged() {
+        let attention = Columns { status: "attention".into(), note: Some("why".into()), ..working_columns() };
+        for c in [
+            Columns { resume: Some("prompt".into()), ..attention.clone() },
+            Columns { status: "manual".into(), prefill: true, prefill_token: None, ..working_columns() },
+            Columns { prefill: true, ..attention },
+        ] {
+            let state = RunState::from_columns(c.clone()).unwrap();
+            assert_eq!(state.columns(), c);
         }
     }
 
@@ -2778,14 +3008,14 @@ mod tests {
     fn the_briefing_s_time_goes_once_the_briefing_is_over() {
         let (_db, mut conn, flow) = setup("runs-briefing-at", &runnable());
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
-        assert!(state(&conn, run).briefing_at.is_some());
+        assert!(column::<Option<i64>>(&conn, run, "briefing_at").is_some());
         on_stop(&mut conn, &tab("t1"), Some("Ready")).unwrap();
-        assert_eq!(state(&conn, run).briefing_at, None);
+        assert_eq!(column::<Option<i64>>(&conn, run, "briefing_at"), None);
         // Nor does a briefing that was lost keep it.
         let (_db, mut conn, flow) = setup("runs-briefing-at-lost", &runnable());
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
         pause_tab(&mut conn, &tab("t1"), "x").unwrap();
-        assert_eq!(state(&conn, run).briefing_at, None);
+        assert_eq!(column::<Option<i64>>(&conn, run, "briefing_at"), None);
     }
 
     #[test]
@@ -2795,11 +3025,28 @@ mod tests {
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
         pause_tab(&mut conn, &tab("t1"), "The Stop hook failed.").unwrap();
         let paused = state(&conn, run);
-        assert_eq!((paused.status, paused.resume, paused.briefing, paused.briefed), (Status::Attention, None, false, false));
+        assert_eq!((paused.phase, paused.briefed), (needs("The Stop hook failed.", None, false), false));
         let (_db, mut conn, flow) = setup("runs-briefing-restart-resume", &runnable());
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
         after_restart(&mut conn, &[tab("t1")]).unwrap();
-        assert_eq!(state(&conn, run).resume, None);
+        assert!(matches!(state(&conn, run).phase, Phase::NeedsPerson { resume: None, .. }));
+    }
+
+    #[test]
+    fn a_failed_hook_marks_the_run_through_runs_and_returns_its_error() {
+        let (_db, mut conn, flow) = setup("runs-hook-failed", &runnable());
+        begin(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!(hook_failed(&mut conn, &tab("t1"), Hook::Stop, "boom".into()), "boom");
+        let run = only_run(&conn);
+        assert_eq!((run.status, run.resumable), (Status::Attention, true));
+        assert!(run.note.unwrap().contains("The Stop hook could not move the run on (boom)"));
+        // A prompt the hook could not record changes nothing at a prompt step.
+        let (_db, mut conn, flow) = setup("runs-hook-failed-prompt", &manual_prompt_first("Fix it"));
+        begin(&mut conn, flow, &tab("t1")).unwrap();
+        assert_eq!(hook_failed(&mut conn, &tab("t1"), Hook::Prompt, "bad".into()), "bad");
+        let run = only_run(&conn);
+        assert_eq!((run.status, run.prefill), (Status::Attention, true), "the paste stays owed");
+        assert!(run.note.unwrap().contains("could not record your prompt (bad)"));
     }
 
     #[test]
@@ -2808,19 +3055,17 @@ mod tests {
         let (_db, mut conn, flow) = setup("runs-state-untouched", &g);
         let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
         let before = state(&conn, run);
-        assert!(before.prefill && before.prefill_token.is_some(), "{before:?}");
+        let token = before.prefill_token.unwrap();
+        assert_eq!(before.phase, Phase::Waiting { prefill: true });
         // The paste stays owed, under the same token.
         prompt_unseen(&mut conn, &tab("t1"), "Your prompt could not be recorded.").unwrap();
         let after = state(&conn, run);
-        assert_eq!(
-            after,
-            RunState { status: Status::Attention, note: Some("Your prompt could not be recorded.".into()), resume: None, ..before.clone() }
-        );
+        assert_eq!(after, RunState { phase: needs("Your prompt could not be recorded.", None, true), ..before.clone() });
         // A paste recorded under another token changes nothing.
-        prefilled(&mut conn, run, "mp", before.prefill_token.unwrap() + 1).unwrap();
+        prefilled(&mut conn, run, "mp", token + 1).unwrap();
         assert_eq!(state(&conn, run), after);
-        prefilled(&mut conn, run, "mp", before.prefill_token.unwrap()).unwrap();
-        assert_eq!(state(&conn, run), RunState { prefill: false, ..after });
+        prefilled(&mut conn, run, "mp", token).unwrap();
+        assert_eq!(state(&conn, run), RunState { phase: needs("Your prompt could not be recorded.", None, false), ..after });
         // A pause leaves a run that waits for the person as it is.
         let (_db, mut conn, flow) = setup("runs-state-pause-waiting", &manual_first());
         let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
@@ -2833,7 +3078,16 @@ mod tests {
         let (_db, mut conn, flow) = setup("runs-state-clear", &g);
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
         let before = state(&conn, run);
+        assert_eq!(before, RunState::initial(&g.nodes[0], true));
         clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
-        assert_eq!(state(&conn, run), RunState { clear: Some(Clear::Done), briefed: false, ..before });
+        assert_eq!(state(&conn, run), RunState { phase: Phase::Clearing { done: true }, briefed: false, ..before });
+    }
+
+    #[test]
+    fn paste_tokens_stay_within_what_javascript_holds_exactly() {
+        for _ in 0..1000 {
+            let token = new_token();
+            assert!((0..(1 << 53) - 1).contains(&token), "{token}");
+        }
     }
 }
