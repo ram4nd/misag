@@ -5,7 +5,7 @@
 //! reply, "Ready", which takes the first step (see `on_stop`); a flow that leads
 //! straight to its end skips that. A briefing with no reply within
 //! `BRIEFING_TIMEOUT_SECS` (Claude was interrupted, or crashed) waits for the
-//! person (see `active`). A prompt step sends its text to Claude; when Claude ends its turn, the Stop hook
+//! person (see `expire`). A prompt step sends its text to Claude; when Claude ends its turn, the Stop hook
 //! (`misag --claude-hook`, a separate process) reads the `FLOW: <output>` line
 //! Claude ended with and moves on, handing Claude the next prompt as hook context.
 //! A pause waits for the person, who goes on by its one output (▶ in the Flows
@@ -25,7 +25,7 @@
 //! the tab at Start while the app types `/clear`, the SessionStart hook reports the
 //! clear (`clear_tab`), and the app then sends the briefing (`cleared`). A run
 //! still at Start `CLEAR_TIMEOUT_SECS` after it began (the page that would go on
-//! was reloaded, or failed) waits for the person instead (see `active`).
+//! was reloaded, or failed) waits for the person instead (see `expire`).
 //!
 //! Any turn that ends while a step runs counts as its reply, including one the
 //! person started by chatting with Claude.
@@ -50,7 +50,7 @@ pub const CLEAR_TIMEOUT_SECS: i64 = 35;
 
 /// How long a run waits at Start for Claude's reply to its briefing, which asks
 /// only for "Ready", before it waits for the person: Claude was interrupted (which
-/// runs no Stop hook) or failed.
+/// runs no Stop hook) or failed. `expire`'s note gives it in minutes.
 pub const BRIEFING_TIMEOUT_SECS: i64 = 120;
 
 /// Its active statuses are mirrored by `RunStatus` in src/flows.ts.
@@ -410,7 +410,7 @@ fn first_turn(tx: &Transaction, run_id: i64, graph: &Graph, start: &Node) -> Res
         return go(tx, &run, start, flows::START_OUTPUT, 0, By::Flow).map(texts);
     }
     set(tx, run_id, &start.id, Status::Running, 0, None)?;
-    tx.execute("UPDATE flow_runs SET briefed = 1, briefing = 1 WHERE id = ?1", [run_id]).map_err(sql)?;
+    tx.execute("UPDATE flow_runs SET briefed = 1, briefing = 1, briefing_at = ?2 WHERE id = ?1", params![run_id, now()]).map_err(sql)?;
     Ok(Some(flows::briefing_text(graph, &flow_name(tx, run_id)?)))
 }
 
@@ -1007,31 +1007,61 @@ fn progress(conn: &Connection, run: i64, graph: &Graph) -> Result<(i64, i64), St
     Ok((done, total))
 }
 
-/// Every active run, oldest first. A run still at Start `CLEAR_TIMEOUT_SECS` after
-/// it began, waiting for a clear the app no longer sees through, first waits for
-/// the person, as after a restart.
-pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
-    conn.execute(
-        "UPDATE flow_runs SET status = 'attention', note = ?1, resume = NULL, clear = NULL, updated_at = ?2
-         WHERE status = 'running' AND clear IS NOT NULL AND started_at <= ?2 - ?3",
+/// Makes the runs that have timed out at Start wait for the person: one still
+/// waiting for its clear `CLEAR_TIMEOUT_SECS` after it began (the app no longer
+/// sees it through), as after a restart; and one whose briefing has had no reply
+/// `BRIEFING_TIMEOUT_SECS` after it was sent. The app calls this before each look
+/// at the runs (see `flow_runs`), so a run waits for you a few seconds after its
+/// time is up. Takes the write lock only when a run has timed out.
+pub fn expire(conn: &mut Connection) -> Result<(), String> {
+    const CLEAR_EXPIRED: &str = "status = 'running' AND clear IS NOT NULL AND started_at <= ?1 - ?2";
+    const BRIEFING_EXPIRED: &str = "status = 'running' AND briefing = 1 AND briefing_at <= ?1 - ?3";
+    let now = now();
+    let timed_out: bool = conn
+        .query_row(
+            &format!("SELECT EXISTS (SELECT 1 FROM flow_runs WHERE ({CLEAR_EXPIRED}) OR ({BRIEFING_EXPIRED}))"),
+            params![now, CLEAR_TIMEOUT_SECS, BRIEFING_TIMEOUT_SECS],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    if !timed_out {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
+    // The 30 seconds are the app's own timeout, which the person sees, not the
+    // longer `CLEAR_TIMEOUT_SECS`.
+    tx.execute(
+        &format!("UPDATE flow_runs SET status = 'attention', note = ?4, resume = NULL, clear = NULL, updated_at = ?1 WHERE {CLEAR_EXPIRED}"),
         params![
+            now,
+            CLEAR_TIMEOUT_SECS,
+            BRIEFING_TIMEOUT_SECS,
             "Claude did not clear the conversation within 30 seconds. Pick an output to go on without clearing, or stop the run and press ▶ again.",
-            now(),
-            CLEAR_TIMEOUT_SECS
         ],
     )
     .map_err(sql)?;
     // Claude may not have read the briefing: the first step carries it again.
-    conn.execute(
-        "UPDATE flow_runs SET status = 'attention', note = ?1, resume = NULL, briefing = 0, briefed = 0, updated_at = ?2
-         WHERE status = 'running' AND briefing = 1 AND updated_at <= ?2 - ?3",
+    tx.execute(
+        &format!(
+            "UPDATE flow_runs SET status = 'attention', note = ?4, resume = NULL, briefing = 0, briefed = 0, updated_at = ?1 WHERE {BRIEFING_EXPIRED}"
+        ),
         params![
-            "Claude did not reply to the flow's briefing within 2 minutes (it may have been interrupted). Pick an output to go on; the first step briefs Claude again.",
-            now(),
-            BRIEFING_TIMEOUT_SECS
+            now,
+            CLEAR_TIMEOUT_SECS,
+            BRIEFING_TIMEOUT_SECS,
+            format!(
+                "Claude did not reply to the flow's briefing within {} minutes (it may have been interrupted). Pick an output to go on; the first step briefs Claude again.",
+                BRIEFING_TIMEOUT_SECS / 60
+            ),
         ],
     )
     .map_err(sql)?;
+    tx.commit().map_err(sql)
+}
+
+/// Every active run, oldest first. Writes nothing: timeouts are `expire`'s, so
+/// call that first when they must be applied.
+pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT r.id, r.flow_id, f.name, r.tab_id, r.graph, r.node_id, r.status, r.note, r.steps, r.resume, r.clear, r.prefill, r.briefing
@@ -1331,11 +1361,51 @@ mod tests {
         let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
         assert!(only_run(&conn).briefing);
         // As if Claude was interrupted (no Stop) long enough ago.
-        conn.execute("UPDATE flow_runs SET updated_at = updated_at - ?1", [BRIEFING_TIMEOUT_SECS + 1]).unwrap();
+        conn.execute("UPDATE flow_runs SET briefing_at = briefing_at - ?1", [BRIEFING_TIMEOUT_SECS + 1]).unwrap();
+        expire(&mut conn).unwrap();
         let waiting = only_run(&conn);
         assert_eq!((waiting.status, waiting.briefing, waiting.outputs.clone()), (Status::Attention, false, vec!["next".to_string()]));
         assert!(waiting.note.as_deref().unwrap().contains("briefing"), "{:?}", waiting.note);
         assert_eq!(pick(&mut conn, run, "next").unwrap(), Some(flows::first_prompt_text(&g, "F", &g.nodes[1])));
+    }
+
+    #[test]
+    fn a_write_to_a_run_reading_its_briefing_does_not_restart_the_briefing_s_time() {
+        let (_db, mut conn, flow) = setup("runs-briefing-timeout-touched", &runnable());
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        // The briefing went out long enough ago; something else wrote to the run just now.
+        conn.execute("UPDATE flow_runs SET briefing_at = briefing_at - ?1, updated_at = ?2", params![BRIEFING_TIMEOUT_SECS + 1, now()])
+            .unwrap();
+        expire(&mut conn).unwrap();
+        assert_eq!(only_run(&conn).status, Status::Attention);
+    }
+
+    #[test]
+    fn listing_the_runs_writes_nothing_even_when_a_run_has_timed_out() {
+        let (_db, mut conn, flow) = setup("runs-active-read-only", &runnable());
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        conn.execute("UPDATE flow_runs SET briefing_at = briefing_at - ?1", [BRIEFING_TIMEOUT_SECS + 1]).unwrap();
+        let before = conn.total_changes();
+        assert_eq!(only_run(&conn).status, Status::Running);
+        assert_eq!(conn.total_changes(), before);
+    }
+
+    #[test]
+    fn expiring_with_nothing_timed_out_does_not_wait_for_another_writer() {
+        let path = db::tests::temp_db("runs-expire-no-lock");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        db.save_flow_graph(flow, &runnable()).unwrap();
+        let mut conn = db::connect_existing(&path).unwrap();
+        start(&mut conn, flow, &tab("t1")).unwrap();
+        // The hook, say, holds the write lock.
+        let writer = db::connect_existing(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let begun = std::time::Instant::now();
+        expire(&mut conn).unwrap();
+        assert!(begun.elapsed() < std::time::Duration::from_secs(1), "{:?}", begun.elapsed());
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(only_run(&conn).status, Status::Running);
     }
 
     #[test]
@@ -2331,6 +2401,7 @@ mod tests {
         assert_eq!(statuses(&conn), [(Status::Running, true), (Status::Running, true)]);
         // The page that would have gone on was reloaded or failed: past the deadline, both wait at Start.
         conn.execute("UPDATE flow_runs SET started_at = started_at - ?1", [CLEAR_TIMEOUT_SECS + 1]).unwrap();
+        expire(&mut conn).unwrap();
         let runs = active(&conn).unwrap();
         assert_eq!(runs.iter().map(|r| (r.status, r.outputs.clone())).collect::<Vec<_>>(), [
             (Status::Attention, vec![flows::START_OUTPUT.to_string()]),

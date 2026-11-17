@@ -187,6 +187,12 @@ const MIGRATIONS: &[&str] = &[r#"
     ALTER TABLE flow_runs ADD COLUMN closing INTEGER NOT NULL DEFAULT 0 CHECK (closing IN (0, 1));
     -- Every prompt in every tab looks for a note owed there.
     CREATE INDEX flow_runs_closing ON flow_runs (tab_id) WHERE closing = 1;
+"#, r#"
+    -- When the run sent its briefing, which its timeout counts from (see
+    -- runs::expire), so other writes to the run do not restart it. It only counts
+    -- while briefing = 1.
+    ALTER TABLE flow_runs ADD COLUMN briefing_at INTEGER;
+    UPDATE flow_runs SET briefing_at = updated_at WHERE briefing = 1;
 "#];
 
 /// Why the database could not be opened. Only `Corrupt` justifies replacing the file.
@@ -954,6 +960,11 @@ impl Db {
 
     pub fn stop_run(&self, run_id: i64) -> Result<(), String> {
         runs::stop(&self.conn(), run_id)
+    }
+
+    /// Makes the runs that have timed out at Start wait for the person (see `runs::expire`).
+    pub fn expire_runs(&self) -> Result<(), String> {
+        runs::expire(&mut self.conn())
     }
 
     pub fn active_runs(&self) -> Result<Vec<runs::Run>, String> {
@@ -2125,6 +2136,31 @@ pub(crate) mod tests {
         // A run started before had sent no base info, and owes none.
         let briefed: bool = connect_existing(&path).unwrap().query_row("SELECT briefed FROM flow_runs", [], |r| r.get(0)).unwrap();
         assert!(briefed);
+    }
+
+    #[test]
+    fn upgrading_times_a_briefing_sent_before_from_the_runs_last_change() {
+        let path = temp_db("upgrade-briefing-at");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.iter().position(|m| m.contains("ADD COLUMN briefing_at")).unwrap();
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        conn.execute("INSERT INTO flows (name, position, graph, created_at, updated_at) VALUES ('F', 0, '{}', 0, 0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at, briefing) VALUES (1, 't1', '{}', 'start', 'running', 0, 0, 1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        Db::open(path.clone()).unwrap();
+        let mut conn = connect_existing(&path).unwrap();
+        let briefing_at: Option<i64> = conn.query_row("SELECT briefing_at FROM flow_runs", [], |r| r.get(0)).unwrap();
+        assert_eq!(briefing_at, Some(0));
+        // Long past its timeout, so the run waits for the person.
+        crate::runs::expire(&mut conn).unwrap();
+        let runs = crate::runs::active(&conn).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].status, crate::runs::Status::Attention);
     }
 
     #[test]

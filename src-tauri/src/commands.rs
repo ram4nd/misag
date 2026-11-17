@@ -795,9 +795,20 @@ pub fn flow_stop_tab(db: State<'_, Db>, tab_id: TabId) -> Result<(), CommandErro
     Ok(db.stop_tab_run(&tab_id)?)
 }
 
+/// The active runs, after making those whose time at Start is up wait for you
+/// (see `runs::expire`). The page polls this every few seconds.
 #[tauri::command(async)]
 pub fn flow_runs(db: State<'_, Db>) -> Result<Vec<crate::runs::Run>, CommandError> {
-    Ok(db.active_runs()?)
+    Ok(poll_runs(&db)?)
+}
+
+/// A timeout that cannot be applied now (another writer held the lock past the
+/// busy timeout, say) is applied on a later poll, so the runs are still listed.
+fn poll_runs(db: &Db) -> Result<Vec<crate::runs::Run>, String> {
+    if let Err(e) = db.expire_runs() {
+        eprintln!("misag: could not apply the flow run timeouts: {e}");
+    }
+    db.active_runs()
 }
 
 #[tauri::command(async)]
@@ -898,6 +909,27 @@ mod tests {
     const ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
     const LATER: &str = "1b4e28ba-2fa1-41d2-883f-0016d3cca427";
     const EXE: &str = "/bin/misag";
+
+    #[test]
+    fn the_runs_are_still_listed_when_their_timeouts_cannot_be_applied() {
+        let path = temp_db("flow-runs-expire-fails");
+        let db = Db::open(path.clone()).unwrap();
+        let flow = db.create_flow("F").unwrap().id;
+        let conn = connect_existing(&path).unwrap();
+        // A briefing long past its timeout, and a write that fails, as when busy.
+        conn.execute(
+            "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at, briefing, briefing_at)
+             VALUES (?1, 't1', '{}', 'start', 'running', 0, 0, 1, 0)",
+            [flow],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail BEFORE UPDATE ON flow_runs BEGIN SELECT RAISE(ABORT, 'database is locked'); END")
+            .unwrap();
+        assert!(db.expire_runs().is_err());
+        let runs = poll_runs(&db).unwrap();
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert_eq!(runs[0].status, crate::runs::Status::Running);
+    }
 
     #[test]
     fn a_loaded_flow_is_one_flat_object() {
