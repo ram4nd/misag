@@ -535,8 +535,38 @@ pub fn claude_open_sessions(
     db: State<'_, Db>,
     tabs: Vec<TabSession>,
 ) -> HashMap<u32, ClaudeState> {
+    poll_claude_states(&state, &db, tabs)
+}
+
+#[cfg(unix)]
+fn poll_claude_states(state: &Sessions, db: &Db, tabs: Vec<TabSession>) -> HashMap<u32, ClaudeState> {
     let skips = |pid| Sessions::process_args(pid).map(|args| skips_permissions(&args));
     claude_states(tabs, |id| state.foreground(id), |tab, pid| db.session_run_by(tab, pid), Sessions::process_name, skips)
+}
+
+/// On Windows, from one snapshot of the running processes for every tab, rather
+/// than one per tab and per process named (a running Claude's command line is
+/// still read on its own).
+#[cfg(windows)]
+fn poll_claude_states(state: &Sessions, db: &Db, tabs: Vec<TabSession>) -> HashMap<u32, ClaudeState> {
+    if tabs.is_empty() {
+        return HashMap::new();
+    }
+    // Logged when it starts failing or fails differently, not on every poll: every
+    // tab then says it cannot tell (Unknown).
+    static LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let all = crate::win::processes().map_err(|e| format!("cannot list processes: {e}"));
+    let error = all.as_ref().err().cloned();
+    let mut last = LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = error.as_ref().filter(|e| last.as_ref() != Some(*e)) {
+        eprintln!("misag: {e}");
+    }
+    *last = error;
+    drop(last);
+    // Asked only of a tab whose foreground was read, so from a snapshot that was taken.
+    let name = |pid| all.as_ref().ok().and_then(|all| crate::proc_tree::name(pid, all));
+    let skips = |pid| Sessions::process_args(pid).map(|args| skips_permissions(&args));
+    claude_states(tabs, |id| state.foreground_in(id, &all), |tab, pid| db.session_run_by(tab, pid), name, skips)
 }
 
 /// When (unix ms) each tab's Claude ended its last turn waiting on background

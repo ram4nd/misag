@@ -19,6 +19,11 @@ pub fn base_name(exe: &str) -> &str {
     }
 }
 
+/// The name of process `pid` in the snapshot `all`, without `.exe`, such as `claude`.
+pub fn name(pid: u32, all: &[Process]) -> Option<String> {
+    all.iter().find(|p| p.pid == pid).map(|p| base_name(&p.exe).to_owned())
+}
+
 /// Programs Windows runs alongside a console program, never what a person started.
 const CONSOLE_HOSTS: &[&str] = &["conhost", "openconsole"];
 
@@ -96,6 +101,13 @@ mod tests {
     fn a_cycle_from_reused_pids_ends() {
         let all = [p(1, 0, "pwsh.exe"), p(2, 1, "a.exe"), p(3, 2, "b.exe"), p(2, 3, "a.exe"), p(1, 3, "x.exe")];
         assert_eq!(foreground_candidates(1, &all), vec![2]);
+    }
+
+    #[test]
+    fn names_a_process_from_the_snapshot() {
+        let all = [p(1, 0, "pwsh.exe"), p(3, 1, "claude.exe")];
+        assert_eq!(name(3, &all).as_deref(), Some("claude"));
+        assert_eq!(name(7, &all), None, "gone");
     }
 
     #[test]

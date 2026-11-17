@@ -999,25 +999,29 @@ impl Sessions {
         path.into_os_string().into_string().map_err(|p| eprintln!("misag: non-UTF-8 directory {p:?}")).ok()
     }
 
-    /// The programs that may run in the session's foreground, most likely first: the
-    /// program a shell is running, such as `claude` typed at its prompt; empty when
-    /// only the shell runs. On Windows, which has no foreground process group, the
-    /// candidates from the shell's process tree (see `proc_tree`).
-    /// An error means it could not be told (no such session, or the query failed),
-    /// which callers must not read as "nothing in the foreground".
+    /// On Windows, which has no foreground process group, the programs that may run
+    /// in the session's foreground, most likely first: the candidates from the
+    /// shell's process tree (see `proc_tree`) in `all`, one snapshot of the running
+    /// processes (or why it could not be taken), shared by every tab of a poll; empty
+    /// when only the shell runs. An error means it could not be told (no such
+    /// session, the session exited, no process id, or no snapshot), which callers
+    /// must not read as "nothing in the foreground".
     #[cfg(windows)]
-    pub fn foreground(&self, id: u32) -> Result<Vec<u32>, String> {
+    pub fn foreground_in(&self, id: u32, all: &Result<Vec<crate::proc_tree::Process>, String>) -> Result<Vec<u32>, String> {
         let s = self.get(id)?;
         if lock(&s.master).is_none() {
             return Err(format!("session {id} has exited"));
         }
         let pid = s.pid.ok_or_else(|| format!("session {id} has no process id"))?;
-        let all = crate::win::processes().map_err(|e| format!("session {id}: cannot list processes: {e}"))?;
-        Ok(crate::proc_tree::foreground_candidates(pid, &all))
+        let all = all.as_ref().map_err(|e| format!("session {id}: {e}"))?;
+        Ok(crate::proc_tree::foreground_candidates(pid, all))
     }
 
-    /// The same, from the PTY's foreground process group: its leader, if that is not
-    /// the session process itself.
+    /// The programs that may run in the session's foreground: the program a shell
+    /// is running, such as `claude` typed at its prompt (the PTY's foreground process
+    /// group's leader, if that is not the session process itself); empty when only
+    /// the shell runs. An error means it could not be told (no such session, or the
+    /// query failed), which callers must not read as "nothing in the foreground".
     #[cfg(unix)]
     pub fn foreground(&self, id: u32) -> Result<Vec<u32>, String> {
         let s = self.get(id)?;

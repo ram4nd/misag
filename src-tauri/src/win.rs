@@ -168,7 +168,7 @@ pub fn processes() -> std::io::Result<Vec<Process>> {
 /// The name of process `pid` without `.exe`, such as `claude`.
 pub fn process_name(pid: u32) -> Option<String> {
     let all = processes().map_err(|e| eprintln!("misag: cannot list processes: {e}")).ok()?;
-    all.into_iter().find(|p| p.pid == pid).map(|p| crate::proc_tree::base_name(&p.exe).to_owned())
+    crate::proc_tree::name(pid, &all)
 }
 
 /// Values any bit pattern is valid for, which `read` may fill from another process.
