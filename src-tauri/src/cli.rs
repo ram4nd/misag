@@ -233,7 +233,9 @@ fn command(args: Vec<OsString>, stdin: &mut impl Read, out: &mut impl Write) -> 
             let (file_name, graph) = flow_file::parse(&text)?;
             let db = open(line.db)?;
             let name = line.name.as_deref().unwrap_or(&file_name);
-            // From one of misag's tabs, a program (such as Claude) may be adding it.
+            // From one of misag's tabs, a program (such as Claude) may be adding it. This
+            // catches Claude following instructions it read; it is not a security boundary,
+            // as a program in the tab can unset MISAG_TAB or write the database itself.
             let in_tab = std::env::var_os(claude::TAB_ENV).is_some_and(|t| !t.is_empty());
             let flow = if in_tab { db.import_unconfirmed_flow(name, &graph)? } else { db.import_flow(name, &graph)? };
             let mut report = format!("Added \"{}\" as flow {}.\n", shown(&flow.name), flow.id);
