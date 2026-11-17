@@ -78,7 +78,8 @@ export interface RunControllerOptions<T extends RunTab> {
    */
   live(tab: T): Promise<boolean>;
   /** Types into the tab's terminal. */
-  write(tab: T, data: Uint8Array): void;
+  /** Writes to the tab; rejects when the tab does not take it. */
+  write(tab: T, data: Uint8Array): Promise<void> | void;
   /** The open flow editors, by flow id. */
   editors(): Iterable<[number, RunEditor]>;
   /** Marks in the tab bar the tabs whose run waits for the person. */
@@ -190,17 +191,17 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       // Ctrl+C clears it; on an empty input one press only shows a hint, so it is
       // sent only when the person typed since their last Enter.
       if (dirtyTabs.delete(tab.tabId)) {
-        opts.write(tab, encoder.encode("\x03"));
+        await opts.write(tab, encoder.encode("\x03"));
         await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
       }
-      opts.write(tab, encoder.encode(`\x1b[200~${text}\x1b[201~`));
+      await opts.write(tab, encoder.encode(`\x1b[200~${text}\x1b[201~`));
       await new Promise((resolve) => setTimeout(resolve, PASTE_SUBMIT_MS));
       if (!(await opts.live(tab))) {
         // The paste may wait in the input of a Claude brought back (fg): cleared before the next prompt.
         dirtyTabs.add(tab.tabId);
         return left();
       }
-      opts.write(tab, encoder.encode("\r"));
+      await opts.write(tab, encoder.encode("\r"));
       return true;
     });
   }
@@ -233,7 +234,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
         const fill = await invoke<Prefill | null>("flow_prefill_text", { runId: run.id, stepId: run.stepId });
         // Claude may have started a turn, or the person typed, meanwhile.
         if (fill === null || opts.busy(tab) || dirtyTabs.has(tab.tabId)) return;
-        opts.write(tab, encoder.encode(`\x1b[200~${fill.text}\x1b[201~`));
+        await opts.write(tab, encoder.encode(`\x1b[200~${fill.text}\x1b[201~`));
         pasted = true;
         dirtyTabs.add(tab.tabId);
         pastedTabs.add(tab.tabId);
@@ -258,7 +259,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   /** Takes a manual prompt's paste the person has not touched back out of the tab's Claude input. */
   async function clearPaste(tab: T) {
     if (!pastedTabs.delete(tab.tabId) || !(await opts.live(tab))) return;
-    opts.write(tab, encoder.encode("\x03"));
+    await opts.write(tab, encoder.encode("\x03"));
     dirtyTabs.delete(tab.tabId);
     await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
   }
@@ -335,6 +336,16 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       return;
     }
     flows.showBoxError(null);
+    try {
+      await sendStart(tab, flow, started);
+    } catch (err) {
+      console.error("misag: could not type into the run's tab", err);
+      await stopStart(started.runId, `Could not type into ${opts.label(tab)} (${opts.errorText(err)}), so "${flow.name}" was stopped.`);
+    }
+  }
+
+  /** Types a started run's /clear and briefing; throws when the tab does not take them. */
+  async function sendStart(tab: T, flow: Flow, started: Started) {
     if (!started.clear) {
       if (started.prompt !== null && !(await typePrompt(tab, started.prompt))) await briefingUnsent(tab, flow, started.runId);
       return;

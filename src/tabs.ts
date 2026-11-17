@@ -71,7 +71,8 @@ export interface Tabs {
    */
   updateTab(s: Session): void;
   /** Types into the tab's process. */
-  write(s: Session, data: Uint8Array): void;
+  /** Writes to the tab's program; rejects when it does not take it. */
+  write(s: Session, data: Uint8Array): Promise<void>;
   /**
    * Whether the person's typing into `s` is held back because a flow is typing its
    * prompt there; says so, so the keys do not seem lost.
@@ -149,12 +150,12 @@ export function createTabs(opts: TabsOptions): Tabs {
       }
       if (heldBack(s)) return;
       runs.typed(s, data);
-      write(s, encoder.encode(data));
+      typedInto(s, encoder.encode(data));
     };
     term.onBinary = (data) => {
       if (heldBack(s)) return;
       runs.typed(s, data);
-      write(s, data);
+      typedInto(s, data);
     };
     handleMouse(term, { signal, shown: () => active === s && pages.shown() === null, notices });
     term.onResize = (cols, rows) => {
@@ -276,10 +277,20 @@ export function createTabs(opts: TabsOptions): Tabs {
     }
   }
 
-  function write(s: Session, data: Uint8Array) {
+  async function write(s: Session, data: Uint8Array) {
     if (s.id === null || s.exited) return;
-    invoke("pty_write", { id: s.id, data: Array.from(data) }).catch((err) =>
-      console.error("misag: write failed", err),
+    await invoke("pty_write", { id: s.id, data: Array.from(data) });
+  }
+
+  /** Writes what the person typed, saying so when the tab does not take it. */
+  function typedInto(s: Session, data: Uint8Array) {
+    const topic = tabTopic(s, "write");
+    write(s, data).then(
+      () => notices.set(topic, null),
+      (err) => {
+        console.error("misag: write failed", err);
+        notices.set(topic, `What you typed in ${label(s)} did not reach it: ${errorText(err)}.`);
+      },
     );
   }
 

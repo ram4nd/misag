@@ -1450,6 +1450,20 @@ describe("process lifecycle", () => {
 });
 
 describe("input", () => {
+  test("input the tab refuses says so, and the next that goes through clears it", async () => {
+    await startApp();
+    await clickClaude();
+    failing.add("pty_write");
+    terms()[0].onData!("x");
+    await settle();
+    expect(noticeVisible()).toBe(true);
+    expect(noticeText()).toContain("did not reach it");
+    failing.delete("pty_write");
+    terms()[0].onData!("y");
+    await settle();
+    expect(noticeVisible()).toBe(false);
+  });
+
   test("text is sent as UTF-8 and binary input as raw bytes", async () => {
     await startApp();
     await clickClaude();

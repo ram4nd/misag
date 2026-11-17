@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -13,6 +13,12 @@ use std::time::Duration;
 /// How long a closed session's processes get to exit after the hang-up (SIGHUP on
 /// Unix; on Windows their console closing) before they are killed.
 pub const KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// How many bytes of input may wait for a session's program to read them. Far
+/// more than anyone types or pastes while a program is busy, so in practice only
+/// input to a program that has stopped reading is refused. A refused write returns
+/// an error, which the tab shows.
+pub const INPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 /// What a session runs: on Unix always through the user's login shell, so PATH and
 /// the rest of their environment are set up; on Windows, which has no login shells,
@@ -43,6 +49,8 @@ struct Session {
     /// Drained by a per-session writer thread, so a PTY that stops reading
     /// its input never blocks a command or another session.
     input: Sender<Vec<u8>>,
+    /// Bytes sent to `input` whose write to the PTY has not finished (see `INPUT_LIMIT`).
+    queued: Arc<AtomicUsize>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     pid: Option<u32>,
     /// Set once the child has been reaped, so SIGKILL never hits a reused pid.
@@ -389,11 +397,13 @@ impl Sessions {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let exited = Arc::new(ExitFlag::default());
         let (input, input_rx) = mpsc::channel::<Vec<u8>>();
+        let queued = Arc::new(AtomicUsize::new(0));
         lock(&self.map).insert(
             id,
             Arc::new(Session {
                 master: Mutex::new(pair.master),
                 input,
+                queued: queued.clone(),
                 killer: Mutex::new(child.clone_killer()),
                 pid: child.process_id(),
                 exited: exited.clone(),
@@ -405,7 +415,9 @@ impl Sessions {
         // Ends when the session is removed (sender dropped) or the PTY closes.
         std::thread::spawn(move || {
             for data in input_rx {
-                if let Err(e) = writer.write_all(&data).and_then(|_| writer.flush()) {
+                let written = writer.write_all(&data).and_then(|_| writer.flush());
+                queued.fetch_sub(data.len(), Ordering::Relaxed);
+                if let Err(e) = written {
                     eprintln!("misag: session {id} write failed: {e}");
                     break;
                 }
@@ -461,9 +473,25 @@ impl Sessions {
         Ok(id)
     }
 
-    /// Queues input for the session; never blocks on the PTY.
+    /// Queues input for the session; never blocks on the PTY. Fails while at least
+    /// `INPUT_LIMIT` bytes wait for the program to read them; a write of any size is
+    /// taken below that, so the queue can go past the limit by one write.
     pub fn write(&self, id: u32, data: Vec<u8>) -> Result<(), String> {
-        self.get(id)?.input.send(data).map_err(|_| format!("session {id} is closed"))
+        let s = self.get(id)?;
+        let len = data.len();
+        // Added up front, so writers at once cannot all slip under the limit, and judged
+        // by the count before this write, so a large write is refused only on a full queue.
+        let before = s.queued.fetch_add(len, Ordering::Relaxed);
+        if before >= INPUT_LIMIT {
+            s.queued.fetch_sub(len, Ordering::Relaxed);
+            return Err(format!(
+                "its program is not reading input ({before} bytes are still waiting); interrupt it or close the tab"
+            ));
+        }
+        s.input.send(data).map_err(|_| {
+            s.queued.fetch_sub(len, Ordering::Relaxed);
+            format!("session {id} is closed")
+        })
     }
 
     /// Like `spawn`, clamps 0 columns or rows to 1, which programs cannot draw in.
@@ -1101,6 +1129,25 @@ mod unix_tests {
         assert!(other.text().contains("ok:y"));
         s.kill(stalled.id);
         stalled.exit_code();
+    }
+
+    #[test]
+    fn input_is_refused_while_a_session_does_not_read_it_and_accepted_once_it_does() {
+        let s = sessions();
+        let p = spawn(&s, "stty raw -echo; echo ready; sleep 1; cat >/dev/null");
+        p.wait_for("ready");
+        let chunk = 64 * 1024;
+        let refused = (0..2 * INPUT_LIMIT / chunk).find_map(|_| s.write(p.id, vec![b'x'; chunk]).err());
+        let e = refused.expect("input queued without limit");
+        assert!(e.contains("not reading"), "{e}");
+        // Once cat drains the queue, input is taken again.
+        let start = Instant::now();
+        while s.write(p.id, b"y".to_vec()).is_err() {
+            assert!(start.elapsed() < TIMEOUT, "the queue never drained");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        s.kill(p.id);
+        p.exit_code();
     }
 
     #[test]

@@ -47,7 +47,7 @@ let runs: RunController<Tab>;
 let busy: boolean;
 let background: boolean;
 let live: () => Promise<boolean>;
-let write: (text: string) => void;
+let write: (text: string) => void | Promise<void>;
 /** Called as a flow takes or releases the tab's lock. */
 let onLock: () => void;
 const tab: Tab = { tabId: "t1" };
@@ -61,7 +61,7 @@ beforeEach(() => {
   busy = false;
   background = false;
   live = async () => true;
-  write = (text) => typed.push(text);
+  write = (text) => void typed.push(text);
   onLock = () => {};
   backend.calls = [];
   backend.unsent = [];
@@ -391,3 +391,37 @@ describe("reading the runs", () => {
     expect(runs.waiting(tab)).toBe(false);
   });
 });
+
+describe("a tab that does not take what is typed", () => {
+  const refuse = () => {
+    // As the tab does: the write is sent, and fails later.
+    write = () => Promise.reject(new Error("its program is not reading input"));
+  };
+
+  test("a step's prompt it refuses is not submitted, and the run waits for the person", async () => {
+    refuse();
+    const done = runs.proceed({ id: 7, tabId: "t1", stepId: "s", flowId: 1, status: "waiting" } as unknown as Run, "ok");
+    await vi.runAllTimersAsync();
+    expect(await done).toBeNull();
+    expect(backend.calls).toContain("flow_unsent");
+    expect(JSON.stringify(backend.unsent)).toContain("could not be typed");
+  });
+
+  test("a briefing it refuses stops the run, saying why", async () => {
+    refuse();
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(backend.calls).toContain("flow_stop");
+  });
+
+  test("a manual prompt's draft it refuses is not recorded as pasted", async () => {
+    refuse();
+    backend.runs = [{ id: 8, tabId: "t1", stepId: "m", step: "Manual prompt", flowId: 1, status: "manual", prefill: true }];
+    await runs.poll();
+    await vi.runAllTimersAsync();
+    expect(backend.calls).toContain("flow_prefill_text");
+    expect(backend.calls).not.toContain("flow_prefilled");
+  });
+});
+
