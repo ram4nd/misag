@@ -466,10 +466,11 @@ impl Sessions {
         self.get(id)?.input.send(data).map_err(|_| format!("session {id} is closed"))
     }
 
+    /// Like `spawn`, clamps 0 columns or rows to 1, which programs cannot draw in.
     pub fn resize(&self, id: u32, cols: u16, rows: u16) -> Result<(), String> {
         let s = self.get(id)?;
         lock(&s.master)
-            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
             .map_err(|e| format!("session {id} resize failed: {e:#}"))
     }
 
@@ -1169,6 +1170,16 @@ mod unix_tests {
         s.write(p.id, b"\n".to_vec()).unwrap();
         p.exit_code();
         assert!(p.text().contains("30 100"), "output: {:?}", p.text());
+    }
+
+    #[test]
+    fn resize_to_zero_is_clamped_like_spawn() {
+        let s = sessions();
+        let p = spawn(&s, "read _; stty size");
+        s.resize(p.id, 0, 0).unwrap();
+        s.write(p.id, b"\n".to_vec()).unwrap();
+        p.exit_code();
+        assert!(p.text().contains("1 1"), "output: {:?}", p.text());
     }
 
     #[test]
