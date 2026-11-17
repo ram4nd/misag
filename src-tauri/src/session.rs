@@ -109,8 +109,9 @@ impl Session {
                     return;
                 }
                 // The child is not reaped yet (`exited` is false), so its pid, and
-                // therefore its process group, still exist.
-                signal_groups(pid as libc::pid_t, foreground, libc::SIGKILL);
+                // therefore its process group and session, still exist.
+                let pid = pid as libc::pid_t;
+                signal_groups(&session_groups(pid, foreground), libc::SIGKILL);
             }))
         }
         // The shell is gone already (Windows has no hang-up signal). Once the session
@@ -125,13 +126,16 @@ impl Session {
     }
 }
 
-/// Sends `signal` to the process group of `pid` and to `foreground` if that is
-/// another group. The caller makes sure neither can have been reused: `pid` is a
-/// child it has not reaped yet.
+/// How long after killing what a session's exited child left running its terminal
+/// may still be held before that is logged (see `end_leftovers`).
 #[cfg(unix)]
-fn signal_groups(pid: libc::pid_t, foreground: Option<libc::pid_t>, signal: libc::c_int) {
-    let groups = [Some(pid), foreground.filter(|&fg| fg > 0 && fg != pid)];
-    for group in groups.into_iter().flatten() {
+const KILL_CHECK: Duration = Duration::from_millis(250);
+
+/// Sends `signal` to each process group in `groups`, which the caller made sure
+/// are a session's (see `session_groups`).
+#[cfg(unix)]
+fn signal_groups(groups: &[libc::pid_t], signal: libc::c_int) {
+    for &group in groups {
         // SAFETY: plain syscall.
         if unsafe { libc::kill(-group, signal) } == -1 {
             let e = std::io::Error::last_os_error();
@@ -143,25 +147,114 @@ fn signal_groups(pid: libc::pid_t, foreground: Option<libc::pid_t>, signal: libc
     }
 }
 
+/// The session id of process `pid`.
+#[cfg(unix)]
+fn session_of(pid: libc::pid_t) -> std::io::Result<libc::pid_t> {
+    // SAFETY: plain syscall.
+    match unsafe { libc::getsid(pid) } {
+        -1 => Err(std::io::Error::last_os_error()),
+        sid => Ok(sid),
+    }
+}
+
+/// The process groups of the session that unreaped child `sid` leads: its own
+/// group, `foreground` if that group's leader is in the session, and every group
+/// with a process in the session, such as the `&` jobs of an interactive shell,
+/// which job control puts in groups of their own. A process that left the session
+/// (`setsid`) is not among them.
+///
+/// The child is not reaped, so its pid stays its session's id and no other
+/// session can have it; a group listed here could end and its id be reused only
+/// in the moment before the caller signals it.
+#[cfg(unix)]
+fn session_groups(sid: libc::pid_t, foreground: Option<libc::pid_t>) -> Vec<libc::pid_t> {
+    let mut groups = vec![sid];
+    let mut unexpected = None;
+    let mut in_session = |pid: libc::pid_t| match session_of(pid) {
+        Ok(of) => of == sid,
+        Err(e) => {
+            // ESRCH: the process ended in the meantime.
+            if e.raw_os_error() != Some(libc::ESRCH) {
+                unexpected.get_or_insert(e);
+            }
+            false
+        }
+    };
+    groups.extend(foreground.filter(|&fg| fg > 0 && in_session(fg)));
+    match proc_info::pids() {
+        Ok(pids) => {
+            for pid in pids.into_iter().filter(|&pid| pid != sid && in_session(pid)) {
+                // SAFETY: plain syscall.
+                let group = unsafe { libc::getpgid(pid) };
+                if group > 0 {
+                    groups.push(group);
+                }
+            }
+        }
+        Err(e) => eprintln!(
+            "misag: cannot list processes, so only the main and foreground process groups of session {sid} are signalled: {e}"
+        ),
+    }
+    if let Some(e) = unexpected {
+        eprintln!("misag: cannot tell the session of some processes, so some of session {sid}'s process groups may not be signalled: {e}");
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
 /// After a session's child `pid` exited, unreaped: ends what still holds its
 /// terminal the way closing the tab does. Nothing, if the terminal is let go within
-/// `pty_io::DRAIN_MAX`; else a hang-up to the child's process group and to the
-/// last foreground group seen (if it is in the child's session), then SIGKILL to
-/// both once `grace` passes with the terminal still held.
+/// `pty_io::DRAIN_MAX`; else a hang-up to the process groups of the child's
+/// session (see `session_groups`), then SIGKILL to them, listed again, once `grace`
+/// passes with the terminal still held.
 #[cfg(unix)]
 fn end_leftovers(exit: &pty_io::Exit, pid: libc::pid_t, grace: Duration) {
-    if exit.hung_up_within(pty_io::DRAIN_MAX) {
-        return;
+    match exit.hung_up_within(pty_io::DRAIN_MAX) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => eprintln!("misag: cannot tell whether anything still holds the terminal of exited pid {pid}, so its session is hung up: {e}"),
     }
-    // The session id is the child's pid, which cannot be reused while the child is
-    // unreaped, so a group whose leader is in that session is one of the tab's.
-    // SAFETY: plain syscall.
-    let foreground = exit.foreground().filter(|&fg| unsafe { libc::getsid(fg) } == pid);
-    signal_groups(pid, foreground, libc::SIGHUP);
-    if exit.hung_up_within(grace) {
-        return;
+    signal_groups(&session_groups(pid, exit.foreground()), libc::SIGHUP);
+    match exit.hung_up_within(grace) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!(
+                "misag: cannot tell whether the session of exited pid {pid} let go of its terminal after the hang-up, so it is killed after the full {grace:?}: {e}"
+            );
+            std::thread::sleep(grace);
+        }
     }
-    signal_groups(pid, foreground, libc::SIGKILL);
+    // Listed again: the foreground may be another group by now, and a job may have started.
+    signal_groups(&session_groups(pid, exit.foreground()), libc::SIGKILL);
+    match exit.hung_up_within(KILL_CHECK) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "misag: the terminal of exited pid {pid} is still held after its session's process groups were killed: a process that left the session (setsid) keeps running and holding it"
+        ),
+        Err(e) => eprintln!("misag: cannot tell whether killing the session of exited pid {pid} let go of its terminal: {e}"),
+    }
+}
+
+/// Reaps a session's exited child and flags it as reaped when dropped, so that
+/// happens even when ending what it left running panics or cannot start.
+#[cfg(unix)]
+struct Reap {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    exited: Arc<ExitFlag>,
+    id: u32,
+}
+
+#[cfg(unix)]
+impl Drop for Reap {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("misag: session {}: ending what its shell left running panicked; reaping the shell anyway", self.id);
+        }
+        reap(&mut *self.child, self.id);
+        self.exited.set();
+    }
 }
 
 /// Waits for a session's child to exit and reaps it; returns its exit code (-1 if
@@ -507,16 +600,23 @@ impl Sessions {
             std::thread::spawn(move || match pid.map(|pid| (pid, pty_io::wait_exit(pid))) {
                 Some((pid, Ok(code))) => {
                     exit.child_exited();
-                    std::thread::spawn(move || {
+                    let reaped = Reap { child, exited, id };
+                    // On failure the closure is dropped, and with it `reaped`, which reaps the child.
+                    let ended = std::thread::Builder::new().name(format!("session {id} leftovers")).spawn(move || {
                         end_leftovers(&exit, pid, grace);
-                        reap(&mut *child, id);
-                        exited.set();
+                        drop(reaped);
                     });
+                    if let Err(e) = ended {
+                        eprintln!("misag: session {id}: cannot start a thread to end what its shell left running, so that keeps running: {e}");
+                    }
                     code
                 }
                 failed => {
-                    if let Some((pid, Err(e))) = failed {
-                        eprintln!("misag: session {id}: waiting for pid {pid} to exit failed, reaping it instead: {e}");
+                    match failed {
+                        Some((pid, Err(e))) => {
+                            eprintln!("misag: session {id}: waiting for pid {pid} to exit failed, reaping it instead: {e}")
+                        }
+                        _ => eprintln!("misag: session {id} has no process id, so what it leaves running is not ended when it exits"),
                     }
                     let code = reap(&mut *child, id);
                     exited.set();
@@ -678,7 +778,11 @@ impl Sessions {
     /// which callers must not read as "nothing in the foreground".
     #[cfg(windows)]
     pub fn foreground(&self, id: u32) -> Result<Vec<u32>, String> {
-        let pid = self.get(id)?.pid.ok_or_else(|| format!("session {id} has no process id"))?;
+        let s = self.get(id)?;
+        if lock(&s.master).is_none() {
+            return Err(format!("session {id} has exited"));
+        }
+        let pid = s.pid.ok_or_else(|| format!("session {id} has no process id"))?;
         let all = crate::win::processes().map_err(|e| format!("session {id}: cannot list processes: {e}"))?;
         Ok(crate::proc_tree::foreground_candidates(pid, &all))
     }
@@ -761,6 +865,8 @@ mod pty_io {
     /// ... but no longer than this, in case a job keeps writing. What still holds
     /// the PTY this long after the child exited is ended (see `Exit::hung_up_within`).
     pub const DRAIN_MAX: Duration = Duration::from_secs(1);
+    /// How long `Exit::hung_up_within` pauses after its poll woke for output only.
+    const HANG_UP_PAUSE: Duration = Duration::from_millis(50);
 
     /// The reader, the writer, and what the child's waiter needs once it exited.
     pub fn open(master: RawFd) -> Result<(Reader, Writer, Exit)> {
@@ -797,7 +903,7 @@ mod pty_io {
             (reader, writer, watch, Arc::new(ended), end)
         };
         let foreground = Arc::new(AtomicI32::new(0));
-        let reader = Reader { file: reader, ended: ended.clone(), ended_at: None, cut_off: false, foreground: foreground.clone() };
+        let reader = Reader { file: reader, ended: ended.clone(), ended_at: None, cut_off: false, foreground: foreground.clone(), told_foreground_failure: false };
         Ok((reader, Writer { file: writer, ended }, Exit { end: Some(end), master: watch, foreground }))
     }
 
@@ -837,15 +943,25 @@ mod pty_io {
             self.end = None;
         }
 
-        /// Whether, within `timeout`, nothing holds the PTY's terminal side any more.
-        /// An error counts as "still held", so the caller ends what may be left.
-        pub fn hung_up_within(&self, timeout: Duration) -> bool {
-            match wait(self.master.as_raw_fd(), 0, None, Some(timeout)) {
-                Ok((hung_up, _)) => hung_up,
-                Err(e) => {
-                    eprintln!("misag: cannot tell whether a PTY is still in use: {e}");
-                    false
+        /// Whether, within `timeout`, nothing holds the PTY's terminal side any more:
+        /// a hang-up (or error) on the master. It is polled for input too, as macOS
+        /// watches nothing on a descriptor polled for no events and so would never
+        /// report its hang-up; nothing is read here, so output stays the reader's,
+        /// and a wake-up for output alone is waited out in short pauses until the
+        /// deadline instead of spinning on output nobody reads any more.
+        pub fn hung_up_within(&self, timeout: Duration) -> Result<bool> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let (revents, _) = wait(self.master.as_raw_fd(), libc::POLLIN | libc::POLLHUP, None, Some(left))?;
+                if revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return Ok(true);
                 }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::sleep(left.min(HANG_UP_PAUSE));
             }
         }
 
@@ -857,9 +973,9 @@ mod pty_io {
     }
 
     /// Waits up to `timeout` (None: for good) for `fd` to have any event of
-    /// `events`, or a hang-up or error, or for `ended` to close. Returns (fd has
-    /// any event, ended); (false, false) when the timeout passed.
-    fn wait(fd: RawFd, events: libc::c_short, ended: Option<&OwnedFd>, timeout: Option<Duration>) -> Result<(bool, bool)> {
+    /// `events`, or a hang-up or error, or for `ended` to close. Returns (fd's
+    /// events, ended); (0, false) when the timeout passed.
+    fn wait(fd: RawFd, events: libc::c_short, ended: Option<&OwnedFd>, timeout: Option<Duration>) -> Result<(libc::c_short, bool)> {
         let mut fds = [
             libc::pollfd { fd, events, revents: 0 },
             libc::pollfd { fd: ended.map_or(-1, AsRawFd::as_raw_fd), events: libc::POLLIN, revents: 0 },
@@ -876,7 +992,7 @@ mod pty_io {
         if (fds[0].revents | fds[1].revents) & libc::POLLNVAL != 0 {
             return Err(Error::from_raw_os_error(libc::EBADF));
         }
-        Ok((fds[0].revents != 0, fds[1].revents != 0))
+        Ok((fds[0].revents, fds[1].revents != 0))
     }
 
     pub struct Reader {
@@ -888,6 +1004,8 @@ mod pty_io {
         cut_off: bool,
         /// The terminal's foreground process group, as last seen (see `Exit::foreground`).
         foreground: Arc<AtomicI32>,
+        /// Whether reading the foreground process group failed and that was logged.
+        told_foreground_failure: bool,
     }
 
     impl Reader {
@@ -916,12 +1034,12 @@ mod pty_io {
                     None => None,
                 };
                 let ended = self.ended_at.is_none().then_some(&*self.ended);
-                let (ready, now_ended) = wait(self.file.as_raw_fd(), libc::POLLIN, ended, timeout)?;
+                let (events, now_ended) = wait(self.file.as_raw_fd(), libc::POLLIN, ended, timeout)?;
                 if now_ended {
                     self.ended_at = Some(Instant::now());
                     continue;
                 }
-                if !ready {
+                if events == 0 {
                     return Ok(0);
                 }
                 match self.file.read(buf) {
@@ -931,6 +1049,15 @@ mod pty_io {
                         let group = unsafe { libc::tcgetpgrp(self.file.as_raw_fd()) };
                         if group > 0 {
                             self.foreground.store(group, Ordering::Relaxed);
+                        } else if group < 0 && !self.told_foreground_failure {
+                            let e = Error::last_os_error();
+                            // EIO, ENOTTY: the terminal side has closed.
+                            if !matches!(e.raw_os_error(), Some(libc::EIO | libc::ENOTTY)) {
+                                self.told_foreground_failure = true;
+                                eprintln!(
+                                    "misag: cannot read a terminal's foreground process group, so a foreground job may be missed when its shell exits: {e}"
+                                );
+                            }
                         }
                         return Ok(n);
                     }
@@ -1072,6 +1199,11 @@ mod proc_info {
         std::fs::read_link(format!("/proc/{pid}/cwd")).map(super::live_path)
     }
 
+    /// Every process's pid (threads other than the main one are not listed).
+    pub fn pids() -> std::io::Result<Vec<libc::pid_t>> {
+        Ok(std::fs::read_dir("/proc")?.filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok()).collect())
+    }
+
     pub fn name(pid: u32) -> Option<String> {
         std::fs::read_to_string(format!("/proc/{pid}/comm")).ok().map(|name| name.trim_end().to_owned())
     }
@@ -1117,6 +1249,21 @@ mod proc_info {
         let path = unsafe { CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast::<c_char>()) };
         use std::os::unix::ffi::OsStrExt;
         Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path.to_bytes())))
+    }
+
+    /// Every process's pid.
+    pub fn pids() -> std::io::Result<Vec<libc::pid_t>> {
+        // SAFETY: a null buffer asks only for (an estimate of) how many there are.
+        let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let n = usize::try_from(n).map_err(|_| Error::last_os_error())?;
+        // Room for processes started since.
+        let mut pids: Vec<libc::pid_t> = vec![0; n + 64];
+        let size = c_int::try_from(pids.len() * std::mem::size_of::<libc::pid_t>()).map_err(Error::other)?;
+        // SAFETY: the kernel writes at most `size` bytes; returns how many pids it wrote.
+        let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), size) };
+        let n = usize::try_from(n).map_err(|_| Error::last_os_error())?;
+        pids.truncate(n);
+        Ok(pids)
     }
 
     pub fn name(pid: u32) -> Option<String> {
@@ -1428,6 +1575,50 @@ mod unix_tests {
         assert!(Sessions::process_name(job).is_some(), "killed before the tab ended");
         let took = wait_gone(job, Duration::from_secs(4));
         assert!(took >= Duration::from_millis(300), "killed before the grace period, after {took:?}");
+    }
+
+    #[test]
+    fn a_job_in_its_own_process_group_is_killed_after_the_shell_exits() {
+        let s = sessions();
+        // An interactive shell, as a terminal tab runs, puts a `&` job in its own
+        // process group under job control.
+        let args = ["--norc", "--noprofile", "-i"].map(String::from).to_vec();
+        let p = spawn_with(&s, Launch::Program { program: "bash".into(), args }, None, vec![]);
+        s.write(p.id, b"sh -c \"trap '' HUP; exec sleep 10\" & echo \"b\"g:$!; sleep 0.2; exit\n".to_vec()).unwrap();
+        p.wait_for("bg:");
+        let job = number_after(&p.text(), "bg:");
+        let _guard = KillOnDrop(job);
+        // (The terminal echoes the typed line, so the tag is split there.)
+        // SAFETY: plain syscalls on a process this test started.
+        let group = unsafe { libc::getpgid(job as libc::pid_t) };
+        assert_eq!(group, job as libc::pid_t, "the job has its own process group");
+        p.exit_code();
+        assert!(Sessions::process_name(job).is_some(), "killed before the tab ended");
+        let took = wait_gone(job, Duration::from_secs(4));
+        assert!(took >= Duration::from_millis(300), "killed before the grace period, after {took:?}");
+    }
+
+    #[test]
+    fn hang_up_is_seen_without_taking_the_readers_output() {
+        let (mut master, mut slave) = (0, 0);
+        // SAFETY: openpty writes two descriptors, which this test closes.
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        let (mut reader, _writer, exit) = pty_io::open(master).unwrap();
+        // SAFETY: writing a byte buffer to a descriptor this test owns.
+        assert_eq!(unsafe { libc::write(slave, b"kept".as_ptr().cast(), 4) }, 4);
+        let start = Instant::now();
+        assert!(!exit.hung_up_within(Duration::from_millis(300)).unwrap(), "the terminal is still held");
+        assert!(start.elapsed() >= Duration::from_millis(300), "gave up early, after {:?}", start.elapsed());
+        let mut buf = [0u8; 16];
+        let n = reader.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"kept", "the output was taken");
+        // SAFETY: closing descriptors this test owns.
+        unsafe { libc::close(slave) };
+        let start = Instant::now();
+        assert!(exit.hung_up_within(Duration::from_secs(2)).unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500), "saw the hang-up only after {:?}", start.elapsed());
+        // SAFETY: closing a descriptor this test owns.
+        unsafe { libc::close(master) };
     }
 
     #[test]
