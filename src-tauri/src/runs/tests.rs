@@ -164,7 +164,7 @@ fn a_restart_during_the_briefing_says_so_and_briefs_claude_again() {
 fn a_slash_prompt_that_reaches_claude_carries_a_finished_flow_s_note() {
     let (_db, mut conn, flow) = setup("runs-stop-closing-slash", &runnable());
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     assert_eq!(on_prompt(&mut conn, &tab("t1"), "/review the diff").unwrap(), finished());
 }
 
@@ -172,8 +172,8 @@ fn a_slash_prompt_that_reaches_claude_carries_a_finished_flow_s_note() {
 fn a_stopped_briefed_run_tells_claude_with_the_person_s_next_prompt() {
     let (_db, mut conn, flow) = setup("runs-stop-closing", &runnable());
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    stop(&conn, run).unwrap();
-    assert!(stop(&conn, run).unwrap_err().contains("no active run"));
+    stop(&mut conn, run).unwrap();
+    assert!(stop(&mut conn, run).unwrap_err().contains("no active run"));
     // A command Claude Code runs itself is not a message to Claude, so it does not carry it.
     assert_eq!(on_prompt(&mut conn, &tab("t1"), "/model").unwrap(), None);
     assert_eq!(on_prompt(&mut conn, &tab("t2"), "Hi").unwrap(), None, "another tab");
@@ -182,14 +182,14 @@ fn a_stopped_briefed_run_tells_claude_with_the_person_s_next_prompt() {
     // Claude got the briefing even if it has yet to reply.
     let (_db, mut conn, flow) = setup("runs-stop-briefing", &runnable());
     let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), finished());
     // A run still clearing never briefed Claude.
     let mut g = runnable();
     g.nodes[0].clear = true;
     let (_db, mut conn, flow) = setup("runs-stop-clearing", &g);
     let run = start(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), None);
 }
 
@@ -197,10 +197,10 @@ fn a_stopped_briefed_run_tells_claude_with_the_person_s_next_prompt() {
 fn a_new_run_or_a_clear_drops_the_finished_flow_s_note() {
     let (_db, mut conn, flow) = setup("runs-closing-dropped", &runnable());
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     // The new run's briefing supersedes it.
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
     assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), None);
 }
@@ -490,9 +490,9 @@ fn a_tab_runs_one_flow_at_a_time() {
     assert!(err.contains("already running"), "{err}");
     begin(&mut conn, flow, &tab("t2")).unwrap();
     let first = active(&conn).unwrap()[0].id;
-    stop(&conn, first).unwrap();
+    stop(&mut conn, first).unwrap();
     begin(&mut conn, flow, &tab("t1")).unwrap();
-    assert!(stop(&conn, 999).unwrap_err().contains("no active run"));
+    assert!(stop(&mut conn, 999).unwrap_err().contains("no active run"));
 }
 
 #[test]
@@ -810,7 +810,7 @@ fn a_late_paste_record_for_an_ended_run_changes_nothing() {
     let (_db, mut conn, flow) = setup("runs-prefilled-ended", &manual_prompt_first("Fix it"));
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
     let token = state(&conn, run).prefill_token.unwrap();
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     // Even one whose state this version cannot read (as a newer version might store it).
     conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
     conn.execute("UPDATE flow_runs SET resume = 'someday', prefill = 1 WHERE id = ?1", [run]).unwrap();
@@ -1058,7 +1058,7 @@ fn a_stopped_run_moved_on_by_hand_takes_no_lock_for_a_prompt() {
             conn.execute_batch("PRAGMA ignore_check_constraints = OFF").unwrap();
         }
         // A closed tab owes no finished flow's note, which a prompt would carry.
-        stop_tab(&conn, &t).unwrap();
+        stop_tab(&mut conn, &t).unwrap();
         assert_eq!(column::<i64>(&conn, run, "typed"), 0, "unreadable: {unreadable}");
         // The hook, say, holds the write lock.
         let writer = db::connect_existing(&path).unwrap();
@@ -1146,7 +1146,7 @@ fn a_run_that_clears_takes_its_first_step_once_claude_has_cleared() {
 fn a_stopped_run_that_clears_is_gone() {
     let (_db, mut conn, flow) = setup("runs-clear-stopped", &clearing());
     let started = begin(&mut conn, flow, &tab("t1")).unwrap();
-    stop(&conn, started.run_id).unwrap();
+    stop(&mut conn, started.run_id).unwrap();
     assert_eq!(cleared(&mut conn, started.run_id).unwrap(), Cleared::Gone);
 }
 
@@ -1198,9 +1198,9 @@ fn after_a_restart_a_run_that_cannot_be_read_does_not_hold_up_the_others() {
 fn closing_a_tab_stops_its_run() {
     let (_db, mut conn, flow) = setup("runs-close", &runnable());
     begin(&mut conn, flow, &tab("t1")).unwrap();
-    stop_tab(&conn, &tab("t1")).unwrap();
+    stop_tab(&mut conn, &tab("t1")).unwrap();
     assert!(active(&conn).unwrap().is_empty());
-    stop_tab(&conn, &tab("t1")).unwrap();
+    stop_tab(&mut conn, &tab("t1")).unwrap();
 }
 
 #[test]
@@ -1215,7 +1215,7 @@ fn a_run_whose_steps_cannot_be_read_is_still_listed() {
     assert!(runs[0].outputs.is_empty());
     assert_eq!((runs[0].done, runs[0].total), (0, 0));
     // It can still be stopped.
-    stop(&conn, runs[0].id).unwrap();
+    stop(&mut conn, runs[0].id).unwrap();
     assert_eq!(active(&conn).unwrap().len(), 1);
 }
 
@@ -1339,7 +1339,7 @@ fn a_second_continue_is_refused_and_changes_nothing() {
     let running = only_run(&conn);
     assert!(go_on(&mut conn, id).unwrap_err().contains("does not need attention"));
     assert_eq!(only_run(&conn), running);
-    stop(&conn, id).unwrap();
+    stop(&mut conn, id).unwrap();
     assert!(go_on(&mut conn, id).unwrap_err().contains("no active run"));
 }
 
@@ -1448,7 +1448,7 @@ fn other_tabs_and_finished_runs_are_left_alone() {
     assert_eq!(on_stop(&mut conn, &tab("t9"), Some("FLOW: pass")).unwrap(), None);
     begin(&mut conn, flow, &tab("t1")).unwrap();
     let run = only_run(&conn).id;
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), None);
     assert!(pick(&mut conn, run, "fail").unwrap_err().contains("no active run"));
 }
@@ -1592,7 +1592,7 @@ fn an_unsent_prompt_without_the_rules_leaves_claude_briefed() {
     assert!(unsent(&mut conn, run, "p", reminder.briefs, "Claude left.").unwrap());
     assert!(briefed(&conn, run));
     // So stopping the run still tells Claude the flow finished.
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     assert_eq!(on_prompt(&mut conn, &t, "Thanks").unwrap(), finished());
 }
 
@@ -1613,7 +1613,7 @@ fn unsent_leaves_a_run_that_moved_on_alone() {
     assert_eq!(only_run(&conn).note, before.note);
     assert!(go_on(&mut conn, run).unwrap().starts_with("Go on with the flow step"), "Continue still reminds Claude");
     // Stopped: nothing to do.
-    stop(&conn, run).unwrap();
+    stop(&mut conn, run).unwrap();
     assert!(!unsent(&mut conn, run, "p", true, "x").unwrap());
     assert!(active(&conn).unwrap().is_empty());
 }
@@ -1764,10 +1764,10 @@ fn a_run_this_version_cannot_read_can_still_be_stopped_and_owes_what_its_row_say
     for (tab_id, odd, owes) in [("t1", "clear = 'later'", false), ("t2", "resume = 'someday'", true)] {
         let run = begin(&mut conn, flow, &tab(tab_id)).unwrap().run_id;
         conn.execute(&format!("UPDATE flow_runs SET {odd} WHERE id = ?1"), [run]).unwrap();
-        stop(&conn, run).unwrap();
+        stop(&mut conn, run).unwrap();
         assert_eq!((column::<String>(&conn, run, "status"), column::<bool>(&conn, run, "closing")), ("stopped".into(), owes), "{odd}");
     }
-    assert!(stop(&conn, 999).unwrap_err().contains("no active run 999"));
+    assert!(stop(&mut conn, 999).unwrap_err().contains("no active run 999"));
 }
 
 /// The stored columns a stop clears or sets: status, note, resume, prefill and closing.
@@ -1786,8 +1786,8 @@ fn every_way_of_stopping_a_readable_run_leaves_the_same_row() {
         let needing = RunState { prefill_token: Some(5), ..at_step("p", needs("why", Some(Resume::Prompt), true)) };
         needing.save(&conn, run).unwrap();
         match how {
-            "stop" => stop(&conn, run).unwrap(),
-            "stop_tab" => stop_tab(&conn, &tab("t1")).unwrap(),
+            "stop" => stop(&mut conn, run).unwrap(),
+            "stop_tab" => stop_tab(&mut conn, &tab("t1")).unwrap(),
             _ => after_restart(&mut conn, &[]).unwrap(),
         }
         // Claude has the run's rules, so ■ owes it the note that the flow is finished;
@@ -1816,7 +1816,7 @@ fn a_run_whose_columns_have_the_wrong_type_does_not_hold_up_the_others() {
     after_restart(&mut conn, &[tab("odd"), tab("fine")]).unwrap();
     assert_eq!(column::<String>(&conn, odd, "status"), "running");
     // It can still be stopped.
-    stop(&conn, odd).unwrap();
+    stop(&mut conn, odd).unwrap();
     assert_eq!(column::<String>(&conn, odd, "status"), "stopped");
 }
 

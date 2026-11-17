@@ -403,7 +403,7 @@ mod tests {
             crate::runs::on_stop(&mut runs, &tid(tab), Some("Ready")).unwrap();
         }
         let idle_run = crate::runs::active(&runs).unwrap()[1].id;
-        crate::runs::stop(&runs, idle_run).unwrap();
+        crate::runs::stop(&mut runs, idle_run).unwrap();
         for status in ["running", "manual", "attention"] {
             // A run needs attention saying why (see the CHECKs on flow_runs).
             runs.execute("UPDATE flow_runs SET status = ?1, note = iif(?1 = 'attention', 'why', NULL) WHERE tab_id = 't1'", [status])

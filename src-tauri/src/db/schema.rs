@@ -854,15 +854,17 @@ mod tests {
         drop(conn);
         // The connection that migrated enforces foreign keys again, and they still
         // lead to the rebuilt table.
-        let conn = connect(&path).unwrap();
+        let mut conn = connect(&path).unwrap();
         let fk: bool = conn.pragma_query_value(None, "foreign_keys", |r| r.get(0)).unwrap();
         assert!(fk);
         let db = Db::open(path.clone()).unwrap();
-        let count = |table: &str| -> i64 { conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap() };
-        assert_eq!((count("flow_run_events"), count("flow_run_resumes")), (1, 1));
-        crate::runs::stop(&conn, run).unwrap();
+        let count = |conn: &Connection, table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!((count(&conn, "flow_run_events"), count(&conn, "flow_run_resumes")), (1, 1));
+        crate::runs::stop(&mut conn, run).unwrap();
         db.delete_flow(1).unwrap();
-        assert_eq!((count("flow_runs"), count("flow_run_events"), count("flow_run_resumes")), (0, 0, 0));
+        assert_eq!((count(&conn, "flow_runs"), count(&conn, "flow_run_events"), count(&conn, "flow_run_resumes")), (0, 0, 0));
     }
 
     #[test]
@@ -990,7 +992,7 @@ mod tests {
         db.save_flow_graph(flow, &crate::flows::tests::runnable()).unwrap();
         let mut runs = connect_existing(&path).unwrap();
         let run = crate::runs::start(&mut runs, flow, &tid("t1")).unwrap().run_id;
-        crate::runs::stop(&runs, run).unwrap();
+        crate::runs::stop(&mut runs, run).unwrap();
         drop((db, runs));
         let mut migrations = MIGRATIONS.to_vec();
         migrations.push("DELETE FROM flows;");
@@ -1075,7 +1077,7 @@ mod tests {
         conn.execute("UPDATE flow_runs SET briefing = 0, briefing_at = NULL, briefed = 1, note = 'odd', resume = 'someday' WHERE id = ?1", [run])
             .unwrap();
         conn.execute_batch("PRAGMA ignore_check_constraints = OFF").unwrap();
-        crate::runs::stop(&conn, run).unwrap();
+        crate::runs::stop(&mut conn, run).unwrap();
         let (status, closing): (String, bool) =
             conn.query_row("SELECT status, closing FROM flow_runs WHERE id = ?1", [run], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         assert_eq!((status.as_str(), closing), ("stopped", true));

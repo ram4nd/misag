@@ -1233,8 +1233,8 @@ fn stop_in(conn: &Connection, tab_id: &str) -> Result<(), String> {
 }
 
 /// Stops the tab's active run, if it has one: the tab is closing.
-pub fn stop_tab(conn: &Connection, tab_id: &TabId) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(sql)?;
+pub fn stop_tab(conn: &mut Connection, tab_id: &TabId) -> Result<(), String> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     stop_in(&tx, tab_id.as_str())?;
     tx.commit().map_err(sql)
 }
@@ -1278,8 +1278,8 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
 /// next prompt (see `RunState::owes_closing`). A run this version cannot read can
 /// still be stopped, by one UPDATE whose `closing` is then a best guess from the
 /// row (see `stop_run`); why it could not be read is logged.
-pub fn stop(conn: &Connection, run_id: i64) -> Result<(), String> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(sql)?;
+pub fn stop(conn: &mut Connection, run_id: i64) -> Result<(), String> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     if !stop_run(&tx, run_id, true)? {
         return Err(format!("there is no active run {run_id}"));
     }
