@@ -1227,8 +1227,12 @@ fn the_one_run_index_covers_the_active_statuses() {
     assert!(index.ends_with(&format!("WHERE status IN {ACTIVE}")), "{index}");
     assert_eq!(ACTIVE, sql_list(&Status::ACTIVE));
     // Every active status is one a run can be read in, and only those.
-    for status in [Status::Running, Status::Manual, Status::Attention, Status::Done, Status::Stopped] {
-        let active = !matches!(status, Status::Done | Status::Stopped);
+    for status in Status::ALL {
+        // No wildcard: a new status has to be placed here, and in `Status::ALL`.
+        let active = match status {
+            Status::Running | Status::Manual | Status::Attention => true,
+            Status::Done | Status::Stopped => false,
+        };
         assert_eq!(Status::ACTIVE.contains(&status), active, "{status:?}");
     }
     assert!(Status::LISTENING.iter().chain(&Status::PROMPTED).all(|s| Status::ACTIVE.contains(s)));

@@ -206,16 +206,20 @@ pub enum Cleared {
     Gone,
 }
 
-/// Statuses in which a run holds its tab (`Status::ACTIVE`), as SQL. The
-/// `one_active_run_per_tab` index in migration 7 lists the same ones; tests check
-/// they agree.
+/// Statuses in which a run holds its tab, as SQL: written out, since the
+/// `one_active_run_per_tab` index in migration 7 lists the same ones. A test checks
+/// both against `Status::ACTIVE`.
 pub(crate) const ACTIVE: &str = "('running', 'manual', 'attention')";
 
 impl Status {
-    /// The statuses in which a run holds its tab, which `ACTIVE` spells out as a
-    /// constant for SQL; a test checks they agree.
+    /// The statuses in which a run holds its tab, which the module's `ACTIVE`
+    /// writes out as SQL; a test checks they agree.
     #[cfg(test)]
     const ACTIVE: [Status; 3] = [Status::Running, Status::Manual, Status::Attention];
+
+    /// Every status, for tests to go through.
+    #[cfg(test)]
+    const ALL: [Status; 5] = [Status::Running, Status::Manual, Status::Attention, Status::Done, Status::Stopped];
 
     /// The statuses in which Claude's turn ending may move a run on (see `on_stop`).
     const LISTENING: [Status; 2] = [Status::Running, Status::Attention];
