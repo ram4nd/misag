@@ -206,11 +206,24 @@ pub enum Cleared {
     Gone,
 }
 
-/// Statuses in which a run holds its tab, as SQL. The `one_active_run_per_tab`
-/// index in migration 7 lists the same ones; a test checks they agree.
+/// Statuses in which a run holds its tab (`Status::ACTIVE`), as SQL. The
+/// `one_active_run_per_tab` index in migration 7 lists the same ones; tests check
+/// they agree.
 pub(crate) const ACTIVE: &str = "('running', 'manual', 'attention')";
 
 impl Status {
+    /// The statuses in which a run holds its tab, which `ACTIVE` spells out as a
+    /// constant for SQL; a test checks they agree.
+    #[cfg(test)]
+    const ACTIVE: [Status; 3] = [Status::Running, Status::Manual, Status::Attention];
+
+    /// The statuses in which Claude's turn ending may move a run on (see `on_stop`).
+    const LISTENING: [Status; 2] = [Status::Running, Status::Attention];
+
+    /// The statuses in which the person's prompt may change a run (see `on_prompt`),
+    /// besides a running one whose typed prompt is pending (`Phase::Typed`).
+    const PROMPTED: [Status; 2] = [Status::Manual, Status::Attention];
+
     fn as_str(self) -> &'static str {
         match self {
             Status::Running => "running",
@@ -231,6 +244,12 @@ impl Status {
             other => return Err(format!("a run has the status {other:?}, which this version does not know")),
         })
     }
+}
+
+/// `statuses` as an SQL list, such as `('running', 'manual')`.
+fn sql_list(statuses: &[Status]) -> String {
+    let quoted: Vec<String> = statuses.iter().map(|s| format!("'{}'", s.as_str())).collect();
+    format!("({})", quoted.join(", "))
 }
 
 fn sql(e: rusqlite::Error) -> String {
@@ -930,7 +949,7 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
     // taking the write lock.
     let listening = conn
         .query_row(
-            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status IN ('running', 'attention')",
+            &format!("SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status IN {}", sql_list(&Status::LISTENING)),
             [tab_id.as_str()],
             |_| Ok(()),
         )
@@ -1023,9 +1042,12 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
     // NeedsPerson (manual, attention) and Typed (running, typed 1 or 2).
     let waiting = conn
         .query_row(
-            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND (status IN ('manual', 'attention') OR (status = 'running' AND typed <> 0))
-             UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
-            [tab_id.as_str()],
+            &format!(
+                "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND (status IN {} OR (status = ?2 AND typed <> 0))
+                 UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
+                sql_list(&Status::PROMPTED)
+            ),
+            params![tab_id.as_str(), Status::Running.as_str()],
             |_| Ok(()),
         )
         .optional()
@@ -1212,8 +1234,8 @@ fn stop_run(conn: &Connection, run_id: i64, tab_open: bool) -> Result<bool, Stri
         Some(Err(why)) => {
             eprintln!("misag: run {run_id} is stopped by its row alone, as {why}");
             conn.execute(
-                &format!("UPDATE flow_runs SET status = 'stopped', closing = ?3 AND ({OWES_CLOSING}), typed = 0, updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
-                params![run_id, now(), tab_open],
+                &format!("UPDATE flow_runs SET status = ?4, closing = ?3 AND ({OWES_CLOSING}), typed = 0, updated_at = ?2 WHERE id = ?1 AND status IN {ACTIVE}"),
+                params![run_id, now(), tab_open, Status::Stopped.as_str()],
             )
             .map_err(sql)?;
             Ok(true)
@@ -1332,10 +1354,10 @@ pub fn expire(conn: &mut Connection) -> Result<(), String> {
 /// (see `expire`). Only a running run can.
 fn timed_out(conn: &Connection, now: i64) -> Result<Vec<(i64, RunState)>, String> {
     let mut stmt = conn
-        .prepare_cached(&format!("SELECT id, started_at, {} FROM flow_runs WHERE status = 'running'", RunState::COLUMNS))
+        .prepare_cached(&format!("SELECT id, started_at, {} FROM flow_runs WHERE status = ?1", RunState::COLUMNS))
         .map_err(sql)?;
     let runs = stmt
-        .query_map([], |r| Ok((r.get::<_, i64>("id")?, r.get::<_, i64>("started_at")?, RunState::from_row(r))))
+        .query_map([Status::Running.as_str()], |r| Ok((r.get::<_, i64>("id")?, r.get::<_, i64>("started_at")?, RunState::from_row(r))))
         .map_err(sql)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(sql)?;

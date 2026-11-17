@@ -1225,6 +1225,13 @@ fn the_one_run_index_covers_the_active_statuses() {
     let index: String =
         conn.query_row("SELECT sql FROM sqlite_master WHERE name = 'one_active_run_per_tab'", [], |r| r.get(0)).unwrap();
     assert!(index.ends_with(&format!("WHERE status IN {ACTIVE}")), "{index}");
+    assert_eq!(ACTIVE, sql_list(&Status::ACTIVE));
+    // Every active status is one a run can be read in, and only those.
+    for status in [Status::Running, Status::Manual, Status::Attention, Status::Done, Status::Stopped] {
+        let active = !matches!(status, Status::Done | Status::Stopped);
+        assert_eq!(Status::ACTIVE.contains(&status), active, "{status:?}");
+    }
+    assert!(Status::LISTENING.iter().chain(&Status::PROMPTED).all(|s| Status::ACTIVE.contains(s)));
 }
 
 #[test]
