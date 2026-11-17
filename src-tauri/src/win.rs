@@ -305,10 +305,10 @@ pub fn args(pid: u32) -> Option<Vec<String>> {
 /// The clipboard's text; None if it holds none.
 pub fn clipboard_text() -> Result<Option<String>, String> {
     use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard};
-    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+    use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     const CF_UNICODETEXT: u32 = 13;
-    // SAFETY: the clipboard is opened and closed here; the locked text is NUL-terminated
-    // UTF-16 and copied out before it is unlocked.
+    // SAFETY: the clipboard is opened and closed here; the locked text is read only
+    // within its allocation's size and copied out before it is unlocked.
     unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
             return Ok(None);
@@ -333,10 +333,22 @@ pub fn clipboard_text() -> Result<Option<String>, String> {
             if locked.is_null() {
                 Err(format!("cannot read the clipboard: {}", Error::last_os_error()))
             } else {
-                let len = (0..).take_while(|&i| *locked.add(i) != 0).count();
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(locked, len));
-                GlobalUnlock(data);
-                Ok(text)
+                // It should end in a NUL, but the program that put it there may have
+                // left that out; the allocation's size bounds it either way. A size of
+                // 0 is an error only when the call says so.
+                windows_sys::Win32::Foundation::SetLastError(0);
+                let size = GlobalSize(data);
+                let failed = (size == 0).then(Error::last_os_error).filter(|e| e.raw_os_error() != Some(0));
+                if let Some(e) = failed {
+                    GlobalUnlock(data);
+                    Err(format!("cannot read the clipboard: {e}"))
+                } else {
+                    let units = std::slice::from_raw_parts(locked, size / 2);
+                    let len = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+                    let text = String::from_utf16_lossy(&units[..len]);
+                    GlobalUnlock(data);
+                    Ok(text)
+                }
             }
         };
         CloseClipboard();
