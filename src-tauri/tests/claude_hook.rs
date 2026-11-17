@@ -361,3 +361,38 @@ fn a_stop_whose_background_tasks_cannot_be_read_still_moves_the_run_on() {
     let log = std::fs::read_to_string(dir.join(claude::HOOK_LOG)).unwrap();
     assert!(log.contains("no session id"), "{log}");
 }
+
+#[test]
+fn a_failure_logged_by_stop_or_prompt_clears_once_the_hook_works_again_for_the_tab() {
+    let dir = temp_dir("hook-problem-clears");
+    let (app, db_path) = app_db(&dir);
+    let exe = Path::new(env!("CARGO_BIN_EXE_misag"));
+    let env = [(claude::TAB_ENV, "t1"), (claude::DB_ENV, db_path.to_str().unwrap())];
+    let other = [(claude::TAB_ENV, "t2"), (claude::DB_ENV, db_path.to_str().unwrap())];
+    let problem = || claude::hook_problem(&app).map(|p| p.message);
+    let bad_stop = r#"{"hook_event_name":"Stop","last_assistant_message":7}"#;
+    let bad_prompt = r#"{"hook_event_name":"UserPromptSubmit"}"#;
+
+    // Stop: another tab working leaves it; the same tab's next Stop clears it.
+    assert!(run_hook(exe, &env, bad_stop).success());
+    assert!(problem().is_some_and(|m| m.contains("could not move the flow run on")), "{:?}", problem());
+    run_stop_hook(&other, "Done.");
+    assert!(problem().is_some_and(|m| m.contains("could not move the flow run on")), "tab t2 working says nothing about t1");
+    run_prompt_hook(&env, "Go on");
+    assert!(problem().is_some_and(|m| m.contains("could not move the flow run on")), "a prompt working says nothing about Stop");
+    run_stop_hook(&env, "Done.");
+    assert_eq!(problem(), None);
+
+    // UserPromptSubmit, cleared by the same tab's next prompt.
+    assert!(run_hook(exe, &env, bad_prompt).success());
+    assert!(problem().is_some_and(|m| m.contains("could not tell the flow run about the prompt")), "{:?}", problem());
+    run_stop_hook(&env, "Done.");
+    assert!(problem().is_some(), "a Stop working says nothing about the prompt");
+    run_prompt_hook(&env, "Go on");
+    assert_eq!(problem(), None);
+
+    // A Stop that does its work but logs a failure along the way does not clear it.
+    let anonymous = serde_json::json!({ "hook_event_name": "Stop", "last_assistant_message": "Done.", "background_tasks": [] });
+    assert!(run_hook(exe, &env, &anonymous.to_string()).success());
+    assert!(problem().is_some_and(|m| m.contains("no session id")), "{:?}", problem());
+}
