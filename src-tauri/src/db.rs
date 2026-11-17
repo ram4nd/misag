@@ -773,14 +773,12 @@ impl Db {
                  FROM flows ORDER BY position, id",
             )
             .map_err(sql)?;
-        let flows = stmt
-            .query_map([], |r| {
-                Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)?, clear: r.get(3)?, unconfirmed: r.get(4)? })
-            })
-            .map_err(sql)?
-            .collect::<Result<_, _>>()
-            .map_err(sql);
-        flows
+        stmt.query_map([], |r| {
+            Ok(FlowSummary { id: r.get(0)?, name: r.get(1)?, archived: r.get(2)?, clear: r.get(3)?, unconfirmed: r.get(4)? })
+        })
+        .map_err(sql)?
+        .collect::<Result<_, _>>()
+        .map_err(sql)
     }
 
     /// Adds a flow after the others, with only its Start step.
@@ -849,8 +847,7 @@ impl Db {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
         let mut stored: Vec<i64> = {
             let mut stmt = tx.prepare("SELECT id FROM flows").map_err(sql)?;
-            let ids = stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?;
-            ids
+            stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?
         };
         let mut given = ids.to_vec();
         stored.sort_unstable();

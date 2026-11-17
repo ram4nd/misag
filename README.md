@@ -58,6 +58,8 @@ cargo test --manifest-path src-tauri/Cargo.toml   # backend: sessions, database,
 MISAG_LIVE_DIR=~/some/trusted/project cargo test --manifest-path src-tauri/Cargo.toml --test claude_live -- --ignored
 ```
 
+The CI workflow (`.github/workflows/ci.yml`) runs these tests (but not the live Claude tests, `claude_live`, which are `#[ignore]`), the build and `cargo clippy -- -D warnings` on every push to main and every pull request.
+
 The logo's source is `app-icon.svg`. After changing it, render `app-icon.png` at 1024px and regenerate the app icons with `pnpm tauri icon app-icon.png`.
 
 ## License

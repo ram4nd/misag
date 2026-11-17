@@ -2,6 +2,8 @@
 name = "misag"
 version = "0.3.0"
 edition = "2024"
+# Let-chains need 1.88.
+rust-version = "1.88"
 # The app; `misag-cli` is the console build of the same commands for Windows terminals.
 default-run = "misag"
 license = "GPL-3.0-only"

@@ -426,16 +426,15 @@ fn go(tx: &Transaction, run: &Stored, from: &Node, output: &str, steps: i64, by:
     if next.is_some_and(|n| n.kind == Kind::Prompt) && steps >= MAX_RUN_STEPS {
         return wait(format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on."));
     }
-    if let (Some(next), By::Flow) = (next, by) {
-        if let Some(max) = next.max_runs {
-            if runs_of(tx, run, &next.id)? >= i64::from(max) {
-                let name = next.name();
-                let times = if max == 1 { "once".to_string() } else { format!("{max} times") };
-                return wait(format!(
-                    "\"{name}\" has already run {times}, its limit. Pick \"{output}\" to run it once more, or another output."
-                ));
-            }
-        }
+    if let (Some(next), By::Flow) = (next, by)
+        && let Some(max) = next.max_runs
+        && runs_of(tx, run, &next.id)? >= i64::from(max)
+    {
+        let name = next.name();
+        let times = if max == 1 { "once".to_string() } else { format!("{max} times") };
+        return wait(format!(
+            "\"{name}\" has already run {times}, its limit. Pick \"{output}\" to run it once more, or another output."
+        ));
     }
     left(tx, run.id, &from.id, output)?;
     // Done: Claude, if it has the run's rules, is told it no longer needs to end
@@ -934,8 +933,7 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let tabs: Vec<String> = {
         let mut stmt = tx.prepare(&format!("SELECT DISTINCT tab_id FROM flow_runs WHERE status IN {ACTIVE}")).map_err(sql)?;
-        let tabs = stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?;
-        tabs
+        stmt.query_map([], |r| r.get(0)).map_err(sql)?.collect::<Result<_, _>>().map_err(sql)?
     };
     for tab in tabs {
         if open_tabs.iter().any(|open| open.as_str() == tab) {
