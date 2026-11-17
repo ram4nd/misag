@@ -29,16 +29,19 @@ struct SessionStart {
 fn record(input: &str, tab_id: &TabId, db_path: &Path, claude_pid: Option<u32>) -> Result<(), String> {
     let event: SessionStart = serde_json::from_str(input).map_err(|e| format!("bad hook payload: {e}"))?;
     let mut conn = db::connect_existing(db_path)?;
-    if event.source.as_deref() == Some("clear") {
-        // A run waiting for this clear goes on; a running step's prompt is gone, so
-        // Claude will not answer it.
-        crate::runs::clear_tab(
+    // A run waiting for this clear goes on; a running step's prompt is gone, so
+    // Claude will not answer it. A failure is returned only after the session is
+    // recorded, so the tab still does not resume the cleared conversation.
+    let cleared = match event.source.as_deref() {
+        Some("clear") => crate::runs::clear_tab(
             &mut conn,
             tab_id,
             "The conversation was cleared, so Claude no longer has this step's prompt. Pick an output to go on.",
-        )?;
-    }
-    db::record_claude_session(
+        )
+        .map_err(|e| format!("could not move the flow run on after the clear: {e}")),
+        _ => Ok(()),
+    };
+    let recorded = db::record_claude_session(
         &conn,
         &SessionReport {
             tab_id,
@@ -48,7 +51,12 @@ fn record(input: &str, tab_id: &TabId, db_path: &Path, claude_pid: Option<u32>) 
             transcript_path: event.transcript_path.as_deref(),
             claude_pid,
         },
-    )
+    );
+    match (recorded, cleared) {
+        (Ok(()), cleared) => cleared,
+        (Err(e), Ok(())) => Err(e),
+        (Err(e), Err(c)) => Err(format!("{e}; {c}")),
+    }
 }
 
 /// Which hook event a payload is.
@@ -203,7 +211,7 @@ fn hook(mut input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, cl
             .map_err(|e| format!("could not record the end of the Claude session: {e}")),
         Some("SessionStart") | None => record(&payload, tab_id, db_path, claude_pid)
             .map(|()| Outcome::Recorded)
-            .map_err(|e| format!("could not record the Claude session: {e}")),
+            .map_err(|e| format!("SessionStart: {e}")),
         Some(other) => Err(format!("misag's hook was run for {other}, which it does not handle")),
     }
 }
@@ -283,6 +291,28 @@ mod tests {
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"clear"}}"#);
         record(&payload, &tid("tab-1"), &path, None).unwrap();
         assert!(matches!(crate::runs::cleared(&mut conn, run).unwrap(), crate::runs::Cleared::Ready { prompt: Some(_) }));
+    }
+
+    #[test]
+    fn a_clear_that_cannot_move_the_run_on_still_records_the_new_session() {
+        let path = temp_db("hook-clear-fails");
+        let db = Db::open(path.clone()).unwrap();
+        let earlier = SessionId::parse("1b4e28ba-2fa1-41d2-883f-0016d3cca427").unwrap();
+        let tab = Tab {
+            tab_id: tid("tab-1"),
+            kind: TabKind::Claude { claude_session: Some(earlier) },
+            name: "c".into(),
+            renamed: false,
+            cwd: None,
+        };
+        db.save_layout(Layout { active: 0, tabs: vec![tab] }).unwrap();
+        // So runs::clear_tab fails.
+        db::connect_existing(&path).unwrap().execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE flow_runs;").unwrap();
+        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"SessionStart","source":"clear"}}"#);
+        let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
+        assert!(err.contains("flow_runs"), "the clear's failure is still reported: {err}");
+        // Not resumed after a restart: the cleared conversation is not the tab's any more.
+        assert_eq!(db.load_layout().unwrap().tabs[0].kind, TabKind::Claude { claude_session: Some(id()) });
     }
 
     #[test]
