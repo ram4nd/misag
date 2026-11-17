@@ -965,12 +965,13 @@ pub fn prefilled(conn: &mut Connection, run_id: i64, step_id: &str, token: i64) 
 
 /// The person sent `prompt` to Claude in tab `tab_id` (the UserPromptSubmit hook):
 /// a run waiting at a manual prompt runs it, so Claude's answer moves it on (see
-/// `on_stop`). Claude has Start's base info if the prompt carried it. A slash
-/// command is not a prompt to Claude, and prompts at any other step change nothing.
+/// `on_stop`). Claude has Start's base info if the prompt carried it. A command
+/// Claude Code handles itself is not a prompt to Claude (see `local_command`), and
+/// prompts at any other step change nothing.
 /// Returns what to add to Claude's context with the prompt: that a flow which ran
 /// in the tab is finished, owed since it ended (see `RunState::owes_closing`).
 pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<Option<String>, String> {
-    if prompt.trim_start().starts_with('/') {
+    if local_command(prompt) {
         return Ok(None);
     }
     // Every prompt in every tab comes here: look before taking the write lock.
@@ -1002,6 +1003,36 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
     }
     tx.commit().map_err(sql)?;
     Ok(closing)
+}
+
+/// Commands Claude Code runs itself, whose output is not an answer to the person's
+/// prompt: sending one is not their prompt at a manual prompt (no answer would move
+/// the step on), nor does it carry a finished flow's note. Other text that starts
+/// with a slash is a prompt: a skill, a custom or MCP command, a built-in sent to
+/// Claude as a prompt (/review, /init, /doctor), or a file path.
+///
+/// Matches the first word only, aliases included, as listed for Claude Code 2.1.326
+/// (code.claude.com/docs/en/commands). A command missing here counts as a prompt:
+/// the step shows Running, and the person can still pick an output. Update it when
+/// Claude Code adds commands.
+const LOCAL_COMMANDS: &[&str] = &[
+    "add-dir", "advisor", "agents", "android", "app", "autocompact", "bashes", "branch", "btw", "bug", "cd", "checkpoint",
+    "chrome", "clear", "color", "compact", "config", "context", "continue", "copy", "cost", "desktop", "design-login",
+    "diff", "effort", "exit", "export", "fast", "feedback", "focus", "fork", "goal", "heapdump", "help", "hooks", "ide",
+    "import", "insights", "install-github-app", "install-slack-app", "ios", "keybindings", "list-agents", "login",
+    "logout", "mcp", "memory", "mobile", "model", "new", "output-style", "passes", "permissions", "plan", "plugin",
+    "powerup", "privacy-settings", "quit", "radio", "rate-limit-options", "recap", "release-notes", "reload-plugins",
+    "reload-skills", "remote-control", "remote-env", "rename", "reset", "restart", "resume", "rewind", "sandbox",
+    "scroll-speed", "setup-bedrock", "setup-vertex", "skill-doctor", "skills", "stats", "status", "stickers", "stop",
+    "subtask", "tasks", "teleport", "terminal-setup", "theme", "todos", "tp", "tui", "undo", "upgrade", "usage",
+    "usage-credits", "vim", "voice", "web-setup", "workflows",
+];
+
+/// Whether `prompt` is one of `LOCAL_COMMANDS`, with or without arguments.
+fn local_command(prompt: &str) -> bool {
+    let Some(rest) = prompt.trim_start().strip_prefix('/') else { return false };
+    let name = rest.split_whitespace().next().unwrap_or_default();
+    LOCAL_COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(name))
 }
 
 /// The UserPromptSubmit hook could not record the person's prompt in tab `tab_id`:
@@ -1516,12 +1547,20 @@ mod tests {
     }
 
     #[test]
+    fn a_slash_prompt_that_reaches_claude_carries_a_finished_flow_s_note() {
+        let (_db, mut conn, flow) = setup("runs-stop-closing-slash", &runnable());
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        stop(&conn, run).unwrap();
+        assert_eq!(on_prompt(&mut conn, &tab("t1"), "/review the diff").unwrap(), finished());
+    }
+
+    #[test]
     fn a_stopped_briefed_run_tells_claude_with_the_person_s_next_prompt() {
         let (_db, mut conn, flow) = setup("runs-stop-closing", &runnable());
         let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
         stop(&conn, run).unwrap();
         assert!(stop(&conn, run).unwrap_err().contains("no active run"));
-        // A slash command is not a message to Claude, so it does not carry it.
+        // A command Claude Code runs itself is not a message to Claude, so it does not carry it.
         assert_eq!(on_prompt(&mut conn, &tab("t1"), "/model").unwrap(), None);
         assert_eq!(on_prompt(&mut conn, &tab("t2"), "Hi").unwrap(), None, "another tab");
         assert_eq!(on_prompt(&mut conn, &tab("t1"), "Thanks").unwrap(), finished());
@@ -2157,12 +2196,33 @@ mod tests {
     }
 
     #[test]
-    fn a_slash_command_is_not_the_person_s_prompt() {
+    fn a_local_command_is_not_the_person_s_prompt() {
         let g = manual_prompt_first("");
         let (_db, mut conn, flow) = setup("runs-manual-prompt-slash", &g);
         begin(&mut conn, flow, &tab("t1")).unwrap();
         on_prompt(&mut conn, &tab("t1"), "  /model opus").unwrap();
         assert_eq!(only_run(&conn).status, Status::Manual);
+    }
+
+    #[test]
+    fn a_prompt_that_starts_with_a_slash_but_reaches_claude_runs_the_manual_prompt() {
+        // A command Claude Code sends Claude as a prompt (a skill, a custom command,
+        // or its own /review), and a path, are the person's prompt.
+        for prompt in ["/review", "/my-skill fix the bug", "/home/me/app/main.rs fails to build", "/mcp__srv__ask hi"] {
+            let g = manual_prompt_first("");
+            let (_db, mut conn, flow) = setup("runs-manual-prompt-slash-prompt", &g);
+            begin(&mut conn, flow, &tab("t1")).unwrap();
+            on_prompt(&mut conn, &tab("t1"), prompt).unwrap();
+            assert_eq!(only_run(&conn).status, Status::Running, "{prompt}");
+        }
+        // Commands Claude Code handles itself are not.
+        for command in ["/clear", "/compact keep the plan", "/model", "/COST", "/exit"] {
+            let g = manual_prompt_first("");
+            let (_db, mut conn, flow) = setup("runs-manual-prompt-slash-local", &g);
+            begin(&mut conn, flow, &tab("t1")).unwrap();
+            on_prompt(&mut conn, &tab("t1"), command).unwrap();
+            assert_eq!(only_run(&conn).status, Status::Manual, "{command}");
+        }
     }
 
     #[test]
