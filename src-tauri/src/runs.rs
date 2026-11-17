@@ -817,6 +817,8 @@ pub fn start(conn: &mut Connection, flow_id: i64, tab_id: &TabId) -> Result<Star
         return Err("a program in a tab added this flow; confirm it in the app before it runs".into());
     }
     let graph = parse_graph(&graph)?;
+    // A newer misag may have stored fields this one would ignore and run differently.
+    flows::check(&graph)?;
     let problems = flows::problems(&graph);
     if !problems.is_empty() {
         return Err(format!("the flow is not ready to run: {}", problems.join(" ")));
@@ -1788,6 +1790,18 @@ mod tests {
         assert!(err.contains("not ready") && err.contains("Start is not connected"), "{err}");
         assert!(active(&conn).unwrap().is_empty());
         assert!(begin(&mut conn, flow + 100, &tab("t1")).unwrap_err().contains("no flow"));
+    }
+
+    #[test]
+    fn a_flow_saved_by_a_newer_version_does_not_start() {
+        let (_db, mut conn, flow) = setup("runs-newer-graph", &runnable());
+        // A newer misag stored it (the app's own save would refuse it).
+        let mut newer = serde_json::to_value(runnable()).unwrap();
+        newer["version"] = (flows::GRAPH_VERSION + 1).into();
+        conn.execute("UPDATE flows SET graph = ?1 WHERE id = ?2", params![newer.to_string(), flow]).unwrap();
+        let err = start(&mut conn, flow, &tab("t1")).unwrap_err();
+        assert!(err.contains("newer"), "{err}");
+        assert!(active(&conn).unwrap().is_empty());
     }
 
     #[test]
