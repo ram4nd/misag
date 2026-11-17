@@ -30,7 +30,7 @@ export interface SettingsPage {
    * folder; if they cannot be read it shows home, and says so. Nothing after `signal` aborts.
    */
   start(signal: AbortSignal): void;
-  /** Plays the finish sound chosen, unless it is off; if it cannot play, a notice says why. */
+  /** Plays the finish sound chosen, unless it is off; if it cannot play, a notice says why, until a sound plays again. */
   playFinish(): void;
 }
 
@@ -132,13 +132,18 @@ export function createSettingsPage(opts: SettingsPageOptions): SettingsPage {
     fillForms();
   }
 
-  /** Plays the finish sound, unless it is off (or missing, from an older backend); if it cannot play, a notice says why. */
+  /**
+   * Plays the finish sound, unless it is off (or missing, from an older backend); if it
+   * cannot play, a notice says why, until a sound plays again.
+   */
   function playFinish() {
     const sound = settings.finishSound;
     if (!sound || sound === "off") return;
-    playSound(sound, (err) => {
+    void playSound(sound, (err) => {
       console.error("misag: could not play the finish sound", err);
       notices.set("finish-sound", `The finish sound could not play (${errorText(err)}). Check your sound output, or turn the sound off in Settings.`);
+    }).then((played) => {
+      if (played) notices.set("finish-sound", null);
     });
   }
 

@@ -172,6 +172,7 @@ vi.mock("./sounds", async (importOriginal) => ({
   playSound: (name: string, onFail: (err: unknown) => void) => {
     if (sounds.fail) onFail(sounds.fail);
     else sounds.played.push(name);
+    return Promise.resolve(!sounds.fail);
   },
   primeAudio: () => void sounds.primed++,
 }));
@@ -1189,6 +1190,22 @@ describe("tab icons", () => {
     await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
     expect(noticeVisible()).toBe(true);
     expect(noticeText()).toContain("finish sound could not play (no audio device)");
+  });
+
+  test("the notice that a sound could not play goes away once one plays", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    sounds.fail = new Error("no audio device");
+    await startApp();
+    await clickClaude();
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(noticeVisible()).toBe(true);
+    sounds.fail = null;
+    turn();
+    await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
+    expect(sounds.played).toEqual(["chime"]);
+    expect(noticeVisible()).toBe(false);
   });
 
   test("a key or click primes audio while a finish sound is chosen", async () => {
