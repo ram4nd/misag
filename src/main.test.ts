@@ -102,6 +102,8 @@ const win = vi.hoisted(() => ({
   prevented: false,
   /** How often the window was brought to the front. */
   focused: 0,
+  /** How often the close listener was removed. */
+  unlistened: 0,
 }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -110,7 +112,7 @@ vi.mock("@tauri-apps/api/window", () => ({
         win.prevented = false;
         return handler({ preventDefault: () => (win.prevented = true) });
       };
-      return () => {};
+      return () => void win.unlistened++;
     },
     setFocus: async () => {
       win.focused++;
@@ -123,13 +125,15 @@ vi.mock("@tauri-apps/api/window", () => ({
 const drop = vi.hoisted(() => ({
   emit: undefined as undefined | ((payload: { type: string; paths?: string[] }) => void),
   fails: false,
+  /** How often the drop listener was removed. */
+  unlistened: 0,
 }));
 vi.mock("@tauri-apps/api/webview", () => ({
   getCurrentWebview: () => ({
     onDragDropEvent: async (handler: (event: { payload: { type: string; paths?: string[] } }) => void) => {
       if (drop.fails) throw new Error("no events");
       drop.emit = (payload) => handler({ payload });
-      return () => {};
+      return () => void drop.unlistened++;
     },
   }),
 }));
@@ -229,6 +233,8 @@ type Settings = Record<string, unknown>;
 let storedSettings: Settings;
 /** The callbacks of every ResizeObserver the app made, to report a resize to. */
 let resizeObservers: ResizeObserverCallback[];
+/** How many ResizeObservers the app disconnected. */
+let resizeDisconnects: number;
 /** fs_list for a directory waits for its promise here, so a test can hold it back. */
 let fsGates: Record<string, Promise<void>>;
 /** How many hidden entries fs_list reports per directory. */
@@ -308,9 +314,19 @@ const flush = () =>
   vi.isFakeTimers() ? vi.advanceTimersByTimeAsync(0) : new Promise((r) => setTimeout(r, 0));
 const lastSaved = () => callsOf("layout_save").at(-1)?.args.layout as Layout | undefined;
 
-async function boot() {
+/**
+ * Stops the app the last `startApp` started, as main.boot()'s dispose does: it clears its
+ * timers, removes its window, document and Tauri listeners, disconnects its ResizeObserver,
+ * and keeps its pending callbacks from changing anything.
+ */
+let dispose: (() => void) | null = null;
+
+/** Loads index.html into the page and starts the app on it with main.boot(), then lets startup settle. */
+async function startApp() {
+  dispose?.();
   document.body.innerHTML = new DOMParser().parseFromString(indexHtml, "text/html").body.innerHTML;
-  await import("./main");
+  const main = await import("./main");
+  dispose = main.boot();
   for (let i = 0; i < 5; i++) await flush();
 }
 
@@ -456,7 +472,9 @@ beforeEach(() => {
   resumeReport = { state: "typed" };
   failing = new Set();
   drop.fails = false;
+  drop.unlistened = 0;
   win.focused = 0;
+  win.unlistened = 0;
   storeReport = { store: { state: "saving" }, hookProblem: null };
   reported = new Set();
   missingDirs = new Set();
@@ -585,13 +603,16 @@ beforeEach(() => {
   });
 
   resizeObservers = [];
+  resizeDisconnects = 0;
   globalThis.ResizeObserver = class {
     constructor(cb: ResizeObserverCallback) {
       resizeObservers.push(cb);
     }
     observe() {}
     unobserve() {}
-    disconnect() {}
+    disconnect() {
+      resizeDisconnects++;
+    }
   };
   globalThis.requestAnimationFrame = (cb) => setTimeout(cb, 0) as unknown as number;
   // jsdom has no modal dialog support.
@@ -606,6 +627,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  dispose?.();
+  dispose = null;
   clearMocks();
   // Spies (such as the layout getters a test stubs) do not restore themselves.
   vi.restoreAllMocks();
@@ -614,14 +637,14 @@ afterEach(() => {
 
 describe("tabs", () => {
   test("starts with no tabs and an empty-state hint", async () => {
-    await boot();
+    await startApp();
     expect(tabs()).toHaveLength(0);
     expect(noTabs()).toBe(true);
     expect(callsOf("pty_spawn")).toHaveLength(0);
   });
 
   test("the terminal button sits after the tabs and opens a terminal tab", async () => {
-    await boot();
+    await startApp();
     const bar = document.querySelector("#tabbar")!;
     expect(bar.lastElementChild?.id).toBe("tab-actions");
     expect(document.querySelector("#new-terminal svg")).not.toBeNull();
@@ -634,7 +657,7 @@ describe("tabs", () => {
   });
 
   test("a folder's Claude button opens a Claude tab in that folder", async () => {
-    await boot();
+    await startApp();
     const button = document.querySelector<HTMLButtonElement>("#workspace-box .tree > ul .open-claude")!;
     expect(button.title).toBe("Open Claude in /home/me/work");
     expect(button.closest(".line")!.querySelector("button.row")!.textContent).toBe("work");
@@ -649,7 +672,7 @@ describe("tabs", () => {
   });
 
   test("the workspace folder itself has a Claude button too", async () => {
-    await boot();
+    await startApp();
     const root = document.querySelector<HTMLButtonElement>("#workspace-box .tree .row.root + .open-claude")!;
     expect(root.title).toBe("Open Claude in ~");
     root.click();
@@ -658,14 +681,14 @@ describe("tabs", () => {
   });
 
   test("each Claude tab gets its own session", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     const [a, b] = spawns().map((s) => s.claudeSession);
     expect(a).not.toBe(b);
   });
 
   test("a new terminal tab opens in the active tab's current directory", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     liveCwds = { 1: "/home/me/src" };
     await clickTerminal();
@@ -673,7 +696,7 @@ describe("tabs", () => {
   });
 
   test("closing the same tab twice kills it once and keeps the others", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(3);
     const x = tabs()[1].querySelector<HTMLButtonElement>(".x")!;
     x.click();
@@ -684,7 +707,7 @@ describe("tabs", () => {
   });
 
   test("middle-click closes a tab", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     tabs()[0].dispatchEvent(new MouseEvent("auxclick", { button: 1, bubbles: true }));
     expect(callsOf("pty_kill").map((c) => c.args.id)).toEqual([1]);
@@ -692,7 +715,7 @@ describe("tabs", () => {
   });
 
   test("closing the last tab keeps the window open and shows the hint", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     expect(tabs()).toHaveLength(0);
@@ -700,7 +723,7 @@ describe("tabs", () => {
   });
 
   test("titles show in the tooltip until the user renames the tab", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("✳ Fix the build");
     expect(tabs()[0].title).toContain("✳ Fix the build");
@@ -712,7 +735,7 @@ describe("tabs", () => {
   });
 
   test("Escape cancels a rename", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     renameTab(0, "discarded", "Escape");
     expect(tabNames()).toEqual(["work"]);
@@ -723,13 +746,13 @@ describe("tab labels", () => {
   const tooltip = (i: number) => tabs()[i].title;
 
   test("a tab is labelled with its folder's name", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     expect(tabNames()).toEqual(["work"]);
   });
 
   test("the label follows the tab's current directory", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     liveCwds[1] = "/home/me/src/misag";
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -740,7 +763,7 @@ describe("tab labels", () => {
   });
 
   test("the terminal title and the full directory are in the tooltip", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("✳ Fix the build");
     expect(tabNames()).toEqual(["work"]);
@@ -749,7 +772,7 @@ describe("tab labels", () => {
   });
 
   test("the rename box starts with what the tab shows", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("✳ Fix the build");
     tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
@@ -757,7 +780,7 @@ describe("tab labels", () => {
   });
 
   test("a rename left unchanged keeps the tab following its folder", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     renameTab(0, "work");
     liveCwds[1] = "/home/me/src";
@@ -766,7 +789,7 @@ describe("tab labels", () => {
   });
 
   test("a check while renaming keeps the rename box open", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     openClaudes[1] = SESSION;
@@ -780,7 +803,7 @@ describe("tab labels", () => {
   });
 
   test("a renamed tab keeps its name wherever it goes", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     renameTab(0, "build");
     liveCwds[1] = "/home/me/src";
@@ -789,7 +812,7 @@ describe("tab labels", () => {
   });
 
   test("a tab whose directory is not known yet shows its name", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     expect(tabNames()).toEqual(["shell 1"]);
     liveCwds[1] = "/home/me/app";
@@ -798,7 +821,7 @@ describe("tab labels", () => {
   });
 
   test("exited tabs are not polled", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     spawns()[0].onExit.onmessage(0);
     const before = callsOf("pty_cwds").length;
@@ -811,7 +834,7 @@ describe("tab icons", () => {
   const kind = (i: number) => tabs()[i].querySelector<HTMLElement>(".icon")?.dataset.kind;
 
   test("Claude tabs show the Claude icon and terminal tabs a terminal icon", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await clickTerminal();
     expect([kind(0), kind(1)]).toEqual(["claude", "terminal"]);
@@ -819,7 +842,7 @@ describe("tab icons", () => {
   });
 
   test("a terminal tab shows the Claude icon while Claude runs in it", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes[1] = SESSION;
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -837,7 +860,7 @@ describe("tab icons", () => {
   };
 
   test("a tab shows Claude working while its title has a spinner", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("✳ Claude Code");
     expect(busy()).toEqual([false]);
@@ -850,7 +873,7 @@ describe("tab icons", () => {
   });
 
   test("a tab shows Claude working while it waits on background tasks", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     const tabId = spawns()[0].tabId;
     terms()[0].onTitle!("◐ Claude Code");
@@ -868,7 +891,7 @@ describe("tab icons", () => {
   });
 
   test("a turn that ends without reporting, such as an interrupted one, stops the wait on background tasks", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     backgroundTabs = { [spawns()[0].tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -882,7 +905,7 @@ describe("tab icons", () => {
   });
 
   test("a restarted Claude tab does not show what the Claude before it waited on", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     backgroundTabs = { [spawns()[0].tabId]: Date.now() - 1000 };
     spawns()[0].onExit.onmessage(1);
@@ -895,7 +918,7 @@ describe("tab icons", () => {
   });
 
   test("waiting on background tasks shows only while Claude runs in the tab", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     backgroundTabs = { [spawns()[0].tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -918,7 +941,7 @@ describe("tab icons", () => {
 
   test("a failed check for background tasks keeps what the tabs showed, and the rest of the check still runs", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     backgroundTabs = { [spawns()[0].tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -945,7 +968,7 @@ describe("tab icons", () => {
 
   test("a Claude tab plays the chosen sound once a tab check confirms Claude stayed done", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "chime" };
-    await boot();
+    await startApp();
     await clickClaude();
     turn();
     await vi.advanceTimersByTimeAsync(FINISH_SETTLE_MS - 1);
@@ -960,7 +983,7 @@ describe("tab icons", () => {
 
   test("no sound plays when the finish sound is off, including when it is turned off while one is due", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "chime" };
-    await boot();
+    await startApp();
     await clickClaude();
     turn();
     storedSettings = { ...DEFAULTS };
@@ -976,7 +999,7 @@ describe("tab icons", () => {
 
   test("a turn that starts again soon, or ends waiting on background tasks, has not finished", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "bell" };
-    await boot();
+    await startApp();
     await clickClaude();
     turn();
     await vi.advanceTimersByTimeAsync(FINISH_SETTLE_MS / 2);
@@ -1000,7 +1023,7 @@ describe("tab icons", () => {
   test("a finish waits for a tab check that could read the background tasks", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     storedSettings = { ...DEFAULTS, finishSound: "bell" };
-    await boot();
+    await startApp();
     await clickClaude();
     failing.add("background_tabs");
     turn();
@@ -1013,7 +1036,7 @@ describe("tab icons", () => {
 
   test("a Claude that exits or quits mid-turn, or another tool's spinner, plays no sound", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "pop" };
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("◐ Claude Code");
     spawns()[0].onExit.onmessage(0);
@@ -1032,7 +1055,7 @@ describe("tab icons", () => {
 
   test("restarting a tab whose Claude exited mid-turn plays no sound", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "pop" };
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("◐ Claude Code");
     spawns()[0].onExit.onmessage(1);
@@ -1046,7 +1069,7 @@ describe("tab icons", () => {
 
   test("a finish while the tab is being renamed still plays", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "chime" };
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!("◐ Claude Code");
     tabs()[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
@@ -1058,7 +1081,7 @@ describe("tab icons", () => {
 
   test("closing a tab whose finish is due plays no sound", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "chime" };
-    await boot();
+    await startApp();
     await clickClaude();
     turn();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
@@ -1068,7 +1091,7 @@ describe("tab icons", () => {
 
   test("tabs that finish together each play", async () => {
     storedSettings = { ...DEFAULTS, finishSound: "pop" };
-    await boot();
+    await startApp();
     await clickClaude();
     await clickClaude();
     turn(0);
@@ -1081,7 +1104,7 @@ describe("tab icons", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     storedSettings = { ...DEFAULTS, finishSound: "chime" };
     sounds.fail = new Error("no audio device");
-    await boot();
+    await startApp();
     await clickClaude();
     turn();
     await vi.advanceTimersByTimeAsync(FINISH_SOUND_MAX_MS);
@@ -1090,7 +1113,7 @@ describe("tab icons", () => {
   });
 
   test("a key or click primes audio while a finish sound is chosen", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].element.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     expect(sounds.primed).toBe(0);
@@ -1106,7 +1129,7 @@ describe("tab icons", () => {
   });
 
   test("a working Claude tab shows a loader in place of the Claude icon", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     renameTab(0, "build");
     terms()[0].onTitle!("◐ Claude Code");
@@ -1125,14 +1148,14 @@ describe("tab icons", () => {
     ["◐a", false],
     ["✳ a", false],
   ])("the title %j shows Claude working: %s", async (title, working) => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onTitle!(title);
     expect(busy()).toEqual([working]);
   });
 
   test("a terminal tab shows Claude working only while Claude runs in it", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     // Another tool's spinner in a plain shell.
     terms()[0].onTitle!("⠂ Installing");
@@ -1151,7 +1174,7 @@ describe("tab icons", () => {
   });
 
   test("a renamed or exited tab still stops showing Claude working", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     renameTab(0, "build");
     terms()[0].onTitle!("◐ Claude Code");
@@ -1161,7 +1184,7 @@ describe("tab icons", () => {
   });
 
   test("a claude that bypassed the wrapper also counts", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     claudeStates[1] = { state: "untracked", pid: 77 };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -1169,7 +1192,7 @@ describe("tab icons", () => {
   });
 
   test("a check that cannot tell keeps the icon", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes[1] = SESSION;
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -1180,7 +1203,7 @@ describe("tab icons", () => {
   });
 
   test("an exited terminal tab goes back to the terminal icon", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes[1] = SESSION;
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -1189,7 +1212,7 @@ describe("tab icons", () => {
   });
 
   test("a check that returns after the tab exited does not bring the Claude icon back", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes[1] = SESSION;
     let release!: () => void;
@@ -1203,7 +1226,7 @@ describe("tab icons", () => {
   });
 
   test("a slow check is not started again until it returns", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     await vi.advanceTimersByTimeAsync(1000);
     let release!: () => void;
@@ -1217,7 +1240,7 @@ describe("tab icons", () => {
   });
 
   test("a Claude started in a terminal tab is saved by the next check", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     await vi.advanceTimersByTimeAsync(1000);
     expect(lastSaved()?.tabs[0].claudeSession).toBeNull();
@@ -1227,7 +1250,7 @@ describe("tab icons", () => {
   });
 
   test("an untracked claude that skips permissions is noted too", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     claudeStates[1] = { state: "untracked", pid: 77, skipsPermissions: true };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -1235,7 +1258,7 @@ describe("tab icons", () => {
   });
 
   test("a terminal tab's Claude that skips permissions is noted in the tooltip, and the note goes with it", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes[1] = SESSION;
     skippingClaudes.add(1);
@@ -1253,14 +1276,14 @@ describe("process lifecycle", () => {
     spawnBehaviour = () => {
       throw { code: "cwd_missing", message: "not a directory: /nope" };
     };
-    await boot();
+    await startApp();
     await clickClaude();
     expect(tabs()[0].classList.contains("exited")).toBe(true);
     expect(terms()[0].output).toContain("could not start: not a directory: /nope");
   });
 
   test("shows the exit code and stops sending input", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     spawns()[0].onExit.onmessage(3);
     expect(terms()[0].output).toContain("process exited with code 3");
@@ -1270,7 +1293,7 @@ describe("process lifecycle", () => {
   });
 
   test("Enter restarts an exited tab in place, with the same ids", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     spawns()[0].onExit.onmessage(1);
     expect(terms()[0].output).toContain("press Enter to restart");
@@ -1294,7 +1317,7 @@ describe("process lifecycle", () => {
       if (fail) throw { code: "failed", message: "cannot check the transcript" };
       return id;
     };
-    await boot();
+    await startApp();
     await clickClaude();
     expect(tabs()[0].classList.contains("exited")).toBe(true);
     fail = false;
@@ -1304,7 +1327,7 @@ describe("process lifecycle", () => {
   });
 
   test("a restarted tab's earlier hook watch stops; the new start has its own", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     spawns()[0].onExit.onmessage(0);
     terms()[0].onData!("\r");
@@ -1319,7 +1342,7 @@ describe("process lifecycle", () => {
       args.onExit.onmessage(0);
       return id;
     };
-    await boot();
+    await startApp();
     await clickClaude();
     expect(tabs()[0].classList.contains("exited")).toBe(true);
   });
@@ -1327,7 +1350,7 @@ describe("process lifecycle", () => {
 
 describe("input", () => {
   test("text is sent as UTF-8 and binary input as raw bytes", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onData!("é");
     terms()[0].onBinary!(Uint8Array.of(0x80, 0x01));
@@ -1335,7 +1358,7 @@ describe("input", () => {
   });
 
   test("resizes are forwarded to the PTY", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onResize!(100, 30);
     expect(callsOf("pty_resize")[0].args).toMatchObject({ id: 1, cols: 100, rows: 30 });
@@ -1356,7 +1379,7 @@ describe("input", () => {
 
     test("pastes the primary selection itself, as WebKitGTK 2.54 crashes doing it", async () => {
       primarySelection = "ls -la";
-      await boot();
+      await startApp();
       await clickClaude();
       expect(await middleClick()).toEqual([true, true]);
       expect(callsOf("primary_selection")).toHaveLength(1);
@@ -1365,7 +1388,7 @@ describe("input", () => {
 
     test("pastes in brackets when the program asked for them, without escapes that end them", async () => {
       primarySelection = "a\x1b[201~b";
-      await boot();
+      await startApp();
       await clickClaude();
       terms()[0].bracketed = true;
       await middleClick();
@@ -1374,7 +1397,7 @@ describe("input", () => {
 
     test("an empty or unreadable primary selection types nothing", async () => {
       primarySelection = null;
-      await boot();
+      await startApp();
       await clickClaude();
       await middleClick();
       failing.add("primary_selection");
@@ -1384,7 +1407,7 @@ describe("input", () => {
 
     test("a program that tracks the mouse gets the click, and Shift pastes anyway", async () => {
       primarySelection = "ls";
-      await boot();
+      await startApp();
       await clickClaude();
       terms()[0].tracking = 1000;
       // WebKit's own paste stays off either way.
@@ -1395,7 +1418,7 @@ describe("input", () => {
     });
 
     test("other buttons are left alone", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       const down = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
       terms()[0].element.dispatchEvent(down);
@@ -1412,7 +1435,7 @@ describe("input", () => {
     }
 
     test("selecting text copies it, and the selection stays", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       const copy = vi.fn(() => true);
       document.execCommand = copy;
@@ -1424,7 +1447,7 @@ describe("input", () => {
     });
 
     test("a click without a selection copies nothing", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       const copy = vi.fn(() => true);
       document.execCommand = copy;
@@ -1433,7 +1456,7 @@ describe("input", () => {
     });
 
     test("copying does not also focus the terminal", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       document.execCommand = vi.fn(() => true);
       terms()[0].selected = "some output";
@@ -1443,7 +1466,7 @@ describe("input", () => {
     });
 
     test("a hidden tab's terminal, or one under the settings page, copies nothing", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       await clickClaude();
       const copy = vi.fn(() => true);
@@ -1460,7 +1483,7 @@ describe("input", () => {
     });
 
     test("only the left button copies", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       const copy = vi.fn(() => true);
       document.execCommand = copy;
@@ -1483,7 +1506,7 @@ describe("input", () => {
 
     test("pastes the clipboard in place of WebKit's menu, which has no Paste there", async () => {
       clipboard = "git status";
-      await boot();
+      await startApp();
       await clickClaude();
       expect(await rightClick()).toBe(true);
       expect(callsOf("clipboard_text")).toHaveLength(1);
@@ -1492,7 +1515,7 @@ describe("input", () => {
 
     test("pastes in brackets when the program asked for them, without escapes that end them", async () => {
       clipboard = "a\x1b[201~b";
-      await boot();
+      await startApp();
       await clickClaude();
       terms()[0].bracketed = true;
       await rightClick();
@@ -1500,7 +1523,7 @@ describe("input", () => {
     });
 
     test("an empty or unreadable clipboard types nothing", async () => {
-      await boot();
+      await startApp();
       await clickClaude();
       await rightClick();
       failing.add("clipboard_text");
@@ -1511,7 +1534,7 @@ describe("input", () => {
 
     test("over selected text it copies the selection instead, and pastes nothing", async () => {
       clipboard = "old";
-      await boot();
+      await startApp();
       await clickClaude();
       const copy = vi.fn(() => true);
       document.execCommand = copy;
@@ -1524,7 +1547,7 @@ describe("input", () => {
 
     test("a program without bracketed paste gets no control characters", async () => {
       clipboard = "a\x1bb\x03c\x9bd\x7fe\tf";
-      await boot();
+      await startApp();
       await clickClaude();
       await rightClick();
       expect(typed()).toEqual(["abcde\tf"]);
@@ -1532,7 +1555,7 @@ describe("input", () => {
 
     test("bracketed paste also drops the 8-bit escape that could end it", async () => {
       clipboard = "a\x9b201~b";
-      await boot();
+      await startApp();
       await clickClaude();
       terms()[0].bracketed = true;
       await rightClick();
@@ -1541,7 +1564,7 @@ describe("input", () => {
 
     test("more than one line to a program without bracketed paste is pasted only if you agree", async () => {
       clipboard = "rm -rf build\nmake\n";
-      await boot();
+      await startApp();
       await clickClaude();
       picker.answer = false;
       await rightClick();
@@ -1554,7 +1577,7 @@ describe("input", () => {
 
     test("more than one line in brackets is pasted without asking, as the program will not run it", async () => {
       clipboard = "a\nb";
-      await boot();
+      await startApp();
       await clickClaude();
       terms()[0].bracketed = true;
       await rightClick();
@@ -1564,7 +1587,7 @@ describe("input", () => {
 
     test("a program that tracks the mouse gets the click, and Shift pastes anyway", async () => {
       clipboard = "ls";
-      await boot();
+      await startApp();
       await clickClaude();
       terms()[0].tracking = 1000;
       expect(await rightClick()).toBe(true);
@@ -1587,7 +1610,7 @@ describe("input", () => {
   }
 
   test("Ctrl+click opens a link through the opener plugin, not in the app's window", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     const click = await clickLink({ ctrlKey: true, detail: 1 });
     expect(click.defaultPrevented).toBe(true);
@@ -1595,14 +1618,14 @@ describe("input", () => {
   });
 
   test("a link activated from the keyboard opens", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await clickLink({ detail: 0 });
     expect(callsOf("plugin:opener|open_url")).toHaveLength(1);
   });
 
   test("a plain click on a link stays in the terminal", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await clickLink({ detail: 1 });
     expect(callsOf("plugin:opener|open_url")).toHaveLength(0);
@@ -1611,7 +1634,7 @@ describe("input", () => {
 
 describe("new terminal dialog", () => {
   test("asks only for a name and directory, with Start as the default button", async () => {
-    await boot();
+    await startApp();
     expect(field("name")).not.toBeNull();
     expect(field("cwd")).not.toBeNull();
     expect(field("command")).toBeNull();
@@ -1619,7 +1642,7 @@ describe("new terminal dialog", () => {
   });
 
   test("Shift+click opens it and Start creates the terminal tab", async () => {
-    await boot();
+    await startApp();
     await clickTerminal(true);
     expect(dialog().open).toBe(true);
     field("name")!.value = "agent";
@@ -1631,7 +1654,7 @@ describe("new terminal dialog", () => {
   });
 
   test("can open a Claude tab instead", async () => {
-    await boot();
+    await startApp();
     await clickTerminal(true);
     dialog().querySelector<HTMLInputElement>("input[name=kind][value=claude]")!.checked = true;
     field("name")!.value = "agent";
@@ -1646,7 +1669,7 @@ describe("new terminal dialog", () => {
   });
 
   test("Escape after an earlier Start does not spawn", async () => {
-    await boot();
+    await startApp();
     await clickTerminal(true);
     dialog().close("ok");
     await flush();
@@ -1670,7 +1693,7 @@ describe("restoring tabs", () => {
 
   test("reopens each tab with its kind, directory, command and session", async () => {
     savedLayout = layout;
-    await boot();
+    await startApp();
     // An unnamed tab shows its folder, or its title while the folder is unknown.
     expect(tabNames()).toEqual(["agent", "✳ Review", "logs", "app"]);
     const [a, b, c, d] = spawns();
@@ -1687,7 +1710,7 @@ describe("restoring tabs", () => {
 
   test("kills leftover sessions before restoring", async () => {
     savedLayout = layout;
-    await boot();
+    await startApp();
     const order = calls.map((c) => c.cmd);
     expect(order.indexOf("pty_reset")).toBeLessThan(order.indexOf("pty_spawn"));
     expect(order.indexOf("pty_reset")).toBeLessThan(order.indexOf("layout_load"));
@@ -1695,14 +1718,14 @@ describe("restoring tabs", () => {
 
   test("a restored tab keeps its id, so its session reports stay attached", async () => {
     savedLayout = layout;
-    await boot();
+    await startApp();
     await win.closeRequested!();
     expect(lastSaved()?.tabs.map((t) => t.tabId)).toEqual(["t3", "t4", "t5", "t6"]);
   });
 
   test("restored user names survive titles; others follow them", async () => {
     savedLayout = layout;
-    await boot();
+    await startApp();
     terms()[0].onTitle!("✳ x");
     terms()[1].onTitle!("✳ y");
     expect(tabNames()).toEqual(["agent", "✳ y", "logs", "app"]);
@@ -1714,7 +1737,7 @@ describe("restoring tabs", () => {
       tabs: [{ tabId: "t8", kind: "claude", name: "old", renamed: true, cwd: "/gone", command: null, claudeSession: SESSION }],
     };
     missingDirs.add("/gone");
-    await boot();
+    await startApp();
     expect(spawns().map((s) => [s.cwd, s.fallbackToHome])).toEqual([["/gone", true]]);
     expect(spawns()[0].claudeSession).toBe(SESSION);
     expect(tabs()[0].classList.contains("exited")).toBe(false);
@@ -1723,7 +1746,7 @@ describe("restoring tabs", () => {
 
   test("with nothing saved, starts with no tabs", async () => {
     savedLayout = { active: 0, tabs: [] };
-    await boot();
+    await startApp();
     expect(tabs()).toHaveLength(0);
     expect(noTabs()).toBe(true);
   });
@@ -1731,7 +1754,7 @@ describe("restoring tabs", () => {
 
 describe("saving tabs", () => {
   test("closing the window saves every tab with its live directory and session", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await clickTerminal(true);
     field("name")!.value = "dev";
@@ -1763,7 +1786,7 @@ describe("saving tabs", () => {
       active: 0,
       tabs: [{ tabId: "t", kind: "terminal", name: "shell", renamed: false, cwd: null, command: null, claudeSession: SESSION }],
     };
-    await boot();
+    await startApp();
     spawns()[0].onExit.onmessage(0);
     terms()[0].onData!("\r");
     await flush();
@@ -1785,7 +1808,7 @@ describe("saving tabs", () => {
 
     test("is kept while the resumed Claude starts, and dropped once it is gone", async () => {
       savedLayout = restoredShell();
-      await boot();
+      await startApp();
       // Claude has not reported yet: the shell alone is no reason to forget it.
       await win.closeRequested!();
       expect(savedSession()).toBe(SESSION);
@@ -1799,7 +1822,7 @@ describe("saving tabs", () => {
         throw { code: "failed", message: "no pty" };
       };
       savedLayout = restoredShell();
-      await boot();
+      await startApp();
       now += 61_000;
       await win.closeRequested!();
       expect(savedSession()).toBe(SESSION);
@@ -1808,7 +1831,7 @@ describe("saving tabs", () => {
     test("is kept when the check is unknown or fails", async () => {
       vi.spyOn(console, "error").mockImplementation(() => {});
       savedLayout = restoredShell();
-      await boot();
+      await startApp();
       now += 61_000;
       claudeStates = { 1: { state: "unknown" } };
       await win.closeRequested!();
@@ -1820,7 +1843,7 @@ describe("saving tabs", () => {
 
     test("is dropped when its shell exits", async () => {
       savedLayout = restoredShell();
-      await boot();
+      await startApp();
       spawns()[0].onExit.onmessage(0);
       await win.closeRequested!();
       expect(savedSession()).toBeNull();
@@ -1829,7 +1852,7 @@ describe("saving tabs", () => {
     test("without a conversation it is dropped, and a notice says why", async () => {
       resumeReport = { state: "noConversation" };
       savedLayout = restoredShell();
-      await boot();
+      await startApp();
       expect(noticeText()).toContain("saved no conversation there");
       await win.closeRequested!();
       expect(savedSession()).toBeNull();
@@ -1838,7 +1861,7 @@ describe("saving tabs", () => {
     test("a resume that failed is kept for next time, and a notice says why", async () => {
       resumeReport = { state: "failed", message: "could not type the command" };
       savedLayout = restoredShell();
-      await boot();
+      await startApp();
       expect(noticeText()).toContain("Claude could not be reopened in “shell” (could not type the command)");
       now += 61_000;
       claudeStates = { 1: { state: "unknown" } };
@@ -1847,7 +1870,7 @@ describe("saving tabs", () => {
     });
 
     test("starting or quitting Claude is saved within seconds", async () => {
-      await boot();
+      await startApp();
       await clickTerminal();
       openClaudes = { 1: SESSION };
       await vi.advanceTimersByTimeAsync(6_000);
@@ -1858,7 +1881,7 @@ describe("saving tabs", () => {
     });
 
     test("a claude that bypassed the wrapper is reported once it has run a while", async () => {
-      await boot();
+      await startApp();
       await clickTerminal();
       claudeStates = { 1: { state: "untracked", pid: 77 } };
       await win.closeRequested!();
@@ -1872,7 +1895,7 @@ describe("saving tabs", () => {
 
   test("tabs are still saved when the open Claude sessions cannot be checked", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickTerminal();
     failing.add("claude_open_sessions");
     await win.closeRequested!();
@@ -1882,7 +1905,7 @@ describe("saving tabs", () => {
   });
 
   test("closing the last tab saves an empty layout", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await win.closeRequested!();
@@ -1890,7 +1913,7 @@ describe("saving tabs", () => {
   });
 
   test("tab changes are saved shortly after they happen", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     await vi.advanceTimersByTimeAsync(1000);
     expect(lastSaved()?.tabs.map((t) => t.name)).toEqual(["Claude 1", "Claude 2"]);
@@ -1909,7 +1932,7 @@ describe("saving tabs", () => {
     };
     // Each spawn takes longer than the save delay, so an unguarded save would fire mid-restore.
     spawnBehaviour = (_args, id) => new Promise((r) => setTimeout(() => r(id), 1000));
-    await boot();
+    await startApp();
     await vi.advanceTimersByTimeAsync(5000);
     expect(tabNames()).toEqual(["a", "b"]);
     const saves = callsOf("layout_save").map((c) => (c.args.layout as Layout).tabs.length);
@@ -1937,7 +1960,7 @@ describe("settings", () => {
   const settingsTabX = () => tabs().at(-1)!.querySelector<HTMLButtonElement>(".x")!;
 
   test("the sidebar button opens a settings tab over the terminals, and closing it goes back", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     await openSettings();
     expect(tabNames()).toEqual(["work", "work", "Settings"]);
@@ -1960,7 +1983,7 @@ describe("settings", () => {
   });
 
   test("with no other tabs, the settings tab opens and closes back to the empty state", async () => {
-    await boot();
+    await startApp();
     await openSettings();
     expect(tabNames()).toEqual(["Settings"]);
     expect(pageShown()).toBe(true);
@@ -1971,7 +1994,7 @@ describe("settings", () => {
   });
 
   test("the settings tab is not saved with the tabs", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await openSettings();
     await win.closeRequested!();
@@ -1979,7 +2002,7 @@ describe("settings", () => {
   });
 
   test("closing the terminal under a shown settings tab keeps settings shown", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     await openSettings();
     tabs()[1].querySelector<HTMLButtonElement>(".x")!.click();
@@ -1990,7 +2013,7 @@ describe("settings", () => {
   });
 
   test("the page shows the stored value each time it opens, and saves changes", async () => {
-    await boot();
+    await startApp();
     await openSettings();
     expect(setting("skipPermissions").checked).toBe(false);
     await change("skipPermissions", true);
@@ -2010,7 +2033,7 @@ describe("settings", () => {
       select().dispatchEvent(new Event("change", { bubbles: true }));
       for (let i = 0; i < 3; i++) await flush();
     }
-    await boot();
+    await startApp();
     await openSettings();
     expect(select().value).toBe("false");
     expect(select().selectedOptions[0].textContent).toBe("Auto");
@@ -2028,7 +2051,7 @@ describe("settings", () => {
 
   test("changing one Claude setting keeps the other", async () => {
     storedSettings = { ...DEFAULTS, skipPermissions: true };
-    await boot();
+    await startApp();
     await openSettings();
     const select = page().querySelector<HTMLSelectElement>("select[name=disableAutoMemory]")!;
     select.value = "true";
@@ -2048,7 +2071,7 @@ describe("settings", () => {
       for (let i = 0; i < 3; i++) await flush();
     }
     storedSettings = { ...DEFAULTS, fontSize: 16 };
-    await boot();
+    await startApp();
     expect(applied()).toBe("16px");
     await clickTerminal();
     await openSettings();
@@ -2065,7 +2088,7 @@ describe("settings", () => {
   });
 
   test("a font size out of range is not saved, and says why", async () => {
-    await boot();
+    await startApp();
     await openSettings();
     const field = setting("fontSize");
     field.value = "40";
@@ -2084,7 +2107,7 @@ describe("settings", () => {
       select().dispatchEvent(new Event("change", { bubbles: true }));
       for (let i = 0; i < 3; i++) await flush();
     }
-    await boot();
+    await startApp();
     await openSettings();
     expect(select().value).toBe("off");
     expect([...select().options].map((o) => o.value)).toEqual(["off", "chime", "bell", "pop"]);
@@ -2101,7 +2124,7 @@ describe("settings", () => {
 
   test("a finish sound that could not be saved is not played", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await openSettings();
     failing.add("settings_save");
     const select = page().querySelector<HTMLSelectElement>("select[name=finishSound]")!;
@@ -2113,7 +2136,7 @@ describe("settings", () => {
   });
 
   test("a finish sound the page does not know is not sent", async () => {
-    await boot();
+    await startApp();
     await openSettings();
     const select = page().querySelector<HTMLSelectElement>("select[name=finishSound]")!;
     select.append(new Option("Siren", "siren"));
@@ -2126,21 +2149,21 @@ describe("settings", () => {
 
   test("a missing finish sound shows as Off", async () => {
     storedSettings = { skipPermissions: false, workspace: null, disableAutoMemory: false, fontSize: 14 };
-    await boot();
+    await startApp();
     await openSettings();
     expect(page().querySelector<HTMLSelectElement>("select[name=finishSound]")!.value).toBe("off");
   });
 
   test("a missing font size shows as 14", async () => {
     storedSettings = { skipPermissions: false, workspace: null, disableAutoMemory: false };
-    await boot();
+    await startApp();
     await openSettings();
     expect(setting("fontSize").value).toBe("14");
   });
 
   test("a missing auto memory value shows as Auto", async () => {
     storedSettings = { skipPermissions: false, workspace: null };
-    await boot();
+    await startApp();
     await openSettings();
     expect(page().querySelector<HTMLSelectElement>("select[name=disableAutoMemory]")!.value).toBe("false");
   });
@@ -2149,7 +2172,7 @@ describe("settings", () => {
     storedSettings = { ...DEFAULTS, skipPermissions: true };
     let release!: () => void;
     settingsLoadGate = new Promise((r) => (release = r));
-    await boot();
+    await startApp();
     await openSettings();
     expect(disabled()).toBe(true);
     release();
@@ -2160,7 +2183,7 @@ describe("settings", () => {
   });
 
   test("a failed save is shown and the checkbox goes back to the stored value", async () => {
-    await boot();
+    await startApp();
     await openSettings();
     failing.add("settings_save");
     await change("skipPermissions", true);
@@ -2174,7 +2197,7 @@ describe("settings", () => {
   });
 
   test("saves run in order", async () => {
-    await boot();
+    await startApp();
     await openSettings();
     await change("skipPermissions", true);
     await change("skipPermissions", false);
@@ -2184,7 +2207,7 @@ describe("settings", () => {
 
   test("unreadable settings are shown and cannot be changed", async () => {
     failing.add("settings_load");
-    await boot();
+    await startApp();
     await openSettings();
     expect(disabled()).toBe(true);
     expect(pageError().textContent).toContain("Claude tabs start with permission prompts and auto memory off");
@@ -2192,7 +2215,7 @@ describe("settings", () => {
 
   test("Claude tabs started with skipped permissions say so in the tooltip, with no badge", async () => {
     storedSettings = { ...DEFAULTS, skipPermissions: true };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     expect(tabs()[0].querySelector(".badge")).toBeNull();
     expect(tabs()[0].title).toContain("--dangerously-skip-permissions");
@@ -2208,7 +2231,7 @@ describe("settings", () => {
 
   test("without a database the page says settings are not kept", async () => {
     storeReport = { store: { state: "notSaving", reason: "no data dir" }, hookProblem: null };
-    await boot();
+    await startApp();
     await openSettings();
     expect(page().querySelector<HTMLElement>(".not-saving")!.hidden).toBe(false);
   });
@@ -2243,14 +2266,14 @@ describe("file tree", () => {
   });
 
   test("shows the home directory by default, one level at a time", async () => {
-    await boot();
+    await startApp();
     await settle();
     expect(rows()).toEqual(["~", "notes"]);
   });
 
   test("shows the stored folder and does not follow the tabs", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     await settle();
     expect(rows()).toEqual(["p", "src", "my notes.txt"]);
     liveCwds = { 1: "/q", 2: "/r" };
@@ -2263,7 +2286,7 @@ describe("file tree", () => {
 
   test("folders are listed when opened, and clicking a file types its quoted path", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     row("src").click();
@@ -2278,7 +2301,7 @@ describe("file tree", () => {
 
   test("the refresh button reloads and keeps open folders open", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     await settle();
     row("src").click();
     await settle();
@@ -2289,7 +2312,7 @@ describe("file tree", () => {
   });
 
   test("the gear opens a workspace settings tab, where the folder is chosen", async () => {
-    await boot();
+    await startApp();
     await settle();
     button(".configure").click();
     await settle();
@@ -2318,7 +2341,7 @@ describe("file tree", () => {
   });
 
   test("a folder that is refused or cannot be read is shown", async () => {
-    await boot();
+    await startApp();
     button(".configure").click();
     await settle();
     picker.picked = "/gone";
@@ -2329,14 +2352,14 @@ describe("file tree", () => {
 
     vi.resetModules();
     storedSettings = { ...DEFAULTS, workspace: "/vanished" };
-    await boot();
+    await startApp();
     await settle();
     expect(treeText()).toContain("cannot read /vanished");
   });
 
   test("with unreadable settings the tree shows home and the folder cannot be changed", async () => {
     failing.add("settings_load");
-    await boot();
+    await startApp();
     await settle();
     expect(rows()).toEqual(["~", "notes"]);
     button(".configure").click();
@@ -2345,7 +2368,7 @@ describe("file tree", () => {
   });
 
   test("both pages can be open as their own tabs next to the terminals", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
     button(".configure").click();
@@ -2366,7 +2389,7 @@ describe("file tree", () => {
   test("file names that could act as keys are not typed, and say why", async () => {
     fsTree["/p"].push({ name: "notes\x15curl x|sh\r.txt", dir: false }, { name: "a\\b", dir: false });
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     row("sh\r.txt").click();
@@ -2382,7 +2405,7 @@ describe("file tree", () => {
 
   test("without a running tab, or when typing fails, a notice says so", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     await settle();
     row("my notes.txt").click();
     expect(noticeText()).toContain("no tab is running");
@@ -2395,7 +2418,7 @@ describe("file tree", () => {
 
   test("clicking a file while a page is shown types it into the tab and shows the tab", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     button(".configure").click();
     await settle();
@@ -2413,7 +2436,7 @@ describe("file tree", () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
     let release!: () => void;
     fsGates["/p/src"] = new Promise((r) => (release = r));
-    await boot();
+    await startApp();
     await settle();
     row("src").click();
     await settle();
@@ -2428,7 +2451,7 @@ describe("file tree", () => {
 
   test("a new workspace starts with its folders closed", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     button(".configure").click();
     await settle();
     row("src").click();
@@ -2443,7 +2466,7 @@ describe("file tree", () => {
   });
 
   test("the picker starts in the listed folder, opens on Space, and a failure is shown", async () => {
-    await boot();
+    await startApp();
     button(".configure").click();
     await settle();
     key(folderField(), " ");
@@ -2457,7 +2480,7 @@ describe("file tree", () => {
 
   test("saving one setting keeps the other", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/p" };
-    await boot();
+    await startApp();
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
     await settle();
     const skip = document.querySelector<HTMLInputElement>("#settings input[name=skipPermissions]")!;
@@ -2474,7 +2497,7 @@ describe("file tree", () => {
 
   test("a workspace folder that has gone does not block other settings", async () => {
     storedSettings = { ...DEFAULTS, workspace: "/vanished" };
-    await boot();
+    await startApp();
     await settle();
     expect(treeText()).toContain("cannot read /vanished");
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
@@ -2489,7 +2512,7 @@ describe("file tree", () => {
 
   test("unreadable settings at startup are shown, with what that means for each page", async () => {
     failing.add("settings_load");
-    await boot();
+    await startApp();
     await settle();
     expect(noticeText()).toContain("the Workspace box shows your home directory");
     expect(noticeText()).toContain("Claude tabs start with permission prompts and auto memory off");
@@ -2499,31 +2522,31 @@ describe("file tree", () => {
   });
 
   test("every icon in the page is drawn", async () => {
-    await boot();
+    await startApp();
     const icons = [...document.querySelectorAll("[data-icon]")];
     expect(icons.length).toBeGreaterThan(5);
     for (const el of icons) expect(el.querySelector("svg"), (el as HTMLElement).dataset.icon).not.toBeNull();
   });
 
   test("the toolbox collapses and remembers it", async () => {
-    await boot();
+    await startApp();
     const box = () => document.querySelector("#workspace-box")!;
     button(".toggle").click();
     expect(box().classList.contains("collapsed")).toBe(true);
     // A fresh app instance on a fresh page.
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(box().classList.contains("collapsed")).toBe(true);
     vi.resetModules();
     localStorage.clear();
-    await boot();
+    await startApp();
     expect(box().classList.contains("collapsed")).toBe(false);
   });
 });
 
 describe("switching and layout", () => {
   test("clicking a tab makes it and its terminal active", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     tabs()[0].click();
     expect(tabs().map((t) => t.classList.contains("active"))).toEqual([true, false]);
@@ -2532,7 +2555,7 @@ describe("switching and layout", () => {
   });
 
   test("the sidebar toggle collapses it and remembers the choice", async () => {
-    await boot();
+    await startApp();
     const collapsed = () => document.body.classList.contains("sidebar-collapsed");
     expect(collapsed()).toBe(false);
     document.querySelector<HTMLButtonElement>("#toggle-sidebar")!.click();
@@ -2541,7 +2564,7 @@ describe("switching and layout", () => {
     // A fresh app instance on a fresh page.
     vi.resetModules();
     document.body.className = "";
-    await boot();
+    await startApp();
     expect(collapsed()).toBe(true);
   });
 
@@ -2553,7 +2576,7 @@ describe("switching and layout", () => {
         { tabId: "b", kind: "claude", name: "b", renamed: true, cwd: null, command: null, claudeSession: null },
       ],
     };
-    await boot();
+    await startApp();
     expect(tabs()[1].classList.contains("active")).toBe(true);
   });
 });
@@ -2564,13 +2587,13 @@ describe("new tab directory", () => {
       active: 0,
       tabs: [{ tabId: "a", kind: "claude", name: "a", renamed: true, cwd: "/srv/app", command: null, claudeSession: null }],
     };
-    await boot();
+    await startApp();
     await clickTerminal();
     expect(spawns()[1].cwd).toBe("/srv/app");
   });
 
   test("still opens a tab when the directory lookup fails", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     failing.add("pty_cwds");
     await clickTerminal();
@@ -2579,7 +2602,7 @@ describe("new tab directory", () => {
   });
 
   test("the dialog uses the current tab's directory when left empty", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     liveCwds = { 1: "/home/me/x" };
     await clickTerminal(true);
@@ -2593,7 +2616,7 @@ describe("failures", () => {
   test("an unreadable saved layout starts empty and is never overwritten", async () => {
     failing.add("layout_load");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     expect(tabs()).toHaveLength(0);
     expect(noTabs()).toBe(true);
     expect(noticeText()).toContain("Saved tabs could not be read");
@@ -2611,7 +2634,7 @@ describe("failures", () => {
       tabs: [{ tabId: "a", kind: "claude", name: "a", renamed: true, cwd: null, command: null, claudeSession: null }],
     };
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     expect(tabNames()).toEqual(["a"]);
     await win.closeRequested!();
     expect(lastSaved()?.tabs.map((t) => t.tabId)).toEqual(["a"]);
@@ -2627,7 +2650,7 @@ describe("failures", () => {
       ],
     };
     spawnBehaviour = (_args, id) => new Promise((r) => setTimeout(() => r(id), 1000));
-    await boot();
+    await startApp();
     await win.closeRequested!();
     expect(callsOf("layout_save")).toHaveLength(0);
   });
@@ -2637,7 +2660,7 @@ describe("failures", () => {
       active: 0,
       tabs: [{ tabId: "a", kind: "claude", name: "a", renamed: true, cwd: "/srv/app", command: null, claudeSession: null }],
     };
-    await boot();
+    await startApp();
     failing.add("pty_cwds");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await win.closeRequested!();
@@ -2653,7 +2676,7 @@ describe("failures", () => {
     spawnBehaviour = () => {
       throw { code: "failed", message: "claude: command not found" };
     };
-    await boot();
+    await startApp();
     expect(spawns().map((s) => s.cwd)).toEqual(["/srv/app"]);
     expect(terms()[0].output).toContain("could not start: claude: command not found");
     expect(terms()[0].output).not.toContain("home directory");
@@ -2670,14 +2693,14 @@ describe("failures", () => {
     spawnBehaviour = () => {
       throw { code: "failed", message: "no pty" };
     };
-    await boot();
+    await startApp();
     expect(tabs()[0].classList.contains("exited")).toBe(true);
     await win.closeRequested!();
     expect(lastSaved()?.tabs[0].cwd).toBe("/gone");
   });
 
   test("a failed save shows a notice that clears after the next good save", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     failing.add("layout_save");
     await win.closeRequested!();
@@ -2689,14 +2712,14 @@ describe("failures", () => {
 
   test("the backend's store status is shown, and only dismissible notices can be dismissed", async () => {
     storeReport.store = { state: "notSaving", reason: "the database was written by a newer Mischief of Agents" };
-    await boot();
+    await startApp();
     expect(noticeText()).toContain("Tabs are not being saved: the database was written by a newer Mischief of Agents.");
     expect(dismissButton().hidden).toBe(true);
   });
 
   test("a recovery notice can be dismissed and stays dismissed", async () => {
     storeReport.store = { state: "recovered", notice: "Saved tabs could not be read, so Mischief of Agents started fresh." };
-    await boot();
+    await startApp();
     expect(noticeVisible()).toBe(true);
     dismissButton().click();
     expect(noticeVisible()).toBe(false);
@@ -2706,7 +2729,7 @@ describe("failures", () => {
 
   test("a dismissed hook failure stays hidden until a new one is logged", async () => {
     storeReport.hookProblem = { at: 2000, message: "first failure", log: LOG };
-    await boot();
+    await startApp();
     expect(noticeText()).toContain("first failure");
     dismissButton().click();
     await vi.advanceTimersByTimeAsync(31_000);
@@ -2720,7 +2743,7 @@ describe("failures", () => {
   });
 
   test("a failed save on close cancels the first close with a warning, and the second close quits", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     failing.add("layout_save");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -2734,14 +2757,14 @@ describe("failures", () => {
   });
 
   test("a close after a good save is not cancelled", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await win.closeRequested!();
     expect(win.prevented).toBe(false);
   });
 
   test("a failed save is tried again until it works", async () => {
-    await boot();
+    await startApp();
     failing.add("layout_save");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await clickClaude();
@@ -2757,7 +2780,7 @@ describe("failures", () => {
   });
 
   test("an exit that arrives after the tab was closed is ignored", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     const { onExit } = spawns()[0];
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
@@ -2769,7 +2792,7 @@ describe("failures", () => {
 
   test("typing before the process has started is dropped, not sent to a missing id", async () => {
     spawnBehaviour = () => new Promise(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].onData!("early");
     terms()[0].onResize!(90, 20);
@@ -2780,7 +2803,7 @@ describe("failures", () => {
   test("a tab closed while its process starts has the process killed once it has", async () => {
     let started!: (id: number) => void;
     spawnBehaviour = () => new Promise((r) => (started = r));
-    await boot();
+    await startApp();
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     started(7);
@@ -2789,7 +2812,7 @@ describe("failures", () => {
   });
 
   test("a tab closed while it restarts has the new process killed once it has started", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     spawns()[0].onExit.onmessage(0);
     let started!: (id: number) => void;
@@ -2806,7 +2829,7 @@ describe("failures", () => {
     let failed!: (err: unknown) => void;
     spawnBehaviour = () => new Promise((_r, reject) => (failed = reject));
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     const before = terms()[0].written.length;
@@ -2822,7 +2845,7 @@ describe("failures", () => {
     let started!: (id: number) => void;
     spawnBehaviour = () => new Promise((r) => (started = r));
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     failing.add("pty_kill");
@@ -2836,7 +2859,7 @@ describe("failures", () => {
   test("a tab left open while its process starts gets the process, and closing it later kills it", async () => {
     let started!: (id: number) => void;
     spawnBehaviour = () => new Promise((r) => (started = r));
-    await boot();
+    await startApp();
     await clickClaude();
     started(7);
     for (let i = 0; i < 3; i++) await flush();
@@ -2853,7 +2876,7 @@ describe("failures", () => {
     missingDirs.add("/gone");
     let started!: (id: number) => void;
     spawnBehaviour = () => new Promise((r) => (started = r));
-    await boot();
+    await startApp();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     started(9);
     for (let i = 0; i < 3; i++) await flush();
@@ -2865,7 +2888,7 @@ describe("failures", () => {
 describe("terminal views", () => {
   test("a tab closed while its terminal loads starts no process", async () => {
     fakes.FakeTerminal.hold = true;
-    await boot();
+    await startApp();
     await clickClaude();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     terms()[0].loading!.resolve();
@@ -2876,7 +2899,7 @@ describe("terminal views", () => {
 
   test("a terminal that fails to load after its tab was closed leaves the other tabs alone", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     fakes.FakeTerminal.hold = true;
     await clickClaude();
@@ -2891,7 +2914,7 @@ describe("terminal views", () => {
 
   test("a tab that cannot be opened gives the screen back to the tab shown before", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     fakes.FakeTerminal.failOnce = true;
     await clickClaude();
@@ -2904,7 +2927,7 @@ describe("terminal views", () => {
 
   test("a new tab's terminal is focused once it has loaded", async () => {
     fakes.FakeTerminal.hold = true;
-    await boot();
+    await startApp();
     await clickClaude();
     terms()[0].loading!.resolve();
     for (let i = 0; i < 3; i++) await flush();
@@ -2912,7 +2935,7 @@ describe("terminal views", () => {
   });
 
   test("switching tabs focuses the shown terminal at once, without the tab taking focus first", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     await flush();
     const before = terms()[0].focused;
@@ -2925,7 +2948,7 @@ describe("terminal views", () => {
   });
 
   test("letting go of a click anywhere on the terminal focuses it, even when its rows were redrawn meanwhile", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await flush();
     const before = terms()[0].focused;
@@ -2937,7 +2960,7 @@ describe("terminal views", () => {
   });
 
   test("letting go of the right button, or over text wterm holds selected, does not focus", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await flush();
     const before = terms()[0].focused;
@@ -2950,7 +2973,7 @@ describe("terminal views", () => {
   });
 
   test("pressing a tab's close button or rename field is left to them", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     for (const target of [tabs()[0].querySelector(".x")!, tabs()[0].querySelector(".name")!.appendChild(document.createElement("input"))]) {
       const down = new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0 });
@@ -2961,7 +2984,7 @@ describe("terminal views", () => {
   });
 
   test("letting go of a drag that selected text keeps the selection", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await flush();
     const before = terms()[0].focused;
@@ -2976,14 +2999,14 @@ describe("terminal views", () => {
   });
 
   test("a terminal fills its pane, rather than keeping the height of the rows it started with", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     for (let i = 0; i < 3; i++) await flush();
     expect(terms()[0].element.style.height).toBe("");
   });
 
   test("only the shown tab's terminal paints", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     expect(terms().map((t) => t.paused)).toEqual([true, false]);
     tabs()[0].click();
@@ -2994,7 +3017,7 @@ describe("terminal views", () => {
 
   test("an error thrown while writing to a terminal does not stop a restart", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await clickClaude();
     spawns()[0].onExit.onmessage(0);
     vi.spyOn(terms()[0], "write").mockImplementation(() => {
@@ -3017,7 +3040,7 @@ describe("terminal views", () => {
 
 describe("edge cases", () => {
   test("an unchanged layout is not written again", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await vi.advanceTimersByTimeAsync(1000);
     const saves = callsOf("layout_save").length;
@@ -3031,7 +3054,7 @@ describe("edge cases", () => {
   });
 
   test("switching tabs saves which one is active", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     await vi.advanceTimersByTimeAsync(1000);
     expect(lastSaved()?.active).toBe(1);
@@ -3045,7 +3068,7 @@ describe("edge cases", () => {
       active: 0,
       tabs: [{ tabId: "a", kind: "claude", name: "a", renamed: true, cwd: "/srv/app", command: null, claudeSession: SESSION }],
     };
-    await boot();
+    await startApp();
     liveCwds = { 1: "/elsewhere" };
     spawns()[0].onExit.onmessage(0);
     await win.closeRequested!();
@@ -3062,7 +3085,7 @@ describe("edge cases", () => {
     };
     fakes.FakeTerminal.failOnce = true;
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     expect(tabNames()).toEqual(["b"]);
     expect(document.querySelectorAll(".term")).toHaveLength(1);
     expect(noticeText()).toContain("A tab could not be opened: wterm: failed to initialize: no wasm.");
@@ -3075,7 +3098,7 @@ describe("edge cases", () => {
   test("a restore that fails outright switches saving off", async () => {
     savedLayout = { active: 0, tabs: null } as unknown as Layout;
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     expect(noticeText()).toContain("Saved tabs could not be restored");
     await clickClaude();
     await win.closeRequested!();
@@ -3086,13 +3109,13 @@ describe("edge cases", () => {
   test("a failed session reset is shown", async () => {
     failing.add("pty_reset");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     expect(noticeText()).toContain("Leftover sessions could not be stopped");
     error.mockRestore();
   });
 
   test("hook failures logged by the backend are picked up by the status check", async () => {
-    await boot();
+    await startApp();
     expect(noticeVisible()).toBe(false);
     storeReport.hookProblem = { at: 2000, message: "schema 2 in misag.db, this binary knows 1", log: LOG };
     await vi.advanceTimersByTimeAsync(31_000);
@@ -3101,7 +3124,7 @@ describe("edge cases", () => {
   });
 
   test("a Claude tab whose hook never reports gets a warning", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await clickClaude();
     reported.add(spawns()[1].tabId);
@@ -3112,7 +3135,7 @@ describe("edge cases", () => {
   });
 
   test("the warning clears once the hook reports, or when the tab closes", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await clickClaude();
     await vi.advanceTimersByTimeAsync(61_000);
@@ -3126,7 +3149,7 @@ describe("edge cases", () => {
   });
 
   test("a dismissed hook warning stays hidden when Claude retitles the tab", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await vi.advanceTimersByTimeAsync(61_000);
     expect(noticeText()).toContain("has not reported");
@@ -3140,7 +3163,7 @@ describe("edge cases", () => {
   });
 
   test("a failing report check neither warns nor gives up", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     failing.add("claude_reported");
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -3154,7 +3177,7 @@ describe("edge cases", () => {
   });
 
   test("the warning goes away when the tab's process exits", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     await vi.advanceTimersByTimeAsync(61_000);
     expect(noticeText()).toContain("has not reported");
@@ -3166,7 +3189,7 @@ describe("edge cases", () => {
 
   test("untracked Claude tabs get no hook warning", async () => {
     storeReport.store = { state: "notSaving", reason: "no data directory" };
-    await boot();
+    await startApp();
     await clickClaude();
     await vi.advanceTimersByTimeAsync(61_000);
     expect(noticeText()).not.toContain("has not reported");
@@ -3174,7 +3197,7 @@ describe("edge cases", () => {
   });
 
   test("starting in the home directory is also shown as a notice", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     liveCwds = { 1: "/gone" };
     missingDirs.add("/gone");
@@ -3183,7 +3206,7 @@ describe("edge cases", () => {
   });
 
   test("a new tab from a vanished active directory starts in the home directory", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     liveCwds = { 1: "/gone" };
     missingDirs.add("/gone");
@@ -3194,7 +3217,7 @@ describe("edge cases", () => {
 
   test("a directory typed into the dialog does not fall back silently", async () => {
     missingDirs.add("/typo");
-    await boot();
+    await startApp();
     await clickTerminal(true);
     field("cwd")!.value = "/typo";
     dialog().close("ok");
@@ -3205,7 +3228,7 @@ describe("edge cases", () => {
 
   test("a claude wrapper that could not be installed is reported", async () => {
     storeReport.wrapperProblem = "cannot write the claude wrapper in /d/bin: Read-only file system";
-    await boot();
+    await startApp();
     expect(noticeText()).toContain(
       "Claude sessions started in terminal tabs will not be reopened: cannot write the claude wrapper in /d/bin",
     );
@@ -3213,13 +3236,13 @@ describe("edge cases", () => {
 
   test("a misag shim that could not be installed is reported", async () => {
     storeReport.cliProblem = "cannot write the misag shim in /d/cli: Read-only file system";
-    await boot();
+    await startApp();
     expect(noticeText()).toContain("misag flow is not available in tabs: cannot write the misag shim in /d/cli");
   });
 
   test("restores the layout fixture the Rust tests also parse", async () => {
     savedLayout = JSON.parse(sharedLayout);
-    await boot();
+    await startApp();
     expect(tabNames()).toEqual(["agent", "logs", "app"]);
     expect(spawns()[0]).toMatchObject({ kind: "claude", tabId: "t1", claudeSession: SESSION, cwd: "/home/me/src" });
     expect(spawns()[1]).toMatchObject({ kind: "terminal", tabId: "t2", command: "tail -f syslog", claudeSession: null });
@@ -3271,7 +3294,7 @@ describe("flows", () => {
 
   test("Import adds a flow from the file picked and opens it", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     page().querySelector<HTMLButtonElement>("button.import")!.click();
     await settle();
@@ -3284,7 +3307,7 @@ describe("flows", () => {
 
   test("a cancelled import does nothing, and a refused one says why", async () => {
     flowPicked = false;
-    await boot();
+    await startApp();
     await openFlows();
     page().querySelector<HTMLButtonElement>("button.import")!.click();
     await settle();
@@ -3300,7 +3323,7 @@ describe("flows", () => {
 
   test("Export saves a flow where the person picks, or says why it could not", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     await click("Deploy", "export");
     expect(callsOf("flow_export_file").map((c) => c.args)).toEqual([{ id: 1 }]);
@@ -3313,7 +3336,7 @@ describe("flows", () => {
   test("an archived flow can be exported too", async () => {
     storedFlows = flows("Old");
     storedFlows[0].archived = true;
-    await boot();
+    await startApp();
     await openFlows();
     await click("Old", "export");
     expect(callsOf("flow_export_file").map((c) => c.args)).toEqual([{ id: 1 }]);
@@ -3321,7 +3344,7 @@ describe("flows", () => {
 
   test("a flow list that cannot be read on a poll leaves the flows working", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     failing.add("flows_list");
     await vi.advanceTimersByTimeAsync(2_000);
@@ -3333,7 +3356,7 @@ describe("flows", () => {
 
   test("a flow added outside the app, as by misag flow import, shows up", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     storedFlows.push({ id: 2, name: "From Claude", archived: false });
     await vi.advanceTimersByTimeAsync(2_000);
@@ -3344,13 +3367,13 @@ describe("flows", () => {
   test("the toolbox lists the flows that are not archived, in order", async () => {
     storedFlows = flows("Deploy", "Old", "Review");
     storedFlows[1].archived = true;
-    await boot();
+    await startApp();
     await settle();
     expect(boxRows()).toEqual(["Deploy", "Review"]);
   });
 
   test("with no flows the toolbox says how to add one", async () => {
-    await boot();
+    await startApp();
     await settle();
     expect(boxRows()).toEqual([]);
     expect(boxText()).toContain("No flows yet");
@@ -3358,23 +3381,23 @@ describe("flows", () => {
 
   test("a toolbox that cannot read the flows says so", async () => {
     failing.add("flows_list");
-    await boot();
+    await startApp();
     await settle();
     expect(boxText()).toContain("flows_list failed");
   });
 
   test("the toolbox collapses on its own and remembers it", async () => {
-    await boot();
+    await startApp();
     box().querySelector<HTMLButtonElement>(".toggle")!.click();
     expect(box().classList.contains("collapsed")).toBe(true);
     expect(document.querySelector("#workspace-box")!.classList.contains("collapsed")).toBe(false);
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(box().classList.contains("collapsed")).toBe(true);
   });
 
   test("the gear opens one Flows tab, which is not saved with the tabs", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await openFlows();
     await openFlows();
@@ -3389,7 +3412,7 @@ describe("flows", () => {
   test("the page lists active and archived flows apart", async () => {
     storedFlows = flows("Deploy", "Old", "Review");
     storedFlows[1].archived = true;
-    await boot();
+    await startApp();
     await openFlows();
     expect(listedNames("flow-list")).toEqual(["Deploy", "Review"]);
     expect(listedNames("archived-list")).toEqual(["Old"]);
@@ -3397,7 +3420,7 @@ describe("flows", () => {
 
   test("a new flow is created by name and shows up in the toolbox", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     await create("  Review ");
     expect(callsOf("flow_create").map((c) => c.args.name)).toEqual(["  Review "]);
@@ -3407,7 +3430,7 @@ describe("flows", () => {
   });
 
   test("a flow that cannot be created shows why and keeps the name", async () => {
-    await boot();
+    await startApp();
     await openFlows();
     await create("   ");
     expect(pageError().hidden).toBe(false);
@@ -3419,7 +3442,7 @@ describe("flows", () => {
 
   test("renaming a flow saves it and updates the toolbox", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     const input = rowOf("Deploy").querySelector<HTMLInputElement>("input.name")!;
     input.value = "Ship";
@@ -3431,7 +3454,7 @@ describe("flows", () => {
 
   test("a rejected rename goes back to the stored name", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     const input = rowOf("Deploy").querySelector<HTMLInputElement>("input.name")!;
     input.value = " ";
@@ -3444,7 +3467,7 @@ describe("flows", () => {
   test("moving a flow up or down reorders all flows, archived ones included", async () => {
     storedFlows = flows("a", "old", "b", "c");
     storedFlows[1].archived = true;
-    await boot();
+    await startApp();
     await openFlows();
     await click("c", "up");
     expect(callsOf("flows_reorder").at(-1)!.args.ids).toEqual([1, 2, 4, 3]);
@@ -3459,7 +3482,7 @@ describe("flows", () => {
 
   test("archiving hides a flow from the toolbox until it is unarchived", async () => {
     storedFlows = flows("Deploy", "Review");
-    await boot();
+    await startApp();
     await openFlows();
     await click("Deploy", "archive");
     expect(callsOf("flow_set_archived").map((c) => c.args)).toEqual([{ id: 1, archived: true }]);
@@ -3473,7 +3496,7 @@ describe("flows", () => {
   test("deleting asks first", async () => {
     storedFlows = flows("Deploy", "Review", "Old");
     storedFlows[2].archived = true;
-    await boot();
+    await startApp();
     await openFlows();
     await click("Deploy", "delete");
     expect(picker.asked).toEqual([expect.stringContaining("Deploy")]);
@@ -3491,7 +3514,7 @@ describe("flows", () => {
     storedFlows = flows("Deploy");
     busyFlows.add(1);
     picker.answer = true;
-    await boot();
+    await startApp();
     await openFlows();
     await click("Deploy", "delete");
     expect(pageError().textContent).toContain("running");
@@ -3501,7 +3524,7 @@ describe("flows", () => {
   test("while the flows cannot be read, nothing on the page can be changed", async () => {
     storedFlows = flows("Deploy", "Old");
     storedFlows[1].archived = true;
-    await boot();
+    await startApp();
     await settle();
     failing.add("flows_list");
     await openFlows();
@@ -3520,7 +3543,7 @@ describe("flows", () => {
 
   test("a change whose reload fails says the list may be out of date", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFlows();
     failing.add("flows_list");
     await create("Review");
@@ -3530,7 +3553,7 @@ describe("flows", () => {
 
   test("changes run one at a time, in order", async () => {
     storedFlows = flows("a", "b", "c");
-    await boot();
+    await startApp();
     await openFlows();
     // Two quick clicks: the second works on the order the first left.
     rowOf("c").querySelector<HTMLButtonElement>("button.up")!.click();
@@ -3597,7 +3620,7 @@ describe("flow editor", () => {
 
   test("clicking a flow in the toolbox opens its editor, one tab per flow", async () => {
     storedFlows = flows("Deploy", "Review");
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await openFromBox("Deploy");
     expect(tabNames()).toEqual(["work", "Deploy"]);
@@ -3617,7 +3640,7 @@ describe("flow editor", () => {
 
   test("the Flows page opens the editor too", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     document.querySelector<HTMLButtonElement>("#flows-box .configure")!.click();
     await settle();
     document.querySelector<HTMLButtonElement>("#flows-settings .flow-list li button.edit")!.click();
@@ -3629,7 +3652,7 @@ describe("flow editor", () => {
   test("the canvas shows the steps, their outputs and their connections", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     expect(titles()).toEqual(["Start", "P", "E"]);
     expect(nodes().map((n) => ["start", "prompt", "end"].find((k) => n.classList.contains(k)))).toEqual(["start", "prompt", "end"]);
@@ -3642,7 +3665,7 @@ describe("flow editor", () => {
 
   test("an added step is saved after a short pause", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     tool("add-prompt").click();
     tool("add-pause").click();
@@ -3666,7 +3689,7 @@ describe("flow editor", () => {
   test("connecting an output saves it, replacing where that output went before", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = { nodes: [START, step("a", "prompt", "A", ["done"], "x"), step("b", "end", "B", [])], edges: [] };
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await connect("Start", 1, "A");
     await connect("A", 1, "B");
@@ -3682,7 +3705,7 @@ describe("flow editor", () => {
   test("a selected step's fields are shown and saved, and its outputs become ports", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     expect(panel().hidden).toBe(true);
     await select("P");
@@ -3705,7 +3728,7 @@ describe("flow editor", () => {
   test("outputs that are not short words are refused in place", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("P");
     await edit("outputs", "ok, needs work");
@@ -3723,7 +3746,7 @@ describe("flow editor", () => {
   test("a step can be limited to a number of runs, for loops", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("P");
     expect(field("maxRuns").value).toBe("");
@@ -3751,7 +3774,7 @@ describe("flow editor", () => {
   test("Start can begin each run with /clear, shown on the canvas and in the toolbox", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     const mark = () => document.querySelector("#flows-box .flows li .lucide")!;
     expect(mark().classList.contains("clears")).toBe(false);
@@ -3779,7 +3802,7 @@ describe("flow editor", () => {
   test("Start has an optional base info text, saved with the flow", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("Start");
     const text = field("text") as HTMLTextAreaElement;
@@ -3806,7 +3829,7 @@ describe("flow editor", () => {
   test("▶ saves a change to the flow first, so a just-ticked /clear counts", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await openFromBox("Deploy");
     await select("Start");
@@ -3829,7 +3852,7 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
     storedGraphs[1].nodes[1] = { ...storedGraphs[1].nodes[1], maxRuns: 5 } as Step;
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("P");
     expect(field("maxRuns").value).toBe("5");
@@ -3842,7 +3865,7 @@ describe("flow editor", () => {
   test("a run limit edit does not hide what is wrong with the outputs", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("P");
     await edit("outputs", "ok, needs work");
@@ -3857,7 +3880,7 @@ describe("flow editor", () => {
   test("an outputs edit is kept when another step is selected before it is committed", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("P");
     field("outputs").value = "pass, fail, skip";
@@ -3868,7 +3891,7 @@ describe("flow editor", () => {
 
   test("a new step never takes the id of a deleted one", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     tool("add-pause").click();
     await afterSave();
@@ -3882,7 +3905,7 @@ describe("flow editor", () => {
 
   test("a manual step has no outputs field, as it goes on one way", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     tool("add-pause").click();
     await settle();
@@ -3892,7 +3915,7 @@ describe("flow editor", () => {
 
   test("a manual prompt has a draft, one output and no run limit", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     tool("add-manual-prompt").click();
     await settle();
@@ -3911,7 +3934,7 @@ describe("flow editor", () => {
   test("a manual prompt from a flow file with several outputs says it has one", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = { nodes: [START, step("m", "manual_prompt", "Ask", ["a", "b"])], edges: [] };
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("Ask");
     await edit("outputs", "a, c");
@@ -3924,7 +3947,7 @@ describe("flow editor", () => {
       nodes: [START, step("m", "manual", "Review", ["approve", "reject"]), step("p", "prompt", "Fix", ["done"], "fix it")],
       edges: [{ from: "m", output: "reject", to: "p" }],
     };
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("Review");
     expect(field("outputs").closest("label")!.hidden).toBe(false);
@@ -3945,7 +3968,7 @@ describe("flow editor", () => {
   test("Start and End have no fields for outputs, End none for a prompt, and Start cannot be deleted", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("Start");
     expect(field("outputs").closest("label")!.hidden).toBe(true);
@@ -3974,7 +3997,7 @@ describe("flow editor", () => {
   test("deleting a step takes its connections with it", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     await select("P");
     panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
@@ -3994,7 +4017,7 @@ describe("flow editor", () => {
     for (const prop of ["clientWidth", "clientHeight"] as const) vi.spyOn(HTMLElement.prototype, prop, "get").mockReturnValue(1000);
     storedFlows = flows("Deploy");
     storedGraphs[1] = runnable();
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     const content = node("E").querySelector(".drawflow_content_node")!;
     mouse(content, "mousedown", 0, 0);
@@ -4007,7 +4030,7 @@ describe("flow editor", () => {
   test("what keeps the flow from running is listed until it is ready", async () => {
     storedFlows = flows("Deploy");
     flowProblems = ["Start is not connected to a step."];
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     const problems = () => [...editor().querySelectorAll(".problems li")].map((li) => li.textContent);
     expect(problems()).toEqual(["Start is not connected to a step."]);
@@ -4020,7 +4043,7 @@ describe("flow editor", () => {
 
   test("a failed save says why, and the next change tries again", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
     tool("add-pause").click();
@@ -4036,7 +4059,7 @@ describe("flow editor", () => {
 
   test("closing the tab saves a change still waiting", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     tool("add-pause").click();
     await settle();
@@ -4048,7 +4071,7 @@ describe("flow editor", () => {
 
   test("a tab whose changes cannot be saved stays open and says so", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
     tool("add-pause").click();
@@ -4067,7 +4090,7 @@ describe("flow editor", () => {
 
   test("quitting saves the open editors' waiting changes", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     tool("add-pause").click();
     await settle();
@@ -4078,7 +4101,7 @@ describe("flow editor", () => {
 
   test("quitting with unsavable editor changes warns once", async () => {
     storedFlows = flows("Deploy");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
     tool("add-pause").click();
@@ -4093,7 +4116,7 @@ describe("flow editor", () => {
   test("a flow that cannot be loaded says so and cannot be edited", async () => {
     storedFlows = flows("Deploy");
     failing.add("flow_load");
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     expect(editor().querySelector(".error")!.textContent).toContain("could not be loaded");
     expect(tool("add-prompt").matches(":disabled")).toBe(true);
@@ -4102,7 +4125,7 @@ describe("flow editor", () => {
   test("renaming a flow retitles its tab, and deleting it closes the tab", async () => {
     storedFlows = flows("Deploy", "Review");
     picker.answer = true;
-    await boot();
+    await startApp();
     await openFromBox("Deploy");
     document.querySelector<HTMLButtonElement>("#flows-box .configure")!.click();
     await settle();
@@ -4166,7 +4189,7 @@ describe("flow runs", () => {
 
   test("▶ starts a flow in the active Claude tab and types what the run sends first (its briefing)", async () => {
     runPrompt = "Fix the tests.\nEnd with FLOW: pass";
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     tabs()[0].click();
     await play("Deploy");
@@ -4178,7 +4201,7 @@ describe("flow runs", () => {
   test("▶ on a flow added from a tab asks first, and runs it only once it is confirmed", async () => {
     runPrompt = "Fix the tests.";
     storedFlows[0].unconfirmed = true;
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await play("Deploy");
     expect(picker.asked).toEqual([expect.stringContaining("added from a tab")]);
@@ -4209,7 +4232,7 @@ describe("flow runs", () => {
   test("a flow whose Start clears starts its run, types /clear, and sends the briefing once Claude has cleared", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
     clearStates = [{ state: "pending" }, { state: "ready", prompt: "Fix the tests." }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await playAndEnter("Deploy");
     // The run holds the tab before anything is typed, so a refused start clears nothing.
@@ -4229,7 +4252,7 @@ describe("flow runs", () => {
 
   test("a clear that never comes stops the run and says so", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await playAndEnter("Deploy");
     await vi.advanceTimersByTimeAsync(CLEAR_TIMEOUT_MS);
@@ -4242,7 +4265,7 @@ describe("flow runs", () => {
   test("a run stopped while it clears is left alone", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
     clearStates = [{ state: "gone" }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await playAndEnter("Deploy");
     await pollClear();
@@ -4255,7 +4278,7 @@ describe("flow runs", () => {
 
   test("a flow that clears does not start while Claude is working, as /clear would wait for it", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     terms()[0].onTitle!("◐ Fixing");
     await playAndEnter("Deploy");
@@ -4266,7 +4289,7 @@ describe("flow runs", () => {
 
   test("no flow starts while Claude is working, as the turn's end would be taken for the briefing's reply", async () => {
     runPrompt = "The briefing.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     terms()[0].onTitle!("◐ Fixing");
     await play("Deploy");
@@ -4277,7 +4300,7 @@ describe("flow runs", () => {
 
   test("a flow that does not clear does not start while Claude waits on background tasks, as the turn they wake it for would be taken for the briefing's reply", async () => {
     runPrompt = "The briefing.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     backgroundTabs = { [spawns()[0].tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -4289,7 +4312,7 @@ describe("flow runs", () => {
 
   test("a flow that clears still starts while Claude only waits on background tasks, as Claude is idle", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     backgroundTabs = { [spawns()[0].tabId]: Date.now() };
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -4301,7 +4324,7 @@ describe("flow runs", () => {
 
   test("pressing ▶ again while a flow starts in the tab does not start it twice", async () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const play = flowRow("Deploy").querySelector<HTMLButtonElement>("button.run")!;
     play.click();
@@ -4317,7 +4340,7 @@ describe("flow runs", () => {
     storedGraphs[1].nodes[0] = { ...START, clear: true };
     flowProblems = ["Start is not connected to a step."];
     runRefusal = "the flow is not ready to run: Start is not connected to a step.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await play("Deploy");
     expect(typed()).toEqual([]);
@@ -4325,7 +4348,7 @@ describe("flow runs", () => {
   });
 
   test("a flow that starts at a manual step types nothing", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await play("Deploy");
     expect(callsOf("flow_start")).toHaveLength(1);
@@ -4334,7 +4357,7 @@ describe("flow runs", () => {
 
   test("a run at a manual prompt fills Claude's input once, without sending it", async () => {
     prefills = [{ text: "The app is in src/.\n\nFix the bug in ", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const tabId = spawns()[0].tabId;
     activeRuns = [run({ tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], prefill: true })];
@@ -4352,7 +4375,7 @@ describe("flow runs", () => {
   test("a manual prompt that cannot be filled is tried again, saying so once", async () => {
     prefillError = "database is locked";
     prefills = [{ text: "Draft", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], prefill: true })];
     await poll();
@@ -4371,7 +4394,7 @@ describe("flow runs", () => {
 
   test("a manual prompt does not wipe what the person is typing, and says how to get its draft", async () => {
     prefills = [{ text: "Draft", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     terms()[0].onData!("half a thought");
     activeRuns = [atManualPrompt({ prefill: true })];
@@ -4388,7 +4411,7 @@ describe("flow runs", () => {
 
   test("skipping a manual prompt takes its untouched draft back out of Claude's input", async () => {
     prefills = [{ text: "Draft", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [atManualPrompt({ prefill: true })];
     await poll();
@@ -4406,7 +4429,7 @@ describe("flow runs", () => {
 
   test("a draft the person has added to stays when the run is stopped", async () => {
     prefills = [{ text: "Draft", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [atManualPrompt({ prefill: true })];
     await poll();
@@ -4420,7 +4443,7 @@ describe("flow runs", () => {
 
   test("stopping a run takes its untouched manual prompt draft out of Claude's input", async () => {
     prefills = [{ text: "Draft", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [atManualPrompt({ prefill: true })];
     await poll();
@@ -4434,7 +4457,7 @@ describe("flow runs", () => {
   test("a paste that could not be recorded says it was pasted", async () => {
     prefills = [{ text: "Draft", token: 7 }];
     prefilledError = "database is locked";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [atManualPrompt({ prefill: true })];
     await poll();
@@ -4442,7 +4465,7 @@ describe("flow runs", () => {
   });
 
   test("stopping a run types nothing into Claude, whose next prompt is told the flow is finished", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4453,7 +4476,7 @@ describe("flow runs", () => {
   });
 
   test("a run says it is briefing Claude before its first step", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, stepId: "start", step: "Start", outputs: [], stepKind: "start", briefing: true })];
     await poll();
@@ -4465,7 +4488,7 @@ describe("flow runs", () => {
   });
 
   test("the run bar offers a manual prompt's output as a skip", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [atManualPrompt()];
     await poll();
@@ -4476,7 +4499,7 @@ describe("flow runs", () => {
 
   test("a manual prompt waits to fill the input while Claude is working", async () => {
     prefills = [{ text: "Draft", token: 7 }];
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const tabId = spawns()[0].tabId;
     terms()[0].onTitle!("◐ Claude Code");
@@ -4489,7 +4512,7 @@ describe("flow runs", () => {
   });
 
   test("without Claude in the active tab, ▶ says where flows run", async () => {
-    await boot();
+    await startApp();
     await play("Deploy");
     await clickTerminal();
     await play("Deploy");
@@ -4499,7 +4522,7 @@ describe("flow runs", () => {
 
   test("a start that is refused says why", async () => {
     runRefusal = "the flow is not ready to run: Start is not connected to a step.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await play("Deploy");
     expect(box().querySelector(".error")!.textContent).toContain("not ready to run");
@@ -4507,7 +4530,7 @@ describe("flow runs", () => {
   });
 
   test("only a flow running in the active tab is marked, with ■ in place of ▶", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     const [a, b] = spawns().map((c) => c.tabId);
     activeRuns = [run({ tabId: a }), run({ id: 6, flowId: 2, tabId: b, status: "manual" })];
@@ -4529,7 +4552,7 @@ describe("flow runs", () => {
 
   test("▶ on a run that needs attention goes on to the next step", async () => {
     runPrompt = "Deploy it.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", outputs: ["done"], resumable: true })];
     await poll();
@@ -4552,7 +4575,7 @@ describe("flow runs", () => {
 
   test("a run that needs attention at a step with several outputs offers them in the flow list", async () => {
     runPrompt = "Fix it.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
     await poll();
@@ -4569,7 +4592,7 @@ describe("flow runs", () => {
 
   test("a run waiting at a manual step goes on from the flow list with the output picked there", async () => {
     runPrompt = "Ship it.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review the diff", outputs: ["approve", "reject"] })];
     await poll();
@@ -4591,7 +4614,7 @@ describe("flow runs", () => {
 
   test("▶ on a manual step with one output finishes the step and goes on", async () => {
     runPrompt = "Submit the form.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review the filled form", outputs: ["done"] })];
     await poll();
@@ -4610,7 +4633,7 @@ describe("flow runs", () => {
   });
 
   test("a manual step with several outputs offers no ▶, as it cannot tell which", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["approve", "reject"] })];
     await poll();
@@ -4619,7 +4642,7 @@ describe("flow runs", () => {
 
   test("a pick in the flow list that cannot go on says why", async () => {
     runRefusal = "the run has moved on";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["ok"] })];
     await poll();
@@ -4630,7 +4653,7 @@ describe("flow runs", () => {
 
   test("Continue in the run bar has Claude go on with a step that needs attention", async () => {
     runPrompt = "Go on.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person.", resumable: true })];
     await poll();
@@ -4643,7 +4666,7 @@ describe("flow runs", () => {
   });
 
   test("■ stops the run", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4656,7 +4679,7 @@ describe("flow runs", () => {
 
   test("a running flow's editor shows its current step, and the outputs to go on by", async () => {
     runPrompt = "Deploy it.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "attention", note: "Claude asked for a person." })];
     await poll();
@@ -4674,7 +4697,7 @@ describe("flow runs", () => {
   });
 
   test("the editor follows the run as it moves on, and ends", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const tabId = spawns()[0].tabId;
     activeRuns = [run({ tabId })];
@@ -4692,7 +4715,7 @@ describe("flow runs", () => {
   });
 
   test("a running flow shows how many of its steps are done", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const tabId = spawns()[0].tabId;
     activeRuns = [run({ tabId, done: 1, total: 3 })];
@@ -4711,7 +4734,7 @@ describe("flow runs", () => {
   });
 
   test("a run whose tab is gone shows on its flow, and ■ stops it", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: "gone" })];
     await poll();
@@ -4727,7 +4750,7 @@ describe("flow runs", () => {
   });
 
   test("closing a tab does not leave its run showing as one of a closed tab", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4737,7 +4760,7 @@ describe("flow runs", () => {
   });
 
   test("while the active tab runs a flow, ▶ on the others is off", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4750,7 +4773,7 @@ describe("flow runs", () => {
   });
 
   test("the editor says when the run's step is no longer in the flow", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId, stepId: "old", step: "Old step" })];
     await poll();
@@ -4761,7 +4784,7 @@ describe("flow runs", () => {
   });
 
   test("an open editor follows the active tab", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     tabs()[0].click();
@@ -4776,7 +4799,7 @@ describe("flow runs", () => {
   });
 
   test("the run's step stays marked while the flow is edited", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4787,7 +4810,7 @@ describe("flow runs", () => {
   });
 
   test("an editor shows only the active tab's run of its flow", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4824,7 +4847,7 @@ describe("flow runs and Claude's state", () => {
 
   test("a prompt is only typed into a terminal tab while Claude still runs there", async () => {
     runPrompt = "Next.";
-    await boot();
+    await startApp();
     await clickTerminal();
     const tabId = spawns()[0].tabId;
     openClaudes = { 1: SESSION };
@@ -4850,7 +4873,7 @@ describe("flow runs and Claude's state", () => {
 
   test("a run does not go on while Claude waits on background tasks, which wake it for another turn", async () => {
     runPrompt = "Next.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const tabId = spawns()[0].tabId;
     activeRuns = [run({ tabId })];
@@ -4870,7 +4893,7 @@ describe("flow runs and Claude's state", () => {
 
   test("a prompt's Enter is held back if Claude left a terminal tab while it was pasted", async () => {
     runPrompt = "Next.";
-    await boot();
+    await startApp();
     await clickTerminal();
     const tabId = spawns()[0].tabId;
     openClaudes = { 1: SESSION };
@@ -4890,7 +4913,7 @@ describe("flow runs and Claude's state", () => {
 
   test("a briefing that cannot be sent, as Claude left the tab, says so", async () => {
     runPrompt = "Fix it.";
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes = { 1: SESSION };
     await poll();
@@ -4910,7 +4933,7 @@ describe("flow runs and Claude's state", () => {
 
   test("Claude leaving before /clear is sent stops the run that would clear", async () => {
     storedGraphs[1] = { nodes: [{ ...START, clear: true }, { id: "p", kind: "prompt", title: "P", text: "x", outputs: ["done"], x: 0, y: 0 }], edges: [] };
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes = { 1: SESSION };
     await poll();
@@ -4928,7 +4951,7 @@ describe("flow runs and Claude's state", () => {
   });
 
   test("▶ checks a terminal tab's Claude right before starting", async () => {
-    await boot();
+    await startApp();
     await clickTerminal();
     openClaudes = { 1: SESSION };
     await poll();
@@ -4940,7 +4963,7 @@ describe("flow runs and Claude's state", () => {
   });
 
   test("closing a tab ends its run", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     const tabId = spawns()[0].tabId;
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
@@ -4949,7 +4972,7 @@ describe("flow runs and Claude's state", () => {
   });
 
   test("runs that cannot be read are reported in the box until they can", async () => {
-    await boot();
+    await startApp();
     failing.add("flow_runs");
     await poll();
     expect(boxError().textContent).toContain("Flow runs could not be read");
@@ -4960,7 +4983,7 @@ describe("flow runs and Claude's state", () => {
 
   test("a refused output says why in the run bar", async () => {
     runRefusal = "the run has moved on";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -4973,7 +4996,7 @@ describe("flow runs and Claude's state", () => {
 
   test("an output is sent once, however often it is clicked", async () => {
     runPrompt = "Next.";
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     activeRuns = [run({ tabId: spawns()[0].tabId })];
     await poll();
@@ -5006,7 +5029,7 @@ describe("session history", () => {
 
   test("lists the Claude sessions of every folder, with their folders, whatever tab is active", async () => {
     pastSessions.push(past(THIRD, "Elsewhere", "/elsewhere"), past(FOURTH, "At home", "/home/me"));
-    await boot();
+    await startApp();
     await settle();
     expect(titles()).toEqual(["Fix the build", "Add tests", "Elsewhere", "At home"]);
     expect(rows().map((li) => li.querySelector(".folder")!.textContent)).toEqual(["work", "work", "elsewhere", "~"]);
@@ -5021,7 +5044,7 @@ describe("session history", () => {
 
   test("says so when Claude has no sessions saved", async () => {
     pastSessions = [];
-    await boot();
+    await startApp();
     await settle();
     expect(hint().hidden).toBe(false);
     expect(hint().textContent).toContain("No Claude sessions");
@@ -5029,7 +5052,7 @@ describe("session history", () => {
 
   test("clicking a session always resumes it in a new Claude tab in its folder", async () => {
     pastSessions.push(past(THIRD, "Elsewhere", "/elsewhere"));
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     rows()[1].querySelector<HTMLButtonElement>("button.resume")!.click();
@@ -5044,7 +5067,7 @@ describe("session history", () => {
 
   test("the pin button keeps a session at the top, and unpins it again", async () => {
     pastSessions.push(past(THIRD, "Third"));
-    await boot();
+    await startApp();
     await settle();
     const pin = (i: number) => rows()[i].querySelector<HTMLButtonElement>("button.pin")!;
     expect(pin(2).getAttribute("aria-pressed")).toBe("false");
@@ -5063,7 +5086,7 @@ describe("session history", () => {
   });
 
   test("a failed pin is shown and changes nothing, and the next pin clears the notice", async () => {
-    await boot();
+    await startApp();
     await settle();
     const pin = (i: number) => rows()[i].querySelector<HTMLButtonElement>("button.pin")!;
     const reads = callsOf("claude_history").length;
@@ -5083,7 +5106,7 @@ describe("session history", () => {
   });
 
   test("an answer overtaken by a later read is dropped", async () => {
-    await boot();
+    await startApp();
     await settle();
     let open!: () => void;
     historyGates.push(new Promise((resolve) => (open = resolve)));
@@ -5100,7 +5123,7 @@ describe("session history", () => {
   test("shows the newest 10, and Load more shows 10 more until there are none", async () => {
     const many = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
     pastSessions = many;
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     const more = () => box().querySelector<HTMLButtonElement>("button.load-more")!;
@@ -5116,7 +5139,7 @@ describe("session history", () => {
   });
 
   test("a session open in a tab is marked, and clicking it shows that tab instead of resuming", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(2);
     tabSessions = { [spawns()[0].tabId]: OTHER, [spawns()[1].tabId]: SESSION };
     box().querySelector<HTMLButtonElement>(".refresh")!.click();
@@ -5130,7 +5153,7 @@ describe("session history", () => {
   });
 
   test("a reload that changes nothing keeps the rows, and the focus in them", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     const button = rows()[1].querySelector<HTMLButtonElement>("button.pin")!;
@@ -5142,7 +5165,7 @@ describe("session history", () => {
   });
 
   test("the box is read every 10 seconds only while it can be seen", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     const reads = () => callsOf("claude_history").length;
@@ -5165,7 +5188,7 @@ describe("session history", () => {
 
   test("a failed Load more keeps the sessions shown, and the next try asks for the same page", async () => {
     pastSessions = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     failing.add("claude_history");
@@ -5183,7 +5206,7 @@ describe("session history", () => {
 
   test("Load more waits for its page before it can be clicked again", async () => {
     pastSessions = Array.from({ length: 25 }, (_, i) => past(`00000000-0000-4000-8000-${String(i).padStart(12, "0")}`, `p${i}`));
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     const more = () => box().querySelector<HTMLButtonElement>("button.load-more")!;
@@ -5201,7 +5224,7 @@ describe("session history", () => {
 
   test("a read that keeps failing is logged once, not on every poll", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     failing.add("claude_history");
@@ -5223,7 +5246,7 @@ describe("session history", () => {
 
   test("transcripts that could not be read are counted in the box", async () => {
     historyUnreadable = 2;
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     const note = box().querySelector<HTMLElement>(".unreadable")!;
@@ -5232,7 +5255,7 @@ describe("session history", () => {
   });
 
   test("the refresh button reads the sessions again, and a failure is shown", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await settle();
     pastSessions.push(past(THIRD, "Third"));
@@ -5270,7 +5293,7 @@ describe("tab order", () => {
   }
 
   test("a tab dragged along the tab bar moves there and is saved in its new place", async () => {
-    await boot();
+    await startApp();
     for (let i = 0; i < 3; i++) await clickTerminal();
     drag(2, 10);
     expect(tabNames()).toEqual(["shell 3", "shell 1", "shell 2"]);
@@ -5286,7 +5309,7 @@ describe("tab order", () => {
   });
 
   test("a terminal tab stays before the page tabs", async () => {
-    await boot();
+    await startApp();
     for (let i = 0; i < 2; i++) await clickTerminal();
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
     for (let i = 0; i < 6; i++) await flush();
@@ -5315,7 +5338,7 @@ describe("tab order", () => {
       return list;
     };
     try {
-      await boot();
+      await startApp();
       for (let i = 0; i < 3; i++) await clickTerminal();
       // Let go 20px off its place, it slides back into it.
       drag(2, 30);
@@ -5331,7 +5354,7 @@ describe("tab order", () => {
   });
 
   test("a drag ends where it is when the tab bar is drawn again", async () => {
-    await boot();
+    await startApp();
     for (let i = 0; i < 2; i++) await clickTerminal();
     mouse(tabs()[0].querySelector(".name")!, "mousedown", 10);
     mouse(document, "mousemove", 20);
@@ -5348,7 +5371,7 @@ describe("tab order", () => {
   });
 
   test("pressing the close button or a short click does not move the tab", async () => {
-    await boot();
+    await startApp();
     for (let i = 0; i < 2; i++) await clickTerminal();
     mouse(tabs()[0].querySelector(".x")!, "mousedown", 90);
     mouse(document, "mousemove", 190);
@@ -5392,7 +5415,7 @@ describe("toolbox order", () => {
   }
 
   test("a toolbox dragged by its header moves, without collapsing, and the order is remembered", async () => {
-    await boot();
+    await startApp();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
     drag("history-box", 10);
     expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
@@ -5403,12 +5426,12 @@ describe("toolbox order", () => {
     expect(document.querySelector<HTMLElement>("#workspace-box")!.style.transform).toBe("");
     // A fresh app instance on a fresh page.
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(order()).toEqual(["history-box", "flows-box", "workspace-box"]);
   });
 
   test("Alt+Up and Alt+Down on a header move its toolbox, and the order is remembered", async () => {
-    await boot();
+    await startApp();
     const keyOn = (id: string, key: string) =>
       header(id).dispatchEvent(new KeyboardEvent("keydown", { key, altKey: true, bubbles: true }));
     keyOn("history-box", "ArrowUp");
@@ -5417,12 +5440,12 @@ describe("toolbox order", () => {
     expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
     expect(document.activeElement).toBe(header("workspace-box"));
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(order()).toEqual(["history-box", "workspace-box", "flows-box"]);
   });
 
   test("Reset sidebar on the Settings page restores the order and opens every toolbox", async () => {
-    await boot();
+    await startApp();
     drag("history-box", 10);
     header("flows-box").click();
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
@@ -5431,13 +5454,13 @@ describe("toolbox order", () => {
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
     expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(false);
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
     expect(document.querySelector("#flows-box")!.classList.contains("collapsed")).toBe(false);
   });
 
   test("a drag released outside the window does not swallow a later click", async () => {
-    await boot();
+    await startApp();
     const start = 210;
     mouse(header("history-box"), "mousedown", start);
     mouse(document, "mousemove", start + 2);
@@ -5450,7 +5473,7 @@ describe("toolbox order", () => {
   });
 
   test("a click without a drag still collapses", async () => {
-    await boot();
+    await startApp();
     mouse(header("flows-box"), "mousedown", 110);
     mouse(document, "mouseup", 111);
     header("flows-box").click();
@@ -5460,11 +5483,11 @@ describe("toolbox order", () => {
 
   test("a stored order with unknown or missing toolboxes keeps the others in place", async () => {
     localStorage.setItem("misag.toolboxOrder", JSON.stringify(["flows-box", "gone-box"]));
-    await boot();
+    await startApp();
     expect(order()).toEqual(["flows-box", "workspace-box", "history-box"]);
     vi.resetModules();
     localStorage.setItem("misag.toolboxOrder", "not json");
-    await boot();
+    await startApp();
     expect(order()).toEqual(["workspace-box", "flows-box", "history-box"]);
   });
 });
@@ -5496,18 +5519,18 @@ describe("sidebar width", () => {
   afterEach(() => setWindowWidth(1024));
 
   test("dragging the sidebar's edge resizes it, and the width is remembered", async () => {
-    await boot();
+    await startApp();
     expect(width()).toBe("240px");
     drag(320);
     expect(width()).toBe("320px");
     expect(document.body.classList.contains("resizing-sidebar")).toBe(false);
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(width()).toBe("320px");
   });
 
   test("the edge moves by as far as the mouse went, wherever it was grabbed", async () => {
-    await boot();
+    await startApp();
     drag(263, 243);
     expect(width()).toBe("260px");
     drag(282, 262);
@@ -5515,7 +5538,7 @@ describe("sidebar width", () => {
   });
 
   test("the width is saved once let go, and moving the mouse after that leaves it", async () => {
-    await boot();
+    await startApp();
     mouse(resizer(), "mousedown", 240);
     mouse(document, "mousemove", 320);
     expect(width()).toBe("320px");
@@ -5527,7 +5550,7 @@ describe("sidebar width", () => {
   });
 
   test("a drag let go outside the window ends at the next move without the button, or when the window loses focus", async () => {
-    await boot();
+    await startApp();
     mouse(resizer(), "mousedown", 240);
     mouse(document, "mousemove", 300);
     mouse(document, "mousemove", 400, { buttons: 0 });
@@ -5545,7 +5568,7 @@ describe("sidebar width", () => {
   });
 
   test("only the left button drags the edge", async () => {
-    await boot();
+    await startApp();
     mouse(resizer(), "mousedown", 240, { button: 2 });
     mouse(document, "mousemove", 320);
     expect(width()).toBe("240px");
@@ -5553,7 +5576,7 @@ describe("sidebar width", () => {
   });
 
   test("the terminal is fitted once the edge is let go, not at every move", async () => {
-    await boot();
+    await startApp();
     await clickClaude();
     const term = terms()[0];
     const before = term.fits;
@@ -5568,7 +5591,7 @@ describe("sidebar width", () => {
   });
 
   test("the sidebar stays between its narrowest and widest", async () => {
-    await boot();
+    await startApp();
     drag(10);
     expect(width()).toBe("160px");
     drag(5000, 160);
@@ -5577,7 +5600,7 @@ describe("sidebar width", () => {
 
   test("the sidebar leaves the terminals room in a narrow window, and takes its width back when the window grows", async () => {
     localStorage.setItem("misag.sidebarWidth", "500");
-    await boot();
+    await startApp();
     expect(width()).toBe("500px");
     setWindowWidth(700);
     window.dispatchEvent(new Event("resize"));
@@ -5594,7 +5617,7 @@ describe("sidebar width", () => {
   });
 
   test("the arrow keys on the sidebar's edge resize it, and a double-click restores the default", async () => {
-    await boot();
+    await startApp();
     key("ArrowRight");
     expect(width()).toBe("256px");
     key("ArrowLeft");
@@ -5611,17 +5634,17 @@ describe("sidebar width", () => {
     resizer().dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
     expect(width()).toBe("240px");
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(width()).toBe("240px");
   });
 
   test("Reset sidebar on the Settings page restores the default width", async () => {
-    await boot();
+    await startApp();
     drag(400);
     document.querySelector<HTMLButtonElement>("#settings .reset-sidebar")!.click();
     expect(width()).toBe("240px");
     vi.resetModules();
-    await boot();
+    await startApp();
     expect(width()).toBe("240px");
   });
 
@@ -5632,7 +5655,7 @@ describe("sidebar width", () => {
     ["10", "160px"],
   ])("a stored width of %j opens the sidebar at %s", async (value, expected) => {
     localStorage.setItem("misag.sidebarWidth", value);
-    await boot();
+    await startApp();
     expect(width()).toBe(expected);
   });
 });
@@ -5648,7 +5671,7 @@ describe("dropping files on the window", () => {
   };
 
   test("types the dropped paths into the active tab, shell-quoted on one line, and brings the window to the front", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await dropFiles(["/home/u/a.txt", "/home/u/my notes.txt"]);
     expect(typed()).toEqual(["/home/u/a.txt '/home/u/my notes.txt' "]);
@@ -5656,7 +5679,7 @@ describe("dropping files on the window", () => {
   });
 
   test("types them as a bracketed paste when the program in the tab asked for one", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     terms()[0].bracketed = true;
     await dropFiles(["/home/u/a.txt"]);
@@ -5664,7 +5687,7 @@ describe("dropping files on the window", () => {
   });
 
   test("ignores dragging over the window, leaving it and an empty drop", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     drop.emit!({ type: "enter", paths: ["/home/u/a.txt"] });
     drop.emit!({ type: "over" });
@@ -5675,7 +5698,7 @@ describe("dropping files on the window", () => {
   });
 
   test("one path that could act as keys types none, and the notice says so", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await dropFiles(["/home/u/b\rc", "/home/u/a.txt"]);
     expect(noticeText()).toContain('"/home/u/b\\rc" was not typed: its name contains control characters');
@@ -5684,7 +5707,7 @@ describe("dropping files on the window", () => {
   });
 
   test("links and files that are not local are not typed", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await dropFiles(["/home/u/a.txt", "https://example.com/x"]);
     expect(noticeText()).toContain('"https://example.com/x" was not typed: it is not a local file');
@@ -5694,7 +5717,7 @@ describe("dropping files on the window", () => {
   });
 
   test("too many files at once are not typed, and the notice names only the first", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     await dropFiles(Array.from({ length: 101 }, (_, i) => `/home/u/f${i}`));
     expect(noticeText()).toContain('"/home/u/f0" and 100 more were not typed: more than 100 files were dropped.');
@@ -5702,13 +5725,13 @@ describe("dropping files on the window", () => {
   });
 
   test("without a running tab, a notice says so", async () => {
-    await boot();
+    await startApp();
     await dropFiles(["/home/u/a.txt", "/home/u/b.txt"]);
     expect(noticeText()).toContain('"/home/u/a.txt" and 1 more were not typed: no tab is running.');
   });
 
   test("a drop while a page is shown is not typed, and says where to drop", async () => {
-    await boot();
+    await startApp();
     await openClaudeTabs(1);
     document.querySelector<HTMLButtonElement>("#open-settings")!.click();
     await settle();
@@ -5719,7 +5742,91 @@ describe("dropping files on the window", () => {
 
   test("when drops cannot be watched, a notice says so", async () => {
     drop.fails = true;
-    await boot();
+    await startApp();
     expect(noticeText()).toContain("Dropping files on the window will not type their paths");
+  });
+});
+
+describe("startup and dispose", () => {
+  const HISTORY_POLL_MS = 60_000;
+  /** Leaves the page as index.html, without starting the app. */
+  const loadPage = () => (document.body.innerHTML = new DOMParser().parseFromString(indexHtml, "text/html").body.innerHTML);
+
+  test.each([
+    ["the page", loadPage],
+    ["an empty body", () => (document.body.innerHTML = "")],
+  ])("importing main.ts on %s starts nothing and renders nothing", async (_, setUp) => {
+    setUp();
+    const before = document.body.innerHTML;
+    await import("./main");
+    await flush();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(calls).toEqual([]);
+    expect(document.body.innerHTML).toBe(before);
+  });
+
+  test("dispose stops the timers, listeners and pending callbacks", async () => {
+    storedSettings = { ...DEFAULTS, finishSound: "chime" };
+    await startApp();
+    await clickClaude();
+    // A pending save, a finish settling, and the hook report check are all waiting.
+    renameTab(0, "build");
+    terms()[0].onTitle!("◐ Claude Code");
+    terms()[0].onTitle!("✳ Claude Code");
+    terms()[0].element.dispatchEvent(new MouseEvent("mouseup", { button: 0, bubbles: true }));
+    dispose!();
+    dispose = null;
+    await flush();
+    expect(win.unlistened).toBe(1);
+    expect(drop.unlistened).toBe(1);
+    expect(resizeDisconnects).toBe(1);
+    const before = calls.length;
+    const primed = sounds.primed;
+    const width = document.querySelector<HTMLElement>("#sidebar")!.style.getPropertyValue("--sidebar-width");
+    await vi.advanceTimersByTimeAsync(HISTORY_POLL_MS * 2);
+    expect(vi.getTimerCount()).toBe(0);
+    Object.defineProperty(window, "innerWidth", { value: 300, configurable: true, writable: true });
+    window.dispatchEvent(new Event("resize"));
+    Object.defineProperty(window, "innerWidth", { value: 1024, configurable: true, writable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    tabs()[0].dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    await flush();
+    expect(calls.slice(before)).toEqual([]);
+    expect(sounds.played).toEqual([]);
+    expect(sounds.primed).toBe(primed);
+    expect(document.querySelector<HTMLElement>("#sidebar")!.style.getPropertyValue("--sidebar-width")).toBe(width);
+  });
+
+  test("the Tauri listeners are removed even when they are added after dispose", async () => {
+    loadPage();
+    const main = await import("./main");
+    main.boot()();
+    await flush();
+    expect(win.unlistened).toBe(1);
+    expect(drop.unlistened).toBe(1);
+  });
+
+  test("startup work that finishes after dispose changes nothing", async () => {
+    savedLayout = { tabs: [{ tabId: "a", kind: "terminal", name: "shell 1", renamed: false, cwd: null, command: null, claudeSession: null }], active: 0 };
+    let release!: () => void;
+    settingsLoadGate = new Promise((r) => (release = r));
+    loadPage();
+    const main = await import("./main");
+    main.boot()();
+    release();
+    for (let i = 0; i < 5; i++) await flush();
+    expect(callsOf("pty_spawn")).toEqual([]);
+    expect(callsOf("fs_list")).toEqual([]);
+    expect(tabs()).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("booting twice without dispose throws, and booting again after dispose works", async () => {
+    await startApp();
+    const main = await import("./main");
+    expect(() => main.boot()).toThrow("misag: boot called twice");
+    await startApp();
+    await clickTerminal();
+    expect(tabNames()).toEqual(["shell 1"]);
   });
 });

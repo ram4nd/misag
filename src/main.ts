@@ -178,7 +178,6 @@ interface Settings {
 const DEFAULT_FONT_SIZE = 14;
 const FONT_SIZES = { min: 8, max: 32 };
 
-
 /** How long after a Claude tab starts its session hook should have reported in. */
 const HOOK_REPORT_DELAY_MS = 60_000;
 /** Polling interval for the backend's saving and hook status, and for re-checking a hook report. */
@@ -203,16 +202,25 @@ const SAVE_DELAY_MS = 300;
 /** A failed save is tried again this long after it failed. */
 const SAVE_RETRY_MS = 5_000;
 
+/**
+ * The running app's signal, aborted by the dispose function `boot` returns (and
+ * aborted before the first boot). Timer chains and async continuations check it, so
+ * nothing changes the page or calls the backend after dispose. Like all the state in
+ * this module it belongs to the module instance: tests get a fresh one per test by
+ * resetting modules.
+ */
+let running: AbortSignal = AbortSignal.abort();
 
 function $<T extends HTMLElement>(sel: string): T {
   const el = document.querySelector<T>(sel);
   if (!el) throw new Error(`misag: missing element ${sel}`);
   return el;
 }
-const tabsEl = $<HTMLDivElement>("#tabs");
-const termsEl = $<HTMLElement>("#terminals");
-const spawnDialog = $<HTMLDialogElement>("#spawn-dialog");
-const noticeEl = $<HTMLDivElement>("#notice");
+// The page's elements and the parts built on them: each `let x!` in this file is set by `boot`.
+let tabsEl!: HTMLDivElement;
+let termsEl!: HTMLElement;
+let spawnDialog!: HTMLDialogElement;
+let noticeEl!: HTMLDivElement;
 
 /** A tab that shows a page of the app instead of a terminal. Pages are not saved with the tabs. */
 interface Page {
@@ -230,7 +238,8 @@ interface Page {
   shown?: () => void;
 }
 /** The fixed pages, plus one editor page per open flow. */
-type StaticPageId = "settings" | "workspace" | "flows";
+const pageIds = ["settings", "workspace", "flows"] as const;
+type StaticPageId = (typeof pageIds)[number];
 type EditorPageId = `flow:${number}`;
 type PageId = StaticPageId | EditorPageId;
 const isEditorPage = (id: PageId): id is EditorPageId => id.startsWith("flow:");
@@ -238,17 +247,8 @@ function page(title: string, icon: IconName, unreadable: string, sel: string): P
   const el = $<HTMLElement>(sel);
   return { title, icon, unreadable, el, form: el.querySelector("form")!, tabEl: null };
 }
-const pages: Record<StaticPageId, Page> = {
-  settings: page("Settings", "settings", "so Claude tabs start with permission prompts and auto memory off, and settings cannot be changed.", "#settings"),
-  workspace: page(
-    "Workspace settings",
-    "folder-cog",
-    "so the Workspace box shows your home directory and its folder cannot be changed.",
-    "#workspace-settings",
-  ),
-  flows: page("Flows", "workflow", "", "#flows-settings"),
-};
-const pageIds = Object.keys(pages) as StaticPageId[];
+/** Set by `boot`. */
+let pages!: Record<StaticPageId, Page>;
 /** The open flows' editor pages, created when opened and removed when closed. */
 const editorPages = new Map<EditorPageId, { page: Page; editor: FlowEditor }>();
 function pageOf(id: PageId): Page {
@@ -258,7 +258,8 @@ function pageOf(id: PageId): Page {
   if (!editor) throw new Error(`misag: no editor page ${id}`);
   return editor.page;
 }
-const settingsForm = pages.settings.form;
+/** Set by `boot`. */
+let settingsForm!: HTMLFormElement;
 
 const sessions: Session[] = [];
 /** The last terminal tab selected; while a page (such as Settings) is shown, it stays selected underneath. */
@@ -380,8 +381,9 @@ async function spawn(opts: SpawnOptions) {
   term.element.addEventListener("mouseup", (e) => {
     if (e.button !== 0) return;
     // After wterm's own click handling, which may have selected a word.
+    const app = running;
     setTimeout(() => {
-      if (active !== s || shownPage !== null) return;
+      if (app.aborted || active !== s || shownPage !== null) return;
       if (term.getSelectionText?.()) {
         // wterm's copy event listener puts its selection on the clipboard.
         if (!document.execCommand("copy")) console.warn("misag: the selection could not be copied");
@@ -524,18 +526,21 @@ function restart(s: Session) {
  */
 function watchHookReport(s: Session, since: number, startNo: number) {
   const topic = tabTopic(s, "hook");
+  const app = running;
   const check = async () => {
     // A restart has its own watch.
-    if (s.starts !== startNo) return;
+    if (app.aborted || s.starts !== startNo) return;
     if (s.closing || s.exited || !sessions.includes(s)) return setNotice(topic, null);
     let reported: boolean;
     try {
       reported = await invoke<boolean>("claude_reported", { tabId: s.tabId, since });
     } catch (err) {
+      if (app.aborted) return;
       // Unknown, so neither warn nor clear; try again later.
       console.error("misag: could not check the session report", err);
       return void setTimeout(check, STORE_POLL_MS);
     }
+    if (app.aborted) return;
     if (reported || s.starts !== startNo) return setNotice(topic, null);
     // Keyed by the start, not the text: Claude retitles the tab, which must not undo a dismissal.
     setNotice(
@@ -905,8 +910,10 @@ function noteFinish(s: Session) {
   const busy = showsBusy(s);
   if (busy) cancelFinish(s);
   else if (s.shownBusy && s.finishSettle === null && s.finishAfter === null) {
+    const app = running;
     s.finishSettle = setTimeout(() => {
       s.finishSettle = null;
+      if (app.aborted) return;
       s.finishAfter = checksStarted;
     }, FINISH_SETTLE_MS);
   }
@@ -941,13 +948,6 @@ function confirmFinish(s: Session, check: number) {
 
 /** The home directory, shown as `~`; null until known, or if it cannot be. */
 let home: string | null = null;
-homeDir().then(
-  (dir) => {
-    home = dir;
-    sessions.forEach(updateTab);
-  },
-  (err) => console.error("misag: could not find the home directory", err),
-);
 
 /** True while `pollTabs` waits for the backend, so a slow check is not started twice. */
 let polling = false;
@@ -1125,7 +1125,6 @@ const queueSettings = (task: () => Promise<void>) => {
   // A task that throws is logged, so it cannot stop the ones queued after it.
   settingsQueue = settingsQueue.then(task).catch((err) => console.error("misag: settings task failed", err));
 };
-settingsForm.onchange = () => queueSettings(saveSettingsForm);
 /** The finish sound chosen on the page; one it does not know keeps the stored one. */
 function chosenSound(): FinishSound {
   const value = settingsField<HTMLSelectElement>("finishSound").value;
@@ -1140,16 +1139,6 @@ function playFinishSound(sound: FinishSound | undefined) {
     setNotice("finish-sound", `The finish sound could not play (${errorText(err)}). Check your sound output, or turn the sound off in Settings.`);
   });
 }
-
-// A context started without a key or click may stay silent, so each one primes it while a sound is chosen.
-for (const area of [$("#tabbar"), $("#content")]) {
-  for (const type of ["pointerdown", "keydown"]) {
-    area.addEventListener(type, () => {
-      if (settings.finishSound && settings.finishSound !== "off") primeAudio();
-    }, true);
-  }
-}
-for (const id of pageIds) pages[id].form.onsubmit = (e) => e.preventDefault();
 
 /** Opens the page's tab (loading the stored settings into it) and shows it. */
 function openPage(id: PageId) {
@@ -1239,14 +1228,15 @@ function renderNotices() {
   noticeEl.querySelector("button")!.hidden = ![...notices.values()].every((n) => n.dismissible);
 }
 
-noticeEl.querySelector("button")!.onclick = () => {
+/** Hides the dismissible notices until their key changes. */
+function dismissNotices() {
   for (const [topic, n] of notices) {
     if (!n.dismissible) continue;
     notices.delete(topic);
     dismissed.set(topic, n.key);
   }
   renderNotices();
-};
+}
 
 // ---------- layout persistence ----------
 
@@ -1261,11 +1251,14 @@ let lastSaved = "";
 const savingPaused = () => restoring || !canSave;
 
 function scheduleSave() {
-  if (savingPaused()) return;
+  if (savingPaused() || running.aborted) return;
+  const app = running;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
+    if (app.aborted) return;
     saveLayout().catch((err) => {
       console.error("misag: could not save tabs", err);
+      if (app.aborted) return;
       // Tried again, so a passing problem (such as a busy database) does not lose the change.
       saveTimer = setTimeout(scheduleSave, SAVE_RETRY_MS);
     });
@@ -1415,6 +1408,7 @@ async function showStoreStatus() {
  * saved with its ids.
  */
 async function restore() {
+  const app = running;
   // Sessions from a previous page load (a dev reload) have no tab any more.
   const reset = invoke("pty_reset").catch((err) => {
     console.error("misag: could not reset sessions", err);
@@ -1427,11 +1421,12 @@ async function restore() {
     [, saved] = await Promise.all([reset, load]);
   } catch (err) {
     console.error("misag: could not load saved tabs", err);
+    if (app.aborted) return;
     canSave = false;
     setNotice("load", `Saved tabs could not be read (${errorText(err)}), so changes are not saved this session.`, false);
     return;
   }
-  if (!saved.tabs.length) return;
+  if (app.aborted || !saved.tabs.length) return;
   restoring = true;
   let lost = 0;
   try {
@@ -1449,6 +1444,7 @@ async function restore() {
   } finally {
     restoring = false;
   }
+  if (app.aborted) return;
   if (lost) {
     canSave = false;
     setNotice("load", `${lost} saved tab(s) could not be reopened, so changes are not saved this session.`, false);
@@ -1458,13 +1454,9 @@ async function restore() {
 
 // ---------- workspace ----------
 
-const workspaceBox = $<HTMLElement>("#workspace-box");
-const tree = createTree(workspaceBox.querySelector<HTMLUListElement>(".tree")!, {
-  list: (dir) => invoke<Listing>("fs_list", { dir }),
-  errorText,
-  onPickFile: (path) => insertPaths([path]),
-  onOpenClaude: (dir) => openClaudeTab(undefined, dir),
-});
+// Set by `boot`.
+let workspaceBox!: HTMLElement;
+let tree!: ReturnType<typeof createTree>;
 
 /** Roots the tree at the workspace folder from the settings (home by default). */
 function showWorkspace() {
@@ -1602,25 +1594,11 @@ function askTab() {
   spawnDialog.showModal();
 }
 
-$<HTMLButtonElement>("#new-terminal").onclick = (e) => {
-  if (e.shiftKey) return askTab();
-  openTerminalTab();
-};
-fillIcons();
-for (const el of document.querySelectorAll(".claude-icon")) el.innerHTML = CLAUDE_ICON;
-$<HTMLButtonElement>("#open-settings").onclick = () => openPage("settings");
-// A hidden terminal has no size to fit to; it is fitted when shown again. While the
-// sidebar's edge is dragged, it is fitted once let go, so the PTY is not resized at every move.
-new ResizeObserver(() => {
-  if (shownPage === null && !document.body.classList.contains("resizing-sidebar")) active?.term.fit();
-}).observe(termsEl);
-
 const SIDEBAR_KEY = "misag.sidebarCollapsed";
 function setSidebar(collapsed: boolean) {
   document.body.classList.toggle("sidebar-collapsed", collapsed);
   remember(SIDEBAR_KEY, collapsed);
 }
-setSidebar(remembered(SIDEBAR_KEY));
 /** The sidebar's width (px) in localStorage, and its default and limits. */
 const SIDEBAR_WIDTH_KEY = "misag.sidebarWidth";
 const SIDEBAR_WIDTH = 240;
@@ -1632,8 +1610,8 @@ const TERMINALS_MIN = 320;
 let chosenSidebarWidth = SIDEBAR_WIDTH;
 /** The width the sidebar is shown at. */
 let sidebarWidth = SIDEBAR_WIDTH;
-const sidebarResizer = $<HTMLElement>("#sidebar-resizer");
-sidebarResizer.setAttribute("aria-valuemin", String(SIDEBAR_MIN));
+/** Set by `boot`. */
+let sidebarResizer!: HTMLElement;
 /** The widest the sidebar may be in this window. */
 const sidebarMax = () => Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, window.innerWidth - TERMINALS_MIN));
 /** Shows the sidebar at `px`, kept within its limits. */
@@ -1661,7 +1639,8 @@ function resetSidebarWidth() {
   chosenSidebarWidth = SIDEBAR_WIDTH;
   showSidebarWidth(SIDEBAR_WIDTH);
 }
-{
+/** Shows the sidebar at the width remembered, or its default. */
+function recallSidebarWidth() {
   let stored: string | null = null;
   try {
     stored = localStorage.getItem(SIDEBAR_WIDTH_KEY);
@@ -1672,8 +1651,8 @@ function resetSidebarWidth() {
   chosenSidebarWidth = Number.isFinite(px) ? Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, px)) : SIDEBAR_WIDTH;
   showSidebarWidth(chosenSidebarWidth);
 }
-window.addEventListener("resize", () => showSidebarWidth(chosenSidebarWidth));
-sidebarResizer.onmousedown = (down) => {
+/** Drags the sidebar's edge, from a mousedown on it. */
+function dragSidebarEdge(down: MouseEvent) {
   if (down.button !== 0) return;
   down.preventDefault();
   const start = sidebarWidth;
@@ -1700,7 +1679,7 @@ sidebarResizer.onmousedown = (down) => {
   document.addEventListener("mousemove", move);
   document.addEventListener("mouseup", up);
   window.addEventListener("blur", end);
-};
+}
 /** Left and Right move the edge 16px; Home and End take it to the narrowest and widest. */
 const SIDEBAR_KEYS: Record<string, () => number> = {
   ArrowLeft: () => sidebarWidth - 16,
@@ -1708,33 +1687,16 @@ const SIDEBAR_KEYS: Record<string, () => number> = {
   Home: () => SIDEBAR_MIN,
   End: sidebarMax,
 };
-sidebarResizer.onkeydown = (e) => {
+/** Moves the sidebar's edge with the keyboard. */
+function moveSidebarEdge(e: KeyboardEvent) {
   const to = SIDEBAR_KEYS[e.key];
   if (!to) return;
   e.preventDefault();
   chooseSidebarWidth(to());
-};
-sidebarResizer.ondblclick = resetSidebarWidth;
-$("#toggle-sidebar").onclick = () => {
-  setSidebar(!document.body.classList.contains("sidebar-collapsed"));
-  reloadHistoryIfShown();
-  active?.term.focus();
-};
+}
 
-workspaceBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => tree.reload();
-workspaceBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("workspace");
-const flowsBox = $<HTMLElement>("#flows-box");
-const flows = createFlows({
-  box: flowsBox,
-  page: pages.flows.el,
-  errorText,
-  showError: (message) => showPageError(pages.flows, message),
-  onOpen: openFlowEditor,
-  onChange: followFlows,
-  onRun: (flow) => void runs.start(flow),
-  onStop: (run) => void runs.stop(run),
-  onContinue: async (run, output) => flows.showBoxError(await runs.proceed(run, output)),
-});
+/** Set by `boot`. */
+let flows!: ReturnType<typeof createFlows>;
 
 /** What a terminal can paste: the backend command that reads it, and its name. */
 const PASTE_SOURCES = { primary_selection: "primary selection", clipboard_text: "clipboard" } as const;
@@ -1767,25 +1729,8 @@ async function pasteFrom(term: WTerm, source: keyof typeof PASTE_SOURCES) {
   term.onData?.(bracketed ? `\x1b[200~${clean}\x1b[201~` : clean);
 }
 
-const runs = createRunController<Session>({
-  flows,
-  errorText,
-  tabs: () => sessions,
-  active: () => active,
-  label: tabLabel,
-  // Claude waiting on background tasks takes /clear, and they may never end.
-  busy: claudeWorking,
-  waitsInBackground,
-  live: claudeLive,
-  write,
-  *editors() {
-    for (const [id, { editor }] of editorPages) yield [Number(id.slice("flow:".length)), editor];
-  },
-  markWaiting: (isWaiting) => sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", isWaiting(s))),
-  lockChanged: (_s, locked) => {
-    if (!locked) setNotice("flow-typing", null);
-  },
-});
+/** Set by `boot`. */
+let runs!: ReturnType<typeof createRunController<Session>>;
 
 /**
  * Whether Claude runs in the tab right now, so a prompt typed there goes to Claude
@@ -1836,7 +1781,7 @@ function followFlows(stored: Flow[]) {
   renderSessions();
 }
 // The page stays disabled if the flows cannot be read, so nothing is changed blindly.
-pages.flows.load = async () => {
+async function loadFlowsPage() {
   try {
     await flows.reload();
     showPageError(pages.flows, null);
@@ -1844,37 +1789,11 @@ pages.flows.load = async () => {
   } catch (err) {
     showPageError(pages.flows, `Flows could not be read (${errorText(err)}). Close and reopen this tab to try again.`);
   }
-};
-flowsBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("flows");
-// A failure is already logged and shown in the Flows box.
-flows.reload().catch(() => {});
+}
 
-const historyBox = $<HTMLElement>("#history-box");
-const sessionHistory = createHistory({
-  box: historyBox,
-  list: async (limit) => {
-    const [page] = await Promise.all([invoke<HistoryPage>("claude_history", { limit }), readTabSessions()]);
-    return page;
-  },
-  errorText,
-  folderLabel: (cwd) => folderLabel(cwd, home),
-  openIn: (id) => {
-    const s = tabWithSession(id);
-    return !s ? null : s === active ? "this tab" : `in ${tabLabel(s)}`;
-  },
-  onResume: (past) => resumeInNewTab(past),
-  pin: async (id, pinned) => {
-    try {
-      await invoke("claude_session_pin", { id, pinned });
-      setNotice("history-pin", null);
-      return true;
-    } catch (err) {
-      console.error("misag: could not pin the session", err);
-      setNotice("history-pin", `The session could not be ${pinned ? "pinned" : "unpinned"}: ${errorText(err)}.`);
-      return false;
-    }
-  },
-});
+// Set by `boot`.
+let historyBox!: HTMLElement;
+let sessionHistory!: ReturnType<typeof createHistory>;
 
 /** Resumes a past session in a new Claude tab in its folder, or shows the tab that has it open. */
 function resumeInNewTab(past: Past) {
@@ -1882,14 +1801,6 @@ function resumeInNewTab(past: Past) {
   if (s) return activate(s);
   openTab({ kind: "claude", claudeSession: past.id }, undefined, past.cwd);
 }
-const toolboxes = setupToolboxes($<HTMLElement>("#sidebar"), (box) => {
-  if (box === historyBox) reloadHistoryIfShown();
-});
-$<HTMLButtonElement>("#settings .reset-sidebar").onclick = () => {
-  toolboxes.reset();
-  resetSidebarWidth();
-};
-historyBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => void sessionHistory.reload();
 
 /** Marks again which sessions the active tab and the others have open. */
 function showHistory() {
@@ -1929,25 +1840,18 @@ const historyShown = () =>
 function reloadHistoryIfShown() {
   if (historyShown()) void sessionHistory.reload();
 }
-document.addEventListener("visibilitychange", reloadHistoryIfShown);
-// The path field is read-only: clicking it (or Enter or Space on it) opens the folder picker.
-const workspaceInput = pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement;
 const pickWorkspace = () =>
   chooseWorkspace().catch((err) => {
     console.error("misag: could not open the folder picker", err);
     showPageError(pages.workspace, `The folder picker could not be opened: ${errorText(err)}`);
   });
-workspaceInput.onclick = pickWorkspace;
-workspaceInput.onkeydown = (e) => {
-  if (e.key !== "Enter" && e.key !== " ") return;
-  e.preventDefault();
-  pickWorkspace();
-};
-pages.workspace.el.querySelector<HTMLButtonElement>(".home-workspace")!.onclick = () => setWorkspace(null);
 
-/** Watches for files dragged in from a file manager, which reach the app as paths, not as an HTML drop. */
-async function watchFileDrops() {
-  await getCurrentWebview().onDragDropEvent((e) => {
+/**
+ * Watches for files dragged in from a file manager, which reach the app as paths, not
+ * as an HTML drop. Resolves to the function that stops watching.
+ */
+function watchFileDrops(): Promise<() => void> {
+  return getCurrentWebview().onDragDropEvent((e) => {
     if (e.payload.type === "drop") dropFiles(e.payload.paths);
   });
 }
@@ -1955,11 +1859,12 @@ async function watchFileDrops() {
 /**
  * Saves on window close; the handler finishes before the window is destroyed. If
  * saving fails, the first close is cancelled with a warning, and closing again quits.
+ * Resolves to the function that stops watching.
  */
-async function watchWindowClose() {
+function watchWindowClose(): Promise<() => void> {
   let warned = false;
   let warnedFlows = false;
-  await getCurrentWindow().onCloseRequested(async (event) => {
+  return getCurrentWindow().onCloseRequested(async (event) => {
     const flowsSaved = await Promise.all([...editorPages.values()].map(({ editor }) => editor.flush()));
     if (flowsSaved.includes(false) && !warnedFlows) {
       warnedFlows = true;
@@ -1980,51 +1885,245 @@ async function watchWindowClose() {
   });
 }
 
-renderSessions();
-renderNotices();
-// The tree waits for the stored folder; if the settings cannot be read it shows home, and says so.
-queueSettings(async () => {
-  try {
-    await loadSettings();
-  } catch (err) {
-    console.error("misag: could not load settings", err);
-    setNotice(
-      "settings",
-      `Settings could not be read (${errorText(err)}), ${pages.workspace.unreadable} Claude tabs start with permission prompts and auto memory off.`,
-    );
-  }
-  showWorkspace();
-});
-// Async so a failure (e.g. outside Tauri) is logged instead of aborting the UI setup.
-watchWindowClose().catch((err) => {
-  console.error("misag: could not watch window close", err);
-  setNotice("close", "Tabs are saved after each change, but not when the window closes.");
-});
-watchFileDrops().catch((err) => {
-  console.error("misag: could not watch file drops", err);
-  setNotice("drop", `Dropping files on the window will not type their paths: ${errorText(err)}.`);
-});
 const checkStore = () =>
   showStoreStatus().catch((err) => {
     console.error("misag: could not read the store status", err);
     setNotice("store", `Could not check whether tabs are being saved (${errorText(err)}).`);
   });
-checkStore();
-// Session-hook failures can happen at any time, so they are checked on a timer.
-setInterval(checkStore, STORE_POLL_MS);
-// Directories and the Claude in terminal tabs change without telling misag, and
-// flow runs move on in Claude's hooks.
-setInterval(pollTabs, TAB_POLL_MS);
-setInterval(runs.poll, TAB_POLL_MS);
-// `misag flow import` adds flows without telling the app.
-setInterval(() => void flows.refresh(), TAB_POLL_MS);
-setInterval(reloadHistoryIfShown, HISTORY_POLL_MS);
-restore()
-  .catch((err) => {
-    console.error("misag: restore failed", err);
-    canSave = false;
-    setNotice("load", "Saved tabs could not be restored, so changes are not saved this session.", false);
-  })
-  .finally(() => {
-    runs.restored();
+
+/**
+ * Starts the app on the page loaded from index.html: finds its elements, wires them
+ * up, starts the timers and restores the saved tabs. Throws if the app is already
+ * running in this module instance.
+ *
+ * Returns dispose, which clears the poll timers and the pending tab save and finish
+ * timers, removes the window, document, audio priming and Tauri close and drop
+ * listeners (once they are added, if that is still pending), disconnects the
+ * ResizeObserver, and aborts the running signal, so pending timer chains and startup
+ * continuations stop without touching the page or the backend. It does not close
+ * tabs, kill their processes or undo what boot rendered. After dispose, boot may be
+ * called again.
+ */
+export function boot(): () => void {
+  if (!running.aborted) throw new Error("misag: boot called twice");
+  const lifetime = new AbortController();
+  running = lifetime.signal;
+  const { signal } = lifetime;
+  tabsEl = $<HTMLDivElement>("#tabs");
+  termsEl = $<HTMLElement>("#terminals");
+  spawnDialog = $<HTMLDialogElement>("#spawn-dialog");
+  noticeEl = $<HTMLDivElement>("#notice");
+  pages = {
+    settings: page("Settings", "settings", "so Claude tabs start with permission prompts and auto memory off, and settings cannot be changed.", "#settings"),
+    workspace: page(
+      "Workspace settings",
+      "folder-cog",
+      "so the Workspace box shows your home directory and its folder cannot be changed.",
+      "#workspace-settings",
+    ),
+    flows: page("Flows", "workflow", "", "#flows-settings"),
+  };
+  settingsForm = pages.settings.form;
+
+  homeDir().then(
+    (dir) => {
+      if (signal.aborted) return;
+      home = dir;
+      sessions.forEach(updateTab);
+    },
+    (err) => console.error("misag: could not find the home directory", err),
+  );
+
+  settingsForm.onchange = () => queueSettings(saveSettingsForm);
+  // A context started without a key or click may stay silent, so each one primes it while a sound is chosen.
+  for (const area of [$("#tabbar"), $("#content")]) {
+    for (const type of ["pointerdown", "keydown"]) {
+      area.addEventListener(type, () => {
+        if (settings.finishSound && settings.finishSound !== "off") primeAudio();
+      }, { capture: true, signal });
+    }
+  }
+  for (const id of pageIds) pages[id].form.onsubmit = (e) => e.preventDefault();
+  noticeEl.querySelector("button")!.onclick = dismissNotices;
+
+  workspaceBox = $<HTMLElement>("#workspace-box");
+  tree = createTree(workspaceBox.querySelector<HTMLUListElement>(".tree")!, {
+    list: (dir) => invoke<Listing>("fs_list", { dir }),
+    errorText,
+    onPickFile: (path) => insertPaths([path]),
+    onOpenClaude: (dir) => openClaudeTab(undefined, dir),
   });
+
+  $<HTMLButtonElement>("#new-terminal").onclick = (e) => {
+    if (e.shiftKey) return askTab();
+    openTerminalTab();
+  };
+  fillIcons();
+  for (const el of document.querySelectorAll(".claude-icon")) el.innerHTML = CLAUDE_ICON;
+  $<HTMLButtonElement>("#open-settings").onclick = () => openPage("settings");
+  // A hidden terminal has no size to fit to; it is fitted when shown again. While the
+  // sidebar's edge is dragged, it is fitted once let go, so the PTY is not resized at every move.
+  const fitObserver = new ResizeObserver(() => {
+    if (shownPage === null && !document.body.classList.contains("resizing-sidebar")) active?.term.fit();
+  });
+  fitObserver.observe(termsEl);
+
+  setSidebar(remembered(SIDEBAR_KEY));
+  sidebarResizer = $<HTMLElement>("#sidebar-resizer");
+  sidebarResizer.setAttribute("aria-valuemin", String(SIDEBAR_MIN));
+  recallSidebarWidth();
+  const onResize = () => showSidebarWidth(chosenSidebarWidth);
+  window.addEventListener("resize", onResize, { signal });
+  sidebarResizer.onmousedown = dragSidebarEdge;
+  sidebarResizer.onkeydown = moveSidebarEdge;
+  sidebarResizer.ondblclick = resetSidebarWidth;
+  $("#toggle-sidebar").onclick = () => {
+    setSidebar(!document.body.classList.contains("sidebar-collapsed"));
+    reloadHistoryIfShown();
+    active?.term.focus();
+  };
+
+  workspaceBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => tree.reload();
+  workspaceBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("workspace");
+  const flowsBox = $<HTMLElement>("#flows-box");
+  flows = createFlows({
+    box: flowsBox,
+    page: pages.flows.el,
+    errorText,
+    showError: (message) => showPageError(pages.flows, message),
+    onOpen: openFlowEditor,
+    onChange: followFlows,
+    onRun: (flow) => void runs.start(flow),
+    onStop: (run) => void runs.stop(run),
+    onContinue: async (run, output) => flows.showBoxError(await runs.proceed(run, output)),
+  });
+  runs = createRunController<Session>({
+    flows,
+    errorText,
+    tabs: () => sessions,
+    active: () => active,
+    label: tabLabel,
+    // Claude waiting on background tasks takes /clear, and they may never end.
+    busy: claudeWorking,
+    waitsInBackground,
+    live: claudeLive,
+    write,
+    *editors() {
+      for (const [id, { editor }] of editorPages) yield [Number(id.slice("flow:".length)), editor];
+    },
+    markWaiting: (isWaiting) => sessions.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", isWaiting(s))),
+    lockChanged: (_s, locked) => {
+      if (!locked) setNotice("flow-typing", null);
+    },
+  });
+  pages.flows.load = loadFlowsPage;
+  flowsBox.querySelector<HTMLButtonElement>(".configure")!.onclick = () => openPage("flows");
+  // A failure is already logged and shown in the Flows box.
+  flows.reload().catch(() => {});
+
+  historyBox = $<HTMLElement>("#history-box");
+  sessionHistory = createHistory({
+    box: historyBox,
+    list: async (limit) => {
+      const [page] = await Promise.all([invoke<HistoryPage>("claude_history", { limit }), readTabSessions()]);
+      return page;
+    },
+    errorText,
+    folderLabel: (cwd) => folderLabel(cwd, home),
+    openIn: (id) => {
+      const s = tabWithSession(id);
+      return !s ? null : s === active ? "this tab" : `in ${tabLabel(s)}`;
+    },
+    onResume: (past) => resumeInNewTab(past),
+    pin: async (id, pinned) => {
+      try {
+        await invoke("claude_session_pin", { id, pinned });
+        setNotice("history-pin", null);
+        return true;
+      } catch (err) {
+        console.error("misag: could not pin the session", err);
+        setNotice("history-pin", `The session could not be ${pinned ? "pinned" : "unpinned"}: ${errorText(err)}.`);
+        return false;
+      }
+    },
+  });
+  const toolboxes = setupToolboxes($<HTMLElement>("#sidebar"), (box) => {
+    if (box === historyBox) reloadHistoryIfShown();
+  });
+  $<HTMLButtonElement>("#settings .reset-sidebar").onclick = () => {
+    toolboxes.reset();
+    resetSidebarWidth();
+  };
+  historyBox.querySelector<HTMLButtonElement>(".refresh")!.onclick = () => void sessionHistory.reload();
+  document.addEventListener("visibilitychange", reloadHistoryIfShown, { signal });
+
+  // The path field is read-only: clicking it (or Enter or Space on it) opens the folder picker.
+  const workspaceInput = pages.workspace.form.elements.namedItem("workspace") as HTMLInputElement;
+  workspaceInput.onclick = pickWorkspace;
+  workspaceInput.onkeydown = (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    pickWorkspace();
+  };
+  pages.workspace.el.querySelector<HTMLButtonElement>(".home-workspace")!.onclick = () => setWorkspace(null);
+
+  renderSessions();
+  renderNotices();
+  // The tree waits for the stored folder; if the settings cannot be read it shows home, and says so.
+  queueSettings(async () => {
+    if (signal.aborted) return;
+    try {
+      await loadSettings();
+    } catch (err) {
+      console.error("misag: could not load settings", err);
+      if (signal.aborted) return;
+      setNotice(
+        "settings",
+        `Settings could not be read (${errorText(err)}), ${pages.workspace.unreadable} Claude tabs start with permission prompts and auto memory off.`,
+      );
+    }
+    if (!signal.aborted) showWorkspace();
+  });
+  // Async so a failure (e.g. outside Tauri) is logged instead of aborting the UI setup.
+  const unlistenClose = watchWindowClose().catch((err) => {
+    console.error("misag: could not watch window close", err);
+    if (!signal.aborted) setNotice("close", "Tabs are saved after each change, but not when the window closes.");
+  });
+  const unlistenDrops = watchFileDrops().catch((err) => {
+    console.error("misag: could not watch file drops", err);
+    if (!signal.aborted) setNotice("drop", `Dropping files on the window will not type their paths: ${errorText(err)}.`);
+  });
+  checkStore();
+  const timers = [
+    // Session-hook failures can happen at any time, so they are checked on a timer.
+    setInterval(checkStore, STORE_POLL_MS),
+    // Directories and the Claude in terminal tabs change without telling misag, and
+    // flow runs move on in Claude's hooks.
+    setInterval(pollTabs, TAB_POLL_MS),
+    setInterval(runs.poll, TAB_POLL_MS),
+    // `misag flow import` adds flows without telling the app.
+    setInterval(() => void flows.refresh(), TAB_POLL_MS),
+    setInterval(reloadHistoryIfShown, HISTORY_POLL_MS),
+  ];
+  restore()
+    .catch((err) => {
+      console.error("misag: restore failed", err);
+      if (signal.aborted) return;
+      canSave = false;
+      setNotice("load", "Saved tabs could not be restored, so changes are not saved this session.", false);
+    })
+    .finally(() => {
+      if (!signal.aborted) runs.restored();
+    });
+
+  return () => {
+    lifetime.abort();
+    for (const timer of timers) clearInterval(timer);
+    clearTimeout(saveTimer);
+    sessions.forEach(cancelFinish);
+    fitObserver.disconnect();
+    // Also when the listener is added only after this.
+    void unlistenClose.then((unlisten) => unlisten?.());
+    void unlistenDrops.then((unlisten) => unlisten?.());
+  };
+}
