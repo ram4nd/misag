@@ -1773,6 +1773,21 @@ mod unix_tests {
         after.split_whitespace().next().unwrap().parse().unwrap()
     }
 
+    /// That `job`, left by a shell that exited, is killed once the grace period
+    /// passes. Except on macOS, which revokes a terminal when the shell leading its
+    /// session exits: the job no longer holds it, so it is left running, as one that
+    /// let go of the terminal is elsewhere.
+    fn assert_killed_after_the_grace_period(job: u32) {
+        assert!(Sessions::process_name(job).is_some(), "killed before the tab ended");
+        if cfg!(target_os = "macos") {
+            std::thread::sleep(Duration::from_secs(2));
+            assert!(Sessions::process_name(job).is_some(), "killed, though the terminal was revoked");
+            return;
+        }
+        let took = wait_gone(job, Duration::from_secs(4));
+        assert!(took >= Duration::from_millis(300), "killed before the grace period, after {took:?}");
+    }
+
     /// Waits until process `pid` is gone (reaped, not a zombie); returns how long that took.
     fn wait_gone(pid: u32, within: Duration) -> Duration {
         let start = Instant::now();
@@ -1918,9 +1933,7 @@ mod unix_tests {
         let job = number_after(&p.text(), "bg:");
         let _guard = KillOnDrop(job);
         assert_eq!(p.exit_code(), 0);
-        assert!(Sessions::process_name(job).is_some(), "killed before the tab ended");
-        let took = wait_gone(job, Duration::from_secs(4));
-        assert!(took >= Duration::from_millis(300), "killed before the grace period, after {took:?}");
+        assert_killed_after_the_grace_period(job);
     }
 
     #[test]
@@ -1928,7 +1941,8 @@ mod unix_tests {
         let s = sessions();
         // An interactive shell, as a terminal tab runs, puts a `&` job in its own
         // process group under job control.
-        let args = ["--norc", "--noprofile", "-i"].map(String::from).to_vec();
+        // +H: no history expansion, which bash 3.2 (macOS) wrongly applies to `$!;`.
+        let args = ["--norc", "--noprofile", "+H", "-i"].map(String::from).to_vec();
         let p = spawn_with(&s, Launch::Program { program: "bash".into(), args }, None, vec![]);
         s.write(p.id, b"sh -c \"trap '' HUP; exec sleep 10\" & echo \"b\"g:$!; sleep 0.2; exit\n".to_vec()).unwrap();
         p.wait_for("bg:");
@@ -1939,9 +1953,7 @@ mod unix_tests {
         let group = unsafe { libc::getpgid(job as libc::pid_t) };
         assert_eq!(group, job as libc::pid_t, "the job has its own process group");
         p.exit_code();
-        assert!(Sessions::process_name(job).is_some(), "killed before the tab ended");
-        let took = wait_gone(job, Duration::from_secs(4));
-        assert!(took >= Duration::from_millis(300), "killed before the grace period, after {took:?}");
+        assert_killed_after_the_grace_period(job);
     }
 
     #[test]
