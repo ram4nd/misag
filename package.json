@@ -12,16 +12,16 @@
     "app:dev": "tauri dev --config src-tauri/tauri.dev.conf.json"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/api": "^2.12.5",
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-opener": "^2.7.3",
-    "@wterm/dom": "0.5.10",
+    "@wterm/dom": "0.6.0",
     "drawflow": "0.0.60",
-    "lucide": "^1.73.0",
-    "sortablejs": "1.15.6"
+    "lucide": "^1.74.0",
+    "sortablejs": "1.15.7"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.4",
+    "@tauri-apps/cli": "^2.12.5",
     "@types/sortablejs": "^1.15.9",
     "jsdom": "^31.0.1",
     "typescript": "^7.0.2",
