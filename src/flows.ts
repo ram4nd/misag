@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
+import Sortable from "sortablejs";
 import type { StepKind } from "./flowEditor";
 import { icon, type IconName } from "./icons";
 
@@ -109,6 +110,10 @@ export function createFlows(opts: FlowsOptions): Flows {
   let flows: Flow[] = [];
   let here: Run[] = [];
   let orphans: Run[] = [];
+  /** A row is being dragged: the page is not redrawn under it, so Sortable keeps hold of its row. */
+  let dragging = false;
+  /** The page skipped a redraw during the drag. */
+  let pageStale = false;
   /** Changes run one after another, each on the flows the previous one left. */
   let queue = Promise.resolve();
 
@@ -163,20 +168,46 @@ export function createFlows(opts: FlowsOptions): Flows {
   }
 
   /**
-   * Swaps the flow with the next unarchived flow before (-1) or after (1) it, in the
-   * flows as they are when the change runs; archived flows keep their places.
+   * Moves the flow among the unarchived flows to the index `to` gives for where it is
+   * in the flows as they are when the change runs; archived flows keep their places.
+   * With `focus`, then focuses its drag handle, so the arrow keys can go on moving it,
+   * unless the person has gone elsewhere meanwhile (the redraw drops the focus on the body).
    */
-  function move(id: number, by: -1 | 1) {
-    change("reorder the flows", async () => {
+  async function move(id: number, to: (from: number) => number, focus = false) {
+    const before = document.activeElement;
+    await change("reorder the flows", async () => {
       const active = flows.filter((f) => !f.archived).map((f) => f.id);
-      const other = active[active.indexOf(id) + by];
-      if (!active.includes(id) || other === undefined) return;
-      const ids = flows.map((f) => f.id);
-      const [i, j] = [ids.indexOf(id), ids.indexOf(other)];
-      [ids[i], ids[j]] = [ids[j], ids[i]];
+      const from = active.indexOf(id);
+      const index = Math.max(0, Math.min(to(from), active.length - 1));
+      if (from < 0 || from === index) return;
+      active.splice(from, 1);
+      active.splice(index, 0, id);
+      const ids = flows.map((f) => (f.archived ? f.id : active.shift()!));
       await invoke("flows_reorder", { ids });
     });
+    const now = document.activeElement;
+    if (focus && (!now || now === document.body || now === before)) activeList.querySelector<HTMLElement>(`li[data-id="${id}"] .handle`)?.focus();
   }
+
+  Sortable.create(activeList, {
+    handle: ".handle",
+    // Tauri's drag-drop handler (for files dropped on the window) takes HTML5 drag and drop
+    // on Windows, so rows move by pointer events instead.
+    forceFallback: true,
+    animation: 150,
+    // Not while the page's fieldset is disabled: before the flows have been read, or when they could not be.
+    filter: () => activeList.closest("fieldset")!.disabled,
+    onStart() {
+      dragging = true;
+    },
+    onEnd(e) {
+      dragging = false;
+      const id = Number(e.item.dataset.id);
+      if (e.oldIndex !== undefined && e.newIndex !== undefined && e.oldIndex !== e.newIndex) void move(id, () => e.newIndex!);
+      // The move redraws the page when it has run; a drop in place catches up on what changed meanwhile.
+      else if (pageStale) render();
+    },
+  });
 
   /**
    * Adds a flow from a file the person picks, and opens it, so its problems show.
@@ -214,23 +245,27 @@ export function createFlows(opts: FlowsOptions): Flows {
     return name;
   }
 
-  function activeRow(flow: Flow, first: boolean, last: boolean): HTMLLIElement {
+  function activeRow(flow: Flow): HTMLLIElement {
     const li = document.createElement("li");
+    li.dataset.id = String(flow.id);
+    const handle = button("handle", "grip-vertical", "Drag to reorder (or press ↑ or ↓, with or without Alt)", () => {});
+    handle.onkeydown = (e) => {
+      const by = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0;
+      if (!by) return;
+      e.preventDefault();
+      void move(flow.id, (from) => from + by, true);
+    };
     const name = document.createElement("input");
     name.className = "name";
     name.value = flow.name;
     name.setAttribute("aria-label", "Flow name");
     name.onchange = () => change(`rename "${flow.name}"`, () => invoke("flow_rename", { id: flow.id, name: name.value }));
-    const up = button("up", "arrow-up", "Move up", () => move(flow.id, -1));
-    const down = button("down", "arrow-down", "Move down", () => move(flow.id, 1));
-    up.disabled = first;
-    down.disabled = last;
     const archive = button("archive", "archive", "Archive (hide from the sidebar)", () =>
       change(`archive "${flow.name}"`, () => invoke("flow_set_archived", { id: flow.id, archived: true })),
     );
     const edit = button("edit", "pencil", "Edit the steps", () => opts.onOpen(flow));
     const exported = button("export", "download", "Export to a file", () => exportFile(flow));
-    li.append(name, edit, exported, up, down, archive, button("delete", "trash-2", "Delete", () => remove(flow)));
+    li.append(handle, name, edit, exported, archive, button("delete", "trash-2", "Delete", () => remove(flow)));
     return li;
   }
 
@@ -425,7 +460,9 @@ export function createFlows(opts: FlowsOptions): Flows {
     const archived = flows.filter((f) => f.archived);
     renderBox();
     boxEmpty.hidden = active.length > 0 || !boxError.hidden;
-    activeList.replaceChildren(...active.map((f, i) => activeRow(f, i === 0, i === active.length - 1)));
+    pageStale = dragging;
+    if (dragging) return;
+    activeList.replaceChildren(...active.map(activeRow));
     archivedList.replaceChildren(...archived.map(archivedRow));
     pageEmpty.hidden = active.length > 0;
     archivedList.closest("details")!.hidden = archived.length === 0;
@@ -465,7 +502,8 @@ export function createFlows(opts: FlowsOptions): Flows {
     showRuns(nextHere: Run[], nextOrphans: Run[]) {
       if (JSON.stringify([nextHere, nextOrphans]) === JSON.stringify([here, orphans])) return;
       [here, orphans] = [nextHere, nextOrphans];
-      render();
+      // The page's rows show no runs, and redrawing them would end a drag.
+      renderBox();
     },
   };
 }

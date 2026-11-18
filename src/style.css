@@ -268,6 +268,9 @@ svg.lucide { display: block; flex: none; }
 #flows-settings li button { padding: 4px; background: none; }
 #flows-settings li button:hover:not(:disabled) { background: var(--hover); }
 #flows-settings li button:disabled { opacity: .35; cursor: default; }
+#flows-settings li button.handle { cursor: grab; color: var(--muted); }
+#flows-settings li.sortable-ghost { opacity: .4; }
+#flows-settings li.sortable-fallback { background: var(--panel); box-shadow: 0 2px 8px rgba(0, 0, 0, .25); }
 #flows-settings .new-flow fieldset { flex-direction: row; gap: 8px; margin-top: 16px; }
 #flows-settings details fieldset { margin: 0; padding: 0; border: 0; }
 #flows-settings .new-flow input { flex: 1; }

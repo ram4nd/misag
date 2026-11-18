@@ -1,8 +1,6 @@
 import {
   Archive,
   ArchiveRestore,
-  ArrowDown,
-  ArrowUp,
   ChevronDown,
   ChevronRight,
   CircleAlert,
@@ -13,6 +11,7 @@ import {
   Folder,
   FolderCog,
   FolderOpen,
+  GripVertical,
   House,
   LoaderCircle,
   Menu,
@@ -42,8 +41,6 @@ export const CLAUDE_ICON = `<svg width="16" height="16" viewBox="0 0 24 24" aria
 const ICONS = {
   archive: Archive,
   "archive-restore": ArchiveRestore,
-  "arrow-down": ArrowDown,
-  "arrow-up": ArrowUp,
   "chevron-down": ChevronDown,
   "chevron-right": ChevronRight,
   "circle-alert": CircleAlert,
@@ -53,6 +50,7 @@ const ICONS = {
   folder: Folder,
   "folder-cog": FolderCog,
   "folder-open": FolderOpen,
+  "grip-vertical": GripVertical,
   house: House,
   "loader-circle": LoaderCircle,
   menu: Menu,

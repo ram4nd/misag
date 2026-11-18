@@ -25,6 +25,7 @@ How every part of Mischief of Agents (`misag`) behaves. For an overview, buildin
 | Change the workspace folder | On the Workspace settings tab, click the path to pick a folder; the house button goes back to your home directory |
 | Type a file's path into the active tab | Click the file in the Workspace box, or drag files or folders onto a terminal tab from a file manager (the tab must be running) |
 | Manage flows | Flows box in the sidebar: its gear opens the Flows tab, to add, rename, reorder, archive and delete flows |
+| Reorder flows | On the Flows tab, drag a flow by its grip, or press Up or Down (or Alt+Up or Alt+Down) on the grip |
 | Export or import a flow | On the Flows tab: a flow's download button saves it as a JSON file; Import… adds one. Or from a terminal: `misag flow export`, `misag flow import` (see `misag flow help`) |
 | Have Claude write a flow | Ask Claude in a misag tab: "run `misag flow help`, then add a misag flow that …". The help tells it the file format, and the flow shows up in the Flows box |
 | Edit a flow's steps | Click the flow in the Flows box, or its pencil on the Flows tab; it opens the flow's editor tab |

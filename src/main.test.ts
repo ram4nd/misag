@@ -6,6 +6,7 @@ import indexHtml from "../index.html?raw";
 import capabilities from "../src-tauri/capabilities/default.json?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json?raw";
 import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
+import Sortable from "sortablejs";
 import { boot } from "./main";
 
 // wterm needs WASM and real layout, so the tests drive a stand-in that
@@ -3653,20 +3654,148 @@ describe("flows", () => {
     expect(listedNames("flow-list")).toEqual(["Deploy"]);
   });
 
-  test("moving a flow up or down reorders all flows, archived ones included", async () => {
+  /** Drops the named flow's row at `index` of the active list, as SortableJS reports a drag. */
+  async function drop(name: string, index: number) {
+    const list = page().querySelector<HTMLElement>(".flow-list")!;
+    const item = rowOf(name);
+    const oldIndex = [...list.children].indexOf(item);
+    // Sortable has moved the row by the time it reports the drop.
+    item.remove();
+    list.insertBefore(item, list.children[index] ?? null);
+    Sortable.get(list)!.option("onEnd")!({ item, oldIndex, newIndex: index } as Sortable.SortableEvent);
+    await settle();
+  }
+  /** Presses `k` on the named flow's grip; resolves to whether the press was taken (its default prevented). */
+  async function key(name: string, k: string, init: KeyboardEventInit = {}) {
+    const e = new KeyboardEvent("keydown", { key: k, bubbles: true, cancelable: true, ...init });
+    rowOf(name).querySelector<HTMLButtonElement>("button.handle")!.dispatchEvent(e);
+    await settle();
+    return e.defaultPrevented;
+  }
+
+  test("flows are dragged by their grip, by pointer events rather than native drag and drop", async () => {
+    storedFlows = flows("a");
+    await startApp();
+    await openFlows();
+    const sortable = Sortable.get(page().querySelector<HTMLElement>(".flow-list")!)!;
+    expect(sortable.option("handle")).toBe(".handle");
+    expect(sortable.option("forceFallback")).toBe(true);
+  });
+
+  test("a drop that cannot be stored puts the flows back in their stored order", async () => {
+    storedFlows = flows("a", "b", "c");
+    await startApp();
+    await openFlows();
+    failing.add("flows_reorder");
+    await drop("c", 0);
+    expect(pageError().textContent).toContain("Could not reorder the flows");
+    expect(listedNames("flow-list")).toEqual(["a", "b", "c"]);
+  });
+
+  test("the Flows page is not redrawn under a drag, and catches up after the drop", async () => {
+    storedFlows = flows("a", "b");
+    await startApp();
+    await openFlows();
+    const list = page().querySelector<HTMLElement>(".flow-list")!;
+    const row = rowOf("a");
+    Sortable.get(list)!.option("onStart")!({ item: row, oldIndex: 0 } as Sortable.SortableEvent);
+    storedFlows.push({ id: 3, name: "c", archived: false });
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    expect(boxRows()).toEqual(["a", "b", "c"]);
+    expect(rowOf("a")).toBe(row);
+    expect(listedNames("flow-list")).toEqual(["a", "b"]);
+    Sortable.get(list)!.option("onEnd")!({ item: row, oldIndex: 0, newIndex: 0 } as Sortable.SortableEvent);
+    await settle();
+    expect(listedNames("flow-list")).toEqual(["a", "b", "c"]);
+  });
+
+  test("a run changing does not redraw the Flows page", async () => {
+    storedFlows = flows("a", "b");
+    await startApp();
+    await openFlows();
+    const row = rowOf("a");
+    activeRuns = [{
+      id: 5, flowId: 1, flowName: "a", tabId: "gone", stepId: "p", step: "P", status: "running", note: null,
+      outputs: ["pass"], steps: 1, done: 0, total: 1, resumable: false, prefill: false, stepKind: "prompt", briefing: false,
+    }];
+    await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
+    await settle();
+    expect(box().querySelector(".flows li.orphan")).not.toBeNull();
+    expect(rowOf("a")).toBe(row);
+  });
+
+  test("dragging a flow reorders all flows, archived ones keeping their places", async () => {
     storedFlows = flows("a", "old", "b", "c");
     storedFlows[1].archived = true;
     await startApp();
     await openFlows();
-    await click("c", "up");
-    expect(callsOf("flows_reorder").at(-1)!.args.ids).toEqual([1, 2, 4, 3]);
+    await drop("c", 0);
+    expect(callsOf("flows_reorder").at(-1)!.args.ids).toEqual([4, 2, 1, 3]);
+    expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
+    expect(boxRows()).toEqual(["c", "a", "b"]);
+    await drop("c", 2);
+    expect(listedNames("flow-list")).toEqual(["a", "b", "c"]);
+    // A drop where it started stores nothing.
+    const calls = callsOf("flows_reorder").length;
+    await drop("b", 1);
+    expect(callsOf("flows_reorder")).toHaveLength(calls);
+  });
+
+  test("the grip moves its flow with Up and Down, or Alt+Up and Alt+Down as on a toolbox, and keeps the focus", async () => {
+    storedFlows = flows("a", "b", "c");
+    await startApp();
+    await openFlows();
+    expect(await key("c", "ArrowUp")).toBe(true);
     expect(listedNames("flow-list")).toEqual(["a", "c", "b"]);
-    expect(boxRows()).toEqual(["a", "c", "b"]);
-    await click("a", "down");
+    expect(document.activeElement).toBe(rowOf("c").querySelector("button.handle"));
+    expect(await key("a", "ArrowDown", { altKey: true })).toBe(true);
     expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
     // The ends cannot move further.
-    expect(rowOf("c").querySelector<HTMLButtonElement>("button.up")!.disabled).toBe(true);
-    expect(rowOf("b").querySelector<HTMLButtonElement>("button.down")!.disabled).toBe(true);
+    await key("c", "ArrowUp");
+    await key("b", "ArrowDown");
+    expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
+    // Other keys are left alone.
+    const calls = callsOf("flows_reorder").length;
+    expect(await key("a", "Tab")).toBe(false);
+    expect(await key("a", "Enter")).toBe(false);
+    expect(callsOf("flows_reorder")).toHaveLength(calls);
+  });
+
+  test("the grip's keys move a flow past archived ones, which keep their places", async () => {
+    storedFlows = flows("a", "old", "b");
+    storedFlows[1].archived = true;
+    await startApp();
+    await openFlows();
+    await key("a", "ArrowDown");
+    expect(callsOf("flows_reorder").at(-1)!.args.ids).toEqual([3, 2, 1]);
+  });
+
+  test("a move does not take the focus back from where the person went meanwhile", async () => {
+    storedFlows = flows("a", "b");
+    await startApp();
+    await openFlows();
+    rowOf("b").querySelector<HTMLButtonElement>("button.handle")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true }));
+    const newName = page().querySelector<HTMLInputElement>("form.new-flow input[name=name]")!;
+    newName.focus();
+    await settle();
+    expect(listedNames("flow-list")).toEqual(["b", "a"]);
+    expect(document.activeElement).toBe(newName);
+  });
+
+  test("flows cannot be dragged while the page is disabled", async () => {
+    storedFlows = flows("a", "b");
+    await startApp();
+    await settle();
+    failing.add("flows_list");
+    await openFlows();
+    const list = page().querySelector<HTMLElement>(".flow-list")!;
+    const filter = Sortable.get(list)!.option("filter") as (e: Event, target: HTMLElement) => boolean;
+    expect(filter(new Event("pointerdown"), list)).toBe(true);
+    failing.delete("flows_list");
+    tabs().at(-1)!.querySelector<HTMLButtonElement>(".x")!.click();
+    await openFlows();
+    expect(filter(new Event("pointerdown"), list)).toBe(false);
   });
 
   test("archiving hides a flow from the toolbox until it is unarchived", async () => {
@@ -3744,12 +3873,13 @@ describe("flows", () => {
     storedFlows = flows("a", "b", "c");
     await startApp();
     await openFlows();
-    // Two quick clicks: the second works on the order the first left.
-    rowOf("c").querySelector<HTMLButtonElement>("button.up")!.click();
-    rowOf("c").querySelector<HTMLButtonElement>("button.up")!.click();
+    // Two quick presses: the second works on the order the first left.
+    for (const k of ["ArrowUp", "ArrowUp"])
+      rowOf("c").querySelector<HTMLButtonElement>("button.handle")!.dispatchEvent(new KeyboardEvent("keydown", { key: k, bubbles: true }));
     await settle();
     await settle();
     expect(pageError().hidden).toBe(true);
+    expect(callsOf("flows_reorder")).toHaveLength(2);
     expect(listedNames("flow-list")).toEqual(["c", "a", "b"]);
   });
 });
