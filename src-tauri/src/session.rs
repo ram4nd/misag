@@ -1948,7 +1948,7 @@ mod unix_tests {
     fn hang_up_is_seen_without_taking_the_readers_output() {
         let (mut master, mut slave) = (0, 0);
         // SAFETY: openpty writes two descriptors, which this test closes.
-        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) }, 0);
+        assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
         let (mut reader, _writer, exit) = pty_io::open(master).unwrap();
         // SAFETY: writing a byte buffer to a descriptor this test owns.
         assert_eq!(unsafe { libc::write(slave, b"kept".as_ptr().cast(), 4) }, 4);

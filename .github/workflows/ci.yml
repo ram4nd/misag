@@ -53,8 +53,10 @@ jobs:
           set -o pipefail
           if ! cargo test --manifest-path src-tauri/Cargo.toml --locked 2>&1 | tee rust-tests.log; then
             node -e '
-              const log = require("fs").readFileSync("rust-tests.log", "utf8");
-              const at = log.indexOf("\nfailures:\n");
+              const log = require("fs").readFileSync("rust-tests.log", "utf8").replace(/\x1b\[[0-9;]*m/g, "");
+              // The failed tests, else the first compile error, else the end of the log.
+              let at = log.indexOf("\nfailures:\n");
+              if (at < 0) at = log.search(/\nerror(\[|:)/);
               const text = (at >= 0 ? log.slice(at) : log.slice(-6000)).slice(0, 6000);
               const esc = text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
               console.log("::error title=Rust tests failed::" + esc);

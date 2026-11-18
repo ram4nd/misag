@@ -339,7 +339,9 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 pub(crate) fn open_capped_log(path: &std::path::Path, limit: u64) -> std::io::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
     if file.metadata()?.len() > limit {
-        file.set_len(0)?;
+        // Through a handle of its own, as Windows refuses to set the length through
+        // an append-only one.
+        std::fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
     }
     Ok(file)
 }
