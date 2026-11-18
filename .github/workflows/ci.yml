@@ -45,5 +45,19 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 
+      # A failure is repeated as an annotation, which anyone can read through the API,
+      # unlike the logs, which need a GitHub login.
       - name: Rust tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo test --manifest-path src-tauri/Cargo.toml --locked 2>&1 | tee rust-tests.log; then
+            node -e '
+              const log = require("fs").readFileSync("rust-tests.log", "utf8");
+              const at = log.indexOf("\nfailures:\n");
+              const text = (at >= 0 ? log.slice(at) : log.slice(-6000)).slice(0, 6000);
+              const esc = text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+              console.log("::error title=Rust tests failed::" + esc);
+            '
+            exit 1
+          fi
