@@ -6,6 +6,8 @@ A terminal for Linux, macOS and Windows for keeping AI agents on the path you se
 
 Left alone, coding agents like Claude Code decide for themselves what to do next, and what they remember between sessions steers them further. Mischief of Agents puts you back in charge: turn Claude's auto memory off, and give it a flow, a graph of steps you draw, that says what to do at each step and where to go next. Claude works through it on its own and comes back to you where you said it should, or when something goes wrong.
 
+A flow is not a pipeline of API calls like Langflow or n8n. It steers one real, interactive Claude Code conversation in a terminal tab: each step is a prompt to that conversation, Claude picks which way the flow goes, and you can watch, type into it, or step in at any point. Flows run inside the app, in the tab you start them in.
+
 It also works as a lightweight IDE for your agents without any flows: open a tab per agent, browse your workspace, and pick up every conversation where it left off after a restart.
 
 The name and logo come from the same idea. A *mischief* is a group of rats, a nod to the project's old name, raterm. The logo is a *kratt*, a creature from Estonian folklore that its master builds from sticks and household junk and brings to life to work for them. It must always be kept busy, or it turns to mischief.
