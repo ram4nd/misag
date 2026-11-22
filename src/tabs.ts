@@ -550,14 +550,23 @@ export function createTabs(opts: TabsOptions): Tabs {
     document.addEventListener("mouseup", up);
   }
 
-  /** The tab's icon: a loader while Claude works in it, Claude's while Claude runs in it, else a terminal. */
+  /** Which icon the tab shows: a loader while Claude works in it, Claude's while Claude runs in it, else a terminal. */
+  function iconKind(s: Session): "loader" | "claude" | "terminal" {
+    if (showsBusy(s)) return "loader";
+    return s.run.kind === "claude" || s.inClaude ? "claude" : "terminal";
+  }
+
   function tabIcon(s: Session): HTMLElement {
     const mark = document.createElement("span");
     mark.className = "icon";
-    const claude = s.run.kind === "claude" || s.inClaude;
-    mark.dataset.kind = showsBusy(s) ? "loader" : claude ? "claude" : "terminal";
-    if (showsBusy(s)) mark.append(icon("loader-circle"));
-    else if (claude) mark.innerHTML = CLAUDE_ICON;
+    const kind = iconKind(s);
+    mark.dataset.kind = kind;
+    if (kind === "loader") {
+      mark.append(icon("loader-circle"));
+      // In step with the clock, so a loader built anew carries on where the last left off.
+      // 16s holds whole cycles of both the 1s spin and the 3.2s reduced-motion pulse in style.css.
+      mark.style.animationDelay = `-${Date.now() % 16_000}ms`;
+    } else if (kind === "claude") mark.innerHTML = CLAUDE_ICON;
     else mark.append(icon("square-terminal"));
     return mark;
   }
@@ -572,7 +581,8 @@ export function createTabs(opts: TabsOptions): Tabs {
     tab.title = tabTitle(s);
     tab.classList.toggle("busy", showsBusy(s));
     name.textContent = label(s);
-    mark.replaceWith(tabIcon(s));
+    // Kept when its kind holds: Claude retitles the tab on every spinner frame, and a new loader would restart its spin.
+    if ((mark as HTMLElement).dataset.kind !== iconKind(s)) mark.replaceWith(tabIcon(s));
   }
 
   /** The active tab's current directory, so a new tab opens next to it. */

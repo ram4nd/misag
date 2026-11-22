@@ -952,6 +952,43 @@ describe("tab icons", () => {
     while (Date.now() === now);
   };
 
+  test("the loader stays in place while Claude's title steps through spinner frames", async () => {
+    await startApp();
+    await clickClaude();
+    terms()[0].onTitle!("◐ Claude Code");
+    const loader = tabs()[0].querySelector<HTMLElement>(".icon");
+    expect(loader?.dataset.kind).toBe("loader");
+    terms()[0].onTitle!("◓ Claude Code");
+    terms()[0].onTitle!("◑ Fix the build");
+    expect(tabs()[0].querySelector(".icon")).toBe(loader);
+  });
+
+  test("the icon is swapped when Claude starts and stops working", async () => {
+    await startApp();
+    await clickClaude();
+    const idle = tabs()[0].querySelector(".icon");
+    terms()[0].onTitle!("◐ Claude Code");
+    const loader = tabs()[0].querySelector(".icon");
+    expect(loader).not.toBe(idle);
+    expect(kind(0)).toBe("loader");
+    terms()[0].onTitle!("✳ Claude Code");
+    expect(tabs()[0].querySelector(".icon")).not.toBe(loader);
+    expect(kind(0)).toBe("claude");
+    expect(tabs()[0].querySelectorAll(".icon")).toHaveLength(1);
+  });
+
+  test("a new loader starts in step with the clock, so a rebuilt tab does not jump back", async () => {
+    await startApp();
+    await clickClaude();
+    const before = Date.now();
+    terms()[0].onTitle!("◐ Claude Code");
+    const after = Date.now();
+    const delay = -parseInt(tabs()[0].querySelector<HTMLElement>(".icon")!.style.animationDelay);
+    // 16s holds whole cycles of both the 1s spin and the 3.2s reduced-motion pulse.
+    const phases = Array.from({ length: after - before + 1 }, (_, i) => (before + i) % 16_000);
+    expect(phases).toContain(delay);
+  });
+
   test("a tab shows Claude working while its title has a spinner", async () => {
     await startApp();
     await clickClaude();

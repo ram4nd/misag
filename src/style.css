@@ -69,6 +69,7 @@ body.dragging-tab, body.dragging-tab * { cursor: grabbing !important; }
 #tab-actions button { display: grid; place-items: center; }
 .tab .icon { flex: none; display: grid; place-items: center; }
 .tab.exited .icon { opacity: .5; }
+/* tabIcon (tabs.ts) syncs new loaders with a delay modulo 16s: keep both durations dividing into 16s (the pulse counts 3.2s, there and back). */
 .tab.busy .icon { color: #d97757; animation: tab-busy 1s linear infinite; }
 @keyframes tab-busy { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
