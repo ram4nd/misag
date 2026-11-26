@@ -17,15 +17,15 @@
     "@tauri-apps/plugin-opener": "^2.7.3",
     "@wterm/dom": "0.6.0",
     "drawflow": "0.0.60",
-    "lucide": "^1.74.0",
+    "lucide": "^1.80.0",
     "sortablejs": "1.15.7"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.12.5",
+    "@tauri-apps/cli": "^2.12.6",
     "@types/sortablejs": "^1.15.9",
     "jsdom": "^31.0.1",
     "typescript": "^7.0.2",
     "vite": "^8.3.8",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   }
 }
