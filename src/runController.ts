@@ -23,6 +23,12 @@ export interface Prefill {
   token: number;
 }
 
+/** Mirrors `runs::TabTitle`: a title Claude wrote for a tab at a flow's tab title step. */
+export interface TabTitle {
+  tabId: string;
+  title: string;
+}
+
 /** Mirrors `runs::Cleared`. */
 export type Cleared = { state: "pending" | "gone" } | { state: "ready"; prompt: string | null };
 
@@ -41,8 +47,14 @@ const CLEAR_TIMEOUT_MS = 30_000;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-/** The terminal's focus-in and focus-out reports. */
-const FOCUS_REPORTS = /\x1b\[[IO]/g;
+/**
+ * What the terminal sends on its own rather than the person typing: focus reports,
+ * replies to queries (OSC and DCS strings; device attributes, cursor position, status,
+ * color scheme, mode, window size and kitty keyboard flag reports) and mouse reports.
+ * Kitty key events (CSI u without `?`) are typing, so they stay.
+ */
+const TERMINAL_REPORTS =
+  /\x1b\[[IO]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\|\x1b\[[?>=][\d;]*[cnu]|\x1b\[\??[\d;]*\$y|\x1b\[\d+;\d+R|\x1b\[\d*n|\x1b\[\d+(?:;\d+)*t|\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[\d+;\d+;\d+M|\x1b\[M[\s\S]{3}/gu;
 
 /** A tab, as flow runs need it. */
 export interface RunTab {
@@ -84,6 +96,8 @@ export interface RunControllerOptions<T extends RunTab> {
   editors(): Iterable<[number, RunEditor]>;
   /** Marks in the tab bar the tabs whose run waits for the person. */
   markWaiting(isWaiting: (tab: T) => boolean): void;
+  /** Names the tab `title`, which Claude wrote at a flow's tab title step. */
+  retitle(tab: T, title: string): void;
   /** The tab's keyboard was locked (a flow is typing there) or unlocked again. */
   lockChanged?(tab: T, locked: boolean): void;
 }
@@ -130,6 +144,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   let runsError: string | null = null;
   /** Tabs whose Claude input may hold text the person typed and has not sent. */
   const dirtyTabs = new Set<string>();
+  /** Tabs whose last input ended in a backslash, which turns an Enter that follows on its own into a newline. */
+  const backslashTabs = new Set<string>();
   /** Runs whose manual prompt is being put into Claude's input right now. */
   const filling = new Set<number>();
   /** Runs whose manual prompt could not be put into Claude's input, or waits for the person to clear it, said once. */
@@ -190,6 +206,8 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       // Text the person left in Claude's input would be sent along with the prompt.
       // Ctrl+C clears it; on an empty input one press only shows a hint, so it is
       // sent only when the person typed since their last Enter.
+      // The input is about to be cleared or sent, so a backslash the person ended on is gone.
+      backslashTabs.delete(tab.tabId);
       if (dirtyTabs.delete(tab.tabId)) {
         await opts.write(tab, encoder.encode("\x03"));
         await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
@@ -261,6 +279,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     if (!pastedTabs.delete(tab.tabId) || !(await opts.live(tab))) return;
     await opts.write(tab, encoder.encode("\x03"));
     dirtyTabs.delete(tab.tabId);
+    backslashTabs.delete(tab.tabId);
     await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
   }
 
@@ -514,6 +533,20 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       runsError = `Flow runs could not be read: ${opts.errorText(err)}`;
       flows.showBoxError(runsError);
     }
+    await retitle();
+  }
+
+  /** Names the tabs Claude wrote titles for; each title is handed over once, and one for a tab that is gone is dropped. */
+  async function retitle() {
+    try {
+      for (const { tabId, title } of await invoke<TabTitle[]>("flow_tab_titles")) {
+        const tab = opts.tabs().find((t) => t.tabId === tabId);
+        if (tab) opts.retitle(tab, title);
+      }
+    } catch (err) {
+      // Left in the database: the next poll tries again.
+      console.error("misag: could not read the tab titles", err);
+    }
   }
 
   return {
@@ -527,6 +560,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
     show,
     forgetTab(tab) {
       runs = runs.filter((r) => r.tabId !== tab.tabId);
+      backslashTabs.delete(tab.tabId);
     },
     waiting: (tab) => waitingTabs.has(tab.tabId),
     restored() {
@@ -534,12 +568,17 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       show();
     },
     typed(tab, data) {
-      // Focus reports (Claude Code turns on mode 1004) are not typing.
-      const text = (typeof data === "string" ? data : decoder.decode(data)).replace(FOCUS_REPORTS, "");
-      // An Enter that is not inside a paste sends the input; Ctrl+C clears it.
-      const sent = (text.endsWith("\r") && !text.includes("\x1b[200~")) || text === "\x03";
+      // What the terminal reports by itself (focus, query replies, mouse) is not typing.
+      const text = (typeof data === "string" ? data : decoder.decode(data)).replace(TERMINAL_REPORTS, "");
+      // An Enter that is not inside a paste sends the input; Ctrl+C clears it. Alt+Enter
+      // (ESC before it, in the same chunk) and an Enter after a backslash add a line instead.
+      const before = text.length > 1 ? text.at(-2) : backslashTabs.has(tab.tabId) ? "\\" : undefined;
+      const enter = text.endsWith("\r") && before !== "\x1b" && before !== "\\";
+      const sent = (enter && !text.includes("\x1b[200~")) || text === "\x03";
       if (sent) dirtyTabs.delete(tab.tabId);
       else if (text) dirtyTabs.add(tab.tabId);
+      if (text.endsWith("\\")) backslashTabs.add(tab.tabId);
+      else if (text) backslashTabs.delete(tab.tabId);
       // A paste the person has added to, sent or cleared is theirs.
       if (text) pastedTabs.delete(tab.tabId);
     },

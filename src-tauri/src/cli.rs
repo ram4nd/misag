@@ -91,11 +91,15 @@ Steps ("nodes"):
               it. The person writes the prompt and sends it, and the run goes
               on by the step's one output once Claude answers it; ▶ skips
               the step.
+            "title": has Claude name the run's tab after what the person
+              asked it. Claude replies with "TITLE: <title>", which becomes
+              the tab's name, and the run goes on by the step's one output.
+              "text" is optional guidance, such as "Use the ticket number".
             "end": ends the run and has no outputs. Optional: an output that
               leads nowhere ends it too.
   title     The step's name on the canvas (up to 200 characters).
-  text      The prompt, what the person does at a pause, or a manual
-            prompt's draft (up to 20000 characters).
+  text      The prompt, what the person does at a pause, a manual prompt's
+            draft, or a tab title's guidance (up to 20000 characters).
             Optional on Start: base info, such as where things are (up to
             4000 characters). A run first briefs Claude with the flow's
             rules (one step at a time, end each with "FLOW: <output>") and
@@ -105,7 +109,7 @@ Steps ("nodes"):
             the flow is finished (unless a /clear came first).
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
             and _, starting with a letter or digit, up to 24 characters); a
-            pause or manual prompt has exactly one. "attention" is reserved:
+            pause, manual prompt or tab title has exactly one. "attention" is reserved:
             Claude ends with it to ask for the person.
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run

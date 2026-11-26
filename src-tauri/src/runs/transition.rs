@@ -79,7 +79,7 @@ pub(super) fn go(cx: &Cx, state: &RunState, from: &Node, output: &str, steps: i6
     let next = flows::next_step(cx.graph, &from.id, output);
     // Going on with `from` would only redo it and stop here again.
     let wait = |why: String| Change::to(state.waiting(&from.id, steps, &why, None));
-    if next.is_some_and(|n| n.kind == Kind::Prompt) && steps >= MAX_RUN_STEPS {
+    if next.is_some_and(|n| matches!(n.kind, Kind::Prompt | Kind::Title)) && steps >= MAX_RUN_STEPS {
         return wait(format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on."));
     }
     if let (Some(next), By::Flow) = (next, by)
@@ -96,7 +96,7 @@ pub(super) fn go(cx: &Cx, state: &RunState, from: &Node, output: &str, steps: i6
         // The output leads nowhere: the flow is done.
         None => (state.finished(&from.id, steps), None),
         Some(next) => match next.kind {
-            Kind::Prompt => {
+            Kind::Prompt | Kind::Title => {
                 let mut state = state.moved(&next.id, Phase::Working, steps + 1);
                 let say = state.prompt(next);
                 (state, Some(say))
@@ -159,7 +159,7 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
             // that ends with one of the step's outputs moves it on, and only where
             // Continue is offered: at a step limit only a pick passes the wait. Any
             // other turn leaves the wait, its note and Continue as they were.
-            let output = reply.and_then(flows::parse_marker).filter(|m| {
+            let output = reply.and_then(|reply| reply_output(node, reply)).filter(|m| {
                 continue_offered(&state.phase, node.kind).is_some() && m != flows::ATTENTION && node.outputs.contains(m)
             });
             Ok(output.map(|output| go(cx, state, node, &output, state.steps, By::Flow)))
@@ -170,6 +170,12 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
                 // Its next reply would not be reported either.
                 return Ok(Some(Change::to(state.waiting(&node.id, state.steps, NO_REPLY, None))));
             };
+            if node.kind == Kind::Title && flows::parse_marker(reply).as_deref() != Some(flows::ATTENTION) {
+                return Ok(Some(match reply_output(node, reply) {
+                    Some(output) => go(cx, state, node, &output, state.steps, By::Flow),
+                    None => wait("Claude's reply did not end with a TITLE line, so the tab cannot be named.".into()),
+                }));
+            }
             Ok(Some(match flows::parse_marker(reply) {
                 None => wait("Claude's reply did not end with a FLOW line, so the flow cannot tell how to go on.".into()),
                 Some(m) if m == flows::ATTENTION => wait("Claude asked for a person; see its last reply.".into()),
@@ -183,6 +189,15 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
         // (Clearing, Briefing, which is only at Start, and Typed are seen to above.)
         _ => Ok(None),
     }
+}
+
+/// The output a running step's `reply` picks: the `FLOW:` line's, or at a tab title
+/// step, its one output once the reply ends with a title (see `flows::parse_title`).
+fn reply_output(node: &Node, reply: &str) -> Option<String> {
+    if node.kind == Kind::Title {
+        return flows::parse_title(reply).and(node.outputs.first().cloned());
+    }
+    flows::parse_marker(reply)
 }
 
 /// The person picked `output` for `step_id` (see `super::proceed`).
@@ -278,7 +293,7 @@ pub(super) fn prompt_unseen(cx: &Cx, state: &RunState, error: &str) -> Result<Op
 pub(super) fn resume(cx: &Cx, state: &RunState, step_id: &str) -> Result<Change, String> {
     at(cx.graph, state, step_id)?;
     let node = cx.node(&state.node_id)?;
-    if !matches!(state.phase, Phase::NeedsPerson { .. }) || node.kind != Kind::Prompt {
+    if !matches!(state.phase, Phase::NeedsPerson { .. }) || !matches!(node.kind, Kind::Prompt | Kind::Title) {
         return Err(format!("\"{}\" does not need attention; pick an output instead", node.name()));
     }
     let Some(how) = continue_offered(&state.phase, node.kind) else {

@@ -59,5 +59,9 @@
     "clear": true,
     "prompt": "Go",
     "runId": 1
+  },
+  "tabTitle": {
+    "tabId": "tab-1",
+    "title": "Fix login"
   }
 }

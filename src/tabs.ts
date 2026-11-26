@@ -70,6 +70,8 @@ export interface Tabs {
    * finishing the rename renders it again.
    */
   updateTab(s: Session): void;
+  /** Names the tab `title` as a rename would, so Claude's terminal titles no longer change it. */
+  retitle(s: Session, title: string): void;
   /** Types into the tab's process. */
   /** Writes to the tab's program; rejects when it does not take it. */
   write(s: Session, data: Uint8Array): Promise<void>;
@@ -86,6 +88,12 @@ export interface Tabs {
   /** Drops the finishes the tabs were waiting to confirm. */
   dispose(): void;
 }
+
+/**
+ * The period new loaders are synced to: it holds whole cycles of both the 1s spin and
+ * the reduced-motion pulse (1.6s alternate, so 3.2s a cycle) in style.css.
+ */
+export const LOADER_SYNC_MS = 16_000;
 
 /** The terminal tabs: their processes, the tab bar, and which one is shown. */
 export function createTabs(opts: TabsOptions): Tabs {
@@ -564,11 +572,19 @@ export function createTabs(opts: TabsOptions): Tabs {
     if (kind === "loader") {
       mark.append(icon("loader-circle"));
       // In step with the clock, so a loader built anew carries on where the last left off.
-      // 16s holds whole cycles of both the 1s spin and the 3.2s reduced-motion pulse in style.css.
-      mark.style.animationDelay = `-${Date.now() % 16_000}ms`;
+      mark.style.animationDelay = `-${Date.now() % LOADER_SYNC_MS}ms`;
     } else if (kind === "claude") mark.innerHTML = CLAUDE_ICON;
     else mark.append(icon("square-terminal"));
     return mark;
+  }
+
+  /** Names the tab as if the person renamed it, so Claude's terminal titles no longer change it (a flow's tab title step). */
+  function retitle(s: Session, title: string) {
+    if (s.name === title && s.renamed) return;
+    s.name = title;
+    s.renamed = true;
+    updateTab(s);
+    opts.scheduleSave();
   }
 
   function updateTab(s: Session) {
@@ -581,7 +597,7 @@ export function createTabs(opts: TabsOptions): Tabs {
     tab.title = tabTitle(s);
     tab.classList.toggle("busy", showsBusy(s));
     name.textContent = label(s);
-    // Kept when its kind holds: Claude retitles the tab on every spinner frame, and a new loader would restart its spin.
+    // Replaced only when its kind changes: Claude retitles the tab on every spinner frame, and a new loader would restart its spin.
     if ((mark as HTMLElement).dataset.kind !== iconKind(s)) mark.replaceWith(tabIcon(s));
   }
 
@@ -609,6 +625,7 @@ export function createTabs(opts: TabsOptions): Tabs {
     showTerminal,
     render,
     updateTab,
+    retitle,
     write,
     heldBack,
     label,

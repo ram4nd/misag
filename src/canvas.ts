@@ -23,7 +23,7 @@ export interface Canvas {
   mark(id: string | null): void;
 }
 
-const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Pause", manual_prompt: "Manual prompt", end: "End" };
+const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Pause", manual_prompt: "Manual prompt", title: "Tab title", end: "End" };
 
 /**
  * A Drawflow canvas showing a flow's steps, drawn in an element it adds to `canvasEl`.
@@ -132,7 +132,9 @@ export function createCanvas(canvasEl: HTMLElement, events: CanvasEvents): Canva
         const info =
           s.kind === "start" && s.text.trim() !== "" ? `<span class="info" title="Sends base info in the run's briefing">info</span>` : "";
         const html = `<div class="kind">${KIND_LABELS[s.kind]}${limit}${clears}${info}</div><div class="title"></div>`;
-        const id = df.addNode(s.kind, inputs, s.outputs.length, s.x, s.y, s.kind, {}, html, false);
+        // A tab title's class is not "title", which names the step's title inside every step.
+        const cls = s.kind === "title" ? "tab-title" : s.kind;
+        const id = df.addNode(s.kind, inputs, s.outputs.length, s.x, s.y, cls, {}, html, false);
         stepOf.set(String(id), s);
         drawnAs.set(s.id, id);
         const node = el.querySelector(`#node-${id}`)!;

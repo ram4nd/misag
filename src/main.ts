@@ -225,6 +225,7 @@ function build(lifetime: AbortController): () => void {
     write: (s, data) => tabs.write(s, data),
     editors: () => pageTabs.editors(),
     markWaiting: (isWaiting) => tabs.list.forEach((s, i) => tabsEl.children[i]?.classList.toggle("needs-you", isWaiting(s))),
+    retitle: (s, title) => tabs.retitle(s, title),
     lockChanged: (_s, locked) => {
       if (!locked) notices.set("flow-typing", null);
     },

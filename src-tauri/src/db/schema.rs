@@ -270,6 +270,13 @@ const MIGRATIONS: &[&str] = &[r#"
         CONSTRAINT typed_only_when_running
         CHECK (typed IN (0, 1, 2) AND (status IN ('done', 'stopped') OR typed = 0
                OR (status = 'running' AND clear IS NULL AND briefing = 0)));
+"#, r#"
+    -- The tab titles Claude wrote at flow tab title steps, written by the Stop hook
+    -- and taken by the app, which names the tabs (see runs::take_tab_titles).
+    CREATE TABLE tab_titles (
+        tab_id TEXT PRIMARY KEY,
+        title  TEXT NOT NULL
+    );
 "#];
 
 /// The index in MIGRATIONS of the migration adding flow_runs' CHECKs, which

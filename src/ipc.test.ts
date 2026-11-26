@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 import fixtures from "./ipc.fixtures.json";
 import type { Flow, Run } from "./flows";
 import type { Page, Past } from "./history";
-import type { Cleared, Prefill, Started } from "./runController";
+import type { Cleared, Prefill, Started, TabTitle } from "./runController";
 
 /**
  * Each mirror's fields, listed so the compiler checks the list is complete and has
@@ -14,6 +14,7 @@ const RUN: Record<keyof Run, true> = {
   status: true, note: true, outputs: true, steps: true, done: true, total: true, resumable: true, prefill: true, stepKind: true, briefing: true,
 };
 const PREFILL: Record<keyof Prefill, true> = { text: true, token: true };
+const TAB_TITLE: Record<keyof TabTitle, true> = { tabId: true, title: true };
 const STARTED: Record<keyof Started, true> = { runId: true, clear: true, prompt: true };
 const FLOW: Record<keyof Flow, true> = { id: true, name: true, archived: true, clear: true, unconfirmed: true };
 const PAGE: Record<keyof Page, true> = { sessions: true, more: true, unreadable: true };
@@ -27,6 +28,7 @@ describe("the page's types mirror the values the backend sends", () => {
     ["Started", fixtures.started, STARTED],
     ["Flow", fixtures.flow, FLOW],
     ["Prefill", fixtures.prefill, PREFILL],
+    ["TabTitle", fixtures.tabTitle, TAB_TITLE],
     ["Page", fixtures.page, PAGE],
     ["Past", fixtures.page.sessions[0], PAST],
   ])("%s", (_, value, mirror) => {

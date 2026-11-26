@@ -732,7 +732,7 @@ fn node_of<'g>(graph: &'g Graph, id: &str) -> Result<&'g Node, String> {
 /// run on too (see `on_stop`).
 fn continue_offered(phase: &Phase, kind: Kind) -> Option<Resume> {
     match phase {
-        Phase::NeedsPerson { resume, .. } if kind == Kind::Prompt => *resume,
+        Phase::NeedsPerson { resume, .. } if matches!(kind, Kind::Prompt | Kind::Title) => *resume,
         _ => None,
     }
 }
@@ -966,9 +966,42 @@ pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Re
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(None) };
     let taken = taken(&tx, run.id)?;
     let Some(change) = transition::on_stop(&run.cx(&taken), &run.state, reply)? else { return Ok(None) };
+    // Leaving a tab title step on Claude's reply hands its title to the app.
+    let named = change.left.as_ref().and_then(|(id, _)| node_of(&run.graph, id).ok()).filter(|n| n.kind == Kind::Title);
+    if let Some(title) = named.and(reply).and_then(flows::parse_title) {
+        name_tab(&tx, tab_id, &title)?;
+    }
     let next = run.apply(&tx, change)?;
     tx.commit().map_err(sql)?;
     Ok(texts(next))
+}
+
+/// A tab title Claude wrote at a tab title step, for the app to make the tab's name.
+/// Mirrored by `TabTitle` in src/runController.ts.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TabTitle {
+    pub tab_id: String,
+    pub title: String,
+}
+
+/// Has the app name tab `tab_id` `title` (see `take_tab_titles`); a newer title
+/// replaces one not yet taken.
+fn name_tab(tx: &Transaction, tab_id: &TabId, title: &str) -> Result<(), String> {
+    tx.execute(
+        "INSERT INTO tab_titles (tab_id, title) VALUES (?1, ?2) ON CONFLICT (tab_id) DO UPDATE SET title = excluded.title",
+        params![tab_id.as_str(), title],
+    )
+    .map(drop)
+    .map_err(sql)
+}
+
+/// The tab titles Claude wrote since the last call (see `name_tab`), each handed
+/// over once: the app polls this with the runs and names the tabs.
+pub fn take_tab_titles(conn: &mut Connection) -> Result<Vec<TabTitle>, String> {
+    let mut stmt = conn.prepare_cached("DELETE FROM tab_titles RETURNING tab_id, title").map_err(sql)?;
+    let titles = stmt.query_map([], |r| Ok(TabTitle { tab_id: r.get(0)?, title: r.get(1)? })).map_err(sql)?;
+    titles.collect::<Result<_, _>>().map_err(sql)
 }
 
 /// The person picked `output` for `step_id`, the step they saw the run at; returns

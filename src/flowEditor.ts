@@ -3,14 +3,14 @@ import { createCanvas } from "./canvas";
 import { awaitsPrompt, statusLabel, type Run } from "./flows";
 
 /** Mirrors `flows::Kind`; "manual" is a Pause, under the name older misags read. */
-export type StepKind = "start" | "prompt" | "manual" | "manual_prompt" | "end";
+export type StepKind = "start" | "prompt" | "manual" | "manual_prompt" | "title" | "end";
 
 /** Mirrors `flows::Node`. */
 export interface Step {
   id: string;
   kind: StepKind;
   title: string;
-  /** A prompt, what the person does, or for Start: optional base info, sent in the run's briefing. */
+  /** A prompt, what the person does, a tab title's optional guidance, or for Start: optional base info, sent in the run's briefing. */
   text: string;
   outputs: string[];
   /** How many times a run may take the step before it waits for the person; absent: no limit. */
@@ -50,10 +50,11 @@ const MAX_RUNS = 100;
 /** How many changes Ctrl+Z can take back. */
 const MAX_UNDO = 100;
 /** The steps the toolbar adds. An End marks where the flow ends; an output with no next step ends it too. */
-const NEW_STEPS: Record<"prompt" | "manual" | "manual_prompt" | "end", { title: string; outputs: string[] }> = {
+const NEW_STEPS: Record<"prompt" | "manual" | "manual_prompt" | "title" | "end", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
   manual: { title: "Pause", outputs: ["done"] },
   manual_prompt: { title: "Manual prompt", outputs: ["sent"] },
+  title: { title: "Tab title", outputs: ["done"] },
   end: { title: "End", outputs: [] },
 };
 
@@ -88,6 +89,7 @@ function editorMarkup(): string {
           <button type="button" class="add-prompt">+ Prompt</button>
           <button type="button" class="add-manual-prompt" title="Puts a draft into Claude's input for you to finish and send; goes on once Claude answers">+ Manual prompt</button>
           <button type="button" class="add-pause" title="Waits for you to do something and press ▶">+ Pause</button>
+          <button type="button" class="add-title" title="Has Claude name the tab after what you asked it, then goes on">+ Tab title</button>
           <button type="button" class="add-end">+ End</button>
           <span class="status" role="status"></span>
         </div>
@@ -231,9 +233,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     text.value = s.text;
     outputs.value = s.outputs.join(", ");
     maxRuns.value = s.maxRuns === undefined ? "" : String(s.maxRuns);
-    const oneWay = s.kind === "manual" || s.kind === "manual_prompt";
+    const oneWay = s.kind === "manual" || s.kind === "manual_prompt" || s.kind === "title";
     text.closest("label")!.hidden = s.kind === "end";
-    // A pause or manual prompt goes on one way; only one from an older flow, with several, shows them to cut down.
+    // A pause, manual prompt or tab title goes on one way; only one with several (from an older flow, or a file) shows them to cut down.
     outputs.closest("label")!.hidden = !(s.kind === "prompt" || (oneWay && s.outputs.length > 1));
     // Leaving a pause or a manual prompt is always your doing, which no limit holds back.
     maxRuns.closest("label")!.hidden = s.kind !== "prompt";
@@ -244,10 +246,16 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
       prompt: "Prompt",
       manual: "What the person does",
       manual_prompt: "Draft, put into Claude's input for you to finish",
+      title: "Guidance for the title (optional)",
       end: "",
     }[s.kind];
     text.maxLength = s.kind === "start" ? MAX_INFO : MAX_TEXT;
-    text.placeholder = s.kind === "start" ? "Optional: where things are and what Claude should know, sent to Claude in the run's briefing before the first step" : "";
+    text.placeholder =
+      s.kind === "start"
+        ? "Optional: where things are and what Claude should know, sent to Claude in the run's briefing before the first step"
+        : s.kind === "title"
+          ? "Claude names the tab after what you asked it, in 2 to 6 words. Add guidance if you like, such as: start with the ticket number"
+          : "";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
 
@@ -358,6 +366,7 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   $<HTMLButtonElement>(".add-prompt").onclick = () => addStep("prompt");
   $<HTMLButtonElement>(".add-pause").onclick = () => addStep("manual");
   $<HTMLButtonElement>(".add-manual-prompt").onclick = () => addStep("manual_prompt");
+  $<HTMLButtonElement>(".add-title").onclick = () => addStep("title");
   $<HTMLButtonElement>(".add-end").onclick = () => addStep("end");
   $<HTMLButtonElement>(".delete-step").onclick = () => {
     const s = find(selected);
@@ -395,7 +404,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
               ? "A pause has one output: ▶ goes on from it, and ■ stops the run."
               : s.kind === "manual_prompt" && words.length > 1
                 ? "A manual prompt has one output: the run goes on by it once Claude answers your prompt."
-                : null;
+                : s.kind === "title" && words.length > 1
+                  ? "A tab title step has one output: the run goes on by it once Claude names the tab."
+                  : null;
     invalid.hidden = why === null;
     invalid.textContent = why ?? "";
     if (why !== null) return false;

@@ -29,8 +29,11 @@ pub const ATTENTION: &str = "attention";
 /// `stored`), so older misags keep reading the flows they can run correctly.
 /// Version 2 added step run limits (`Node::max_runs`), version 3 clearing the
 /// conversation at Start (`Node::clear`), version 4 Start's base info (its `text`),
-/// version 5 manual prompts (`Kind::ManualPrompt`).
-pub const GRAPH_VERSION: u32 = 5;
+/// version 5 manual prompts (`Kind::ManualPrompt`), version 6 tab title steps
+/// (`Kind::Title`).
+pub const GRAPH_VERSION: u32 = 6;
+/// The most a tab title Claude writes can be, in characters (see `parse_title`).
+pub const MAX_TAB_TITLE: usize = 60;
 
 /// Mirrored by `Graph` in src/flowEditor.ts.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -64,6 +67,11 @@ pub enum Kind {
     /// goes on by its one output when Claude ends that turn.
     #[serde(rename = "manual_prompt")]
     ManualPrompt,
+    /// Has Claude name the run's tab after what the person asked it: Claude replies
+    /// with a `TITLE: <title>` line (see `parse_title`), which the app makes the tab's
+    /// name, and the run goes on by the step's one output. `text`, optional, guides
+    /// the title.
+    Title,
     End,
 }
 
@@ -131,6 +139,7 @@ impl Node {
             ("", Kind::Prompt) => "Prompt step",
             ("", Kind::Pause) => "Pause",
             ("", Kind::ManualPrompt) => "Manual prompt",
+            ("", Kind::Title) => "Tab title",
             ("", Kind::End) => "End",
             (title, _) => title,
         }
@@ -170,7 +179,7 @@ fn check_outputs(node: &Node) -> Result<(), String> {
         }
         Kind::End if !node.outputs.is_empty() => return Err(format!("End step \"{name}\" cannot have outputs")),
         Kind::Start | Kind::End => return Ok(()),
-        Kind::Prompt | Kind::Pause | Kind::ManualPrompt => {}
+        Kind::Prompt | Kind::Pause | Kind::ManualPrompt | Kind::Title => {}
     }
     if node.outputs.is_empty() || node.outputs.len() > MAX_OUTPUTS {
         return Err(format!("\"{name}\" needs between 1 and at most {MAX_OUTPUTS} outputs"));
@@ -211,8 +220,9 @@ fn check_node(node: &Node) -> Result<(), String> {
     }
     match (node.max_runs, node.kind) {
         (None, _) => {}
-        // Leaving a pause or a manual prompt is always the person's doing, which no limit holds back.
-        (Some(_), Kind::Start | Kind::Pause | Kind::ManualPrompt | Kind::End) => {
+        // Leaving a pause or a manual prompt is always the person's doing, which no
+        // limit holds back; naming the tab again and again needs none.
+        (Some(_), Kind::Start | Kind::Pause | Kind::ManualPrompt | Kind::Title | Kind::End) => {
             return Err(format!("\"{}\" cannot have a run limit: only prompt steps can", node.name()));
         }
         (Some(n), _) if !(1..=MAX_RUNS).contains(&n) => {
@@ -231,6 +241,7 @@ fn check_node(node: &Node) -> Result<(), String> {
 pub fn stored(mut graph: Graph) -> Graph {
     // The format each step needs, by the newest field it uses.
     let needs = |n: &Node| match n {
+        Node { kind: Kind::Title, .. } => 6,
         Node { kind: Kind::ManualPrompt, .. } => 5,
         Node { kind: Kind::Start, text, .. } if !text.trim().is_empty() => 4,
         Node { kind: Kind::Start, clear: true, .. } => 3,
@@ -301,13 +312,53 @@ pub fn parse_marker(reply: &str) -> Option<String> {
     (label.trim().eq_ignore_ascii_case("flow") && word).then_some(value)
 }
 
+/// The tab title Claude ends its reply with at a tab title step: the last non-empty
+/// line (closing code fences aside), `TITLE: <title>` in any case, possibly in
+/// backticks, bold or quotes, its whitespace collapsed, characters that do not show
+/// or that act in a terminal dropped, and cut to `MAX_TAB_TITLE` characters. None
+/// without one.
+pub fn parse_title(reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).rfind(|line| !line.is_empty() && !line.starts_with("```"))?;
+    let (label, value) = line.split_once(':')?;
+    if !label.trim_matches(|c| c == '`' || c == '*').trim().eq_ignore_ascii_case("title") {
+        return None;
+    }
+    let value = typeable(value.to_owned());
+    let value = value.trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '*' | '"' | '\'' | '“' | '”'));
+    let title: String = value.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(MAX_TAB_TITLE).collect();
+    let title = title.trim_end().to_owned();
+    (!title.is_empty()).then_some(title)
+}
+
 /// What is sent to Claude for a prompt step: the step's text and how to end the
-/// reply so the runner knows which output.
+/// reply so the runner knows which output. A tab title step asks for the title
+/// instead (see `title_request`).
 /// Control characters (other than newlines and tabs) are dropped: the prompt may be
 /// typed into a terminal, where they would act as keys or end the paste early. So
 /// are hidden ones, which `check` refuses, in case a flow stored before holds some.
 pub fn prompt_text(node: &Node) -> String {
+    if node.kind == Kind::Title {
+        return typeable(title_request(node));
+    }
     typeable(format!("{}\n\n{}", node.text.trim_end(), reply_rule(node)))
+}
+
+/// What a tab title step asks of Claude: a title for the tab from what the person
+/// asked, guided by the step's text if it has any, as the reply's one line.
+fn title_request(node: &Node) -> String {
+    let guide = node.text.trim();
+    let guide = if guide.is_empty() { String::new() } else { format!("\n\n{guide}") };
+    format!(
+        "Give this tab a short title, 2 to 6 words, that says what I asked you to do in this conversation.{guide}\n\n{}",
+        title_rule()
+    )
+}
+
+fn title_rule() -> String {
+    format!(
+        "Do nothing else for this step. Reply with one line that is exactly `TITLE: <the title>`, and no FLOW line. \
+         If you need a person first, end your reply with `FLOW: {ATTENTION}` instead and say why."
+    )
 }
 
 /// What a run tells Claude before its first step: the run's rules, what Claude
@@ -347,7 +398,8 @@ fn rules(flow: &str) -> String {
          - Do only what the current step asks. Do not start on later work until its step arrives.\n\
          - Each step names its outputs. When you have finished the step, end your reply with a last line that is exactly `FLOW: <output>`, the output that fits.\n\
          - If you need a person to decide or do something first, end your reply with `FLOW: {ATTENTION}` instead and say why.\n\
-         - Some steps are the person's own: they will write to you themselves."
+         - Some steps are the person's own: they will write to you themselves.\n\
+         - A step that asks for a tab title ends with a `TITLE:` line instead of a FLOW line."
     )
 }
 
@@ -374,7 +426,8 @@ pub fn base_info(graph: &Graph) -> String {
 /// What is sent to Claude to go on with a prompt step that needs attention, once
 /// the person has seen to it.
 pub fn resume_text(node: &Node) -> String {
-    typeable(format!("Go on with the flow step \"{}\". {}", node.name(), reply_rule(node)))
+    let rule = if node.kind == Kind::Title { title_rule() } else { reply_rule(node) };
+    typeable(format!("Go on with the flow step \"{}\". {rule}", node.name()))
 }
 
 fn reply_rule(node: &Node) -> String {
@@ -434,6 +487,11 @@ pub fn problems(graph: &Graph) -> Vec<String> {
         if node.kind == Kind::ManualPrompt && node.outputs.len() > 1 {
             problems.push(format!(
                 "\"{name}\" has more than one output; a manual prompt goes on one way once Claude answers, so give it a single output."
+            ));
+        }
+        if node.kind == Kind::Title && node.outputs.len() > 1 {
+            problems.push(format!(
+                "\"{name}\" has more than one output; a tab title step goes on one way once Claude names the tab, so give it a single output."
             ));
         }
         // Start must lead somewhere; other outputs with no next step end the flow there.
@@ -679,6 +737,54 @@ pub(crate) mod tests {
         g.nodes[0].text = "The app is in src/.".into();
         assert_eq!(stored(g.clone()).version, 4);
         check(&stored(g)).unwrap();
+    }
+
+    #[test]
+    fn a_graph_with_a_tab_title_step_is_a_newer_format() {
+        let mut g = runnable();
+        g.nodes.push(node("t", Kind::Title, &["done"]));
+        assert_eq!(stored(g.clone()).version, 6);
+        check(&stored(g)).unwrap();
+        let read: Node = serde_json::from_value(serde_json::json!({ "id": "t", "kind": "title", "x": 0, "y": 0 })).unwrap();
+        assert_eq!((read.kind, read.name()), (Kind::Title, "Tab title"));
+    }
+
+    #[test]
+    fn a_tab_title_step_has_one_output_no_run_limit_and_needs_no_text() {
+        let mut g = runnable();
+        g.nodes.push(node("t", Kind::Title, &["done"]));
+        g.edges[1].to = "t".into();
+        assert!(problems(&g).is_empty(), "{:?}", problems(&g));
+        g.nodes[3].outputs.push("again".into());
+        assert!(problems(&g).iter().any(|p| p.contains("single output")), "{:?}", problems(&g));
+        let mut g = runnable();
+        let mut t = node("t", Kind::Title, &["done"]);
+        t.max_runs = Some(2);
+        g.nodes.push(t);
+        rejected(&g, "cannot have a run limit");
+    }
+
+    #[test]
+    fn a_tab_title_step_asks_claude_for_a_title_line_from_the_person_s_request() {
+        let mut t = node("t", Kind::Title, &["done"]);
+        let plain = prompt_text(&t);
+        assert!(plain.contains("what I asked") && plain.contains("TITLE:"), "{plain}");
+        assert!(!plain.contains("FLOW: done"), "{plain}");
+        t.text = "Use the ticket number.".into();
+        assert!(prompt_text(&t).contains("Use the ticket number."));
+        assert!(resume_text(&t).contains("TITLE:"));
+    }
+
+    #[test]
+    fn a_title_line_is_read_from_the_end_of_the_reply() {
+        assert_eq!(parse_title("Sure.\n\nTITLE: Fix login bug"), Some("Fix login bug".into()));
+        assert_eq!(parse_title("**Title:** `Fix login bug`\n```"), Some("Fix login bug".into()));
+        assert_eq!(parse_title("title: \"Refactor  the\tparser\""), Some("Refactor the parser".into()));
+        assert_eq!(parse_title(&format!("TITLE: {}", "a".repeat(100))).unwrap().chars().count(), MAX_TAB_TITLE);
+        assert_eq!(parse_title("TITLE: Fix\u{200B}\u{1b}[2J it"), Some("Fix[2J it".into()));
+        for none in ["Fix login bug", "TITLE:", "TITLE: \"\"", "TITLE: x\nmore", "FLOW: done"] {
+            assert_eq!(parse_title(none), None, "{none:?}");
+        }
     }
 
     #[test]

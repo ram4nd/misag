@@ -4,10 +4,12 @@ import type { Channel } from "@tauri-apps/api/core";
 import type { WTerm } from "@wterm/dom";
 import indexHtml from "../index.html?raw";
 import capabilities from "../src-tauri/capabilities/default.json?raw";
+import styleCss from "./style.css?raw";
 import tauriConfig from "../src-tauri/tauri.conf.json?raw";
 import sharedLayout from "../src-tauri/tests/fixtures/layout.json?raw";
 import Sortable from "sortablejs";
 import { boot } from "./main";
+import { LOADER_SYNC_MS } from "./tabs";
 
 // wterm needs WASM and real layout, so the tests drive a stand-in that
 // records writes and exposes the callbacks tabs.ts and terminalView.ts assign.
@@ -984,9 +986,18 @@ describe("tab icons", () => {
     terms()[0].onTitle!("◐ Claude Code");
     const after = Date.now();
     const delay = -parseInt(tabs()[0].querySelector<HTMLElement>(".icon")!.style.animationDelay);
-    // 16s holds whole cycles of both the 1s spin and the 3.2s reduced-motion pulse.
-    const phases = Array.from({ length: after - before + 1 }, (_, i) => (before + i) % 16_000);
+    const phases = Array.from({ length: after - before + 1 }, (_, i) => (before + i) % LOADER_SYNC_MS);
     expect(phases).toContain(delay);
+  });
+
+  test("the clock sync holds whole cycles of every busy loader animation in style.css", () => {
+    const rules = [...styleCss.matchAll(/\.tab\.busy \.icon \{[^}]*animation: [\w-]+ ([\d.]+)s[^;}]*?( alternate)?;/g)];
+    expect(rules).toHaveLength(2);
+    for (const [, seconds, alternate] of rules) {
+      // An alternating animation comes back to its start only after two runs.
+      const cycle = Number(seconds) * 1000 * (alternate ? 2 : 1);
+      expect(LOADER_SYNC_MS % cycle, `${seconds}s${alternate ?? ""}`).toBe(0);
+    }
   });
 
   test("a tab shows Claude working while its title has a spinner", async () => {

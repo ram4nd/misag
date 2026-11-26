@@ -2013,3 +2013,63 @@ fn paste_tokens_stay_within_what_javascript_holds_exactly() {
         assert!((1..(1 << 53) - 1).contains(&token), "{token}");
     }
 }
+
+/// Start → a tab title step → a prompt that passes to an end.
+fn titled() -> Graph {
+    graph(
+        vec![node("t", Kind::Title, &["done"]), node("p", Kind::Prompt, &["pass"]), node("e", Kind::End, &[])],
+        vec![edge("start", "next", "t"), edge("t", "done", "p"), edge("p", "pass", "e")],
+    )
+}
+
+fn titles(conn: &mut Connection) -> Vec<(String, String)> {
+    take_tab_titles(conn).unwrap().into_iter().map(|t| (t.tab_id, t.title)).collect()
+}
+
+#[test]
+fn a_tab_title_step_has_claude_name_the_tab_and_goes_on() {
+    let g = titled();
+    let (_db, mut conn, flow) = setup("runs-title", &g);
+    assert_eq!(begin(&mut conn, flow, &tab("t1")).unwrap().prompt, prompt_of(&g, "t"));
+    assert_eq!(only_run(&conn).step_kind, Some(Kind::Title));
+    assert!(titles(&mut conn).is_empty());
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("TITLE: Fix login bug")).unwrap(), prompt_of(&g, "p"));
+    assert_eq!(titles(&mut conn), vec![("t1".to_string(), "Fix login bug".to_string())]);
+    assert!(titles(&mut conn).is_empty(), "a title is handed over once");
+}
+
+#[test]
+fn a_reply_without_a_title_line_needs_attention_and_continue_asks_again() {
+    let g = titled();
+    let (_db, mut conn, flow) = setup("runs-title-missing", &g);
+    let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fix login bug")).unwrap(), None);
+    let waiting = only_run(&conn);
+    assert_eq!((waiting.status, waiting.resumable), (Status::Attention, true));
+    assert!(waiting.note.unwrap().contains("TITLE line"));
+    assert!(go_on(&mut conn, run).unwrap().contains("TITLE:"));
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("TITLE: Login")).unwrap(), prompt_of(&g, "p"));
+    assert_eq!(titles(&mut conn), vec![("t1".to_string(), "Login".to_string())]);
+    // A title line while the run waits for the person moves it on too.
+    let (_db, mut conn, flow) = setup("runs-title-waiting", &g);
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    on_stop(&mut conn, &tab("t1"), Some("FLOW: attention")).unwrap();
+    assert!(only_run(&conn).note.unwrap().contains("asked for a person"));
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("TITLE: Login")).unwrap(), prompt_of(&g, "p"));
+    assert_eq!(titles(&mut conn).len(), 1);
+}
+
+#[test]
+fn a_title_step_skipped_by_the_person_names_nothing_and_one_that_ends_the_run_still_does() {
+    let g = titled();
+    let (_db, mut conn, flow) = setup("runs-title-skip", &g);
+    let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    assert_eq!(pick(&mut conn, run, "done").unwrap(), prompt_of(&g, "p"));
+    assert!(titles(&mut conn).is_empty());
+    let last = graph(vec![node("t", Kind::Title, &["done"])], vec![edge("start", "next", "t")]);
+    let (_db, mut conn, flow) = setup("runs-title-last", &last);
+    begin(&mut conn, flow, &tab("t2")).unwrap();
+    assert_eq!(on_stop(&mut conn, &tab("t2"), Some("TITLE: Done")).unwrap(), None);
+    assert!(active(&conn).unwrap().is_empty());
+    assert_eq!(titles(&mut conn), vec![("t2".to_string(), "Done".to_string())]);
+}

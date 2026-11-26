@@ -869,6 +869,13 @@ fn poll_runs(db: &Db) -> Result<Vec<crate::runs::Run>, String> {
     db.with_conn(|c| runs::active(c))
 }
 
+/// The tab titles Claude wrote at flow tab title steps since the last call, for the
+/// page to name the tabs (see `runs::take_tab_titles`). The page polls this with the runs.
+#[tauri::command(async)]
+pub fn flow_tab_titles(db: State<'_, Db>) -> Result<Vec<crate::runs::TabTitle>, CommandError> {
+    Ok(db.with_conn(runs::take_tab_titles)?)
+}
+
 #[tauri::command(async)]
 pub fn flow_delete(db: State<'_, Db>, id: i64) -> Result<(), CommandError> {
     Ok(db.delete_flow(id)?)

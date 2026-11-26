@@ -12,6 +12,8 @@ const backend = vi.hoisted(() => ({
   runsReplies: [] as Promise<unknown[]>[],
   /** What flow_runs returns once `runsReplies` is used up. */
   runs: [] as unknown[],
+  /** What flow_tab_titles returns, or the error it fails with. */
+  tabTitles: [] as { tabId: string; title: string }[] | Error,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -24,6 +26,10 @@ vi.mock("@tauri-apps/api/core", () => ({
     }
     if (cmd === "flow_start") return backend.started;
     if (cmd === "flow_runs") return backend.runsReplies.shift() ?? backend.runs;
+    if (cmd === "flow_tab_titles") {
+      if (backend.tabTitles instanceof Error) throw backend.tabTitles;
+      return backend.tabTitles;
+    }
     if (cmd === "flow_prefill_text") return { text: "Fix the issues", token: 1 };
     if (cmd === "flow_continue") return { stepId: "fix", prompt: "Fix what the review found", briefs: true };
     if (cmd === "flow_resume") return { stepId: "s", prompt: "Go on with the step", briefs: false };
@@ -53,6 +59,8 @@ let onLock: () => void;
 const tab: Tab = { tabId: "t1" };
 /** The ids of the runs shown each time the list is drawn. */
 let shownRuns: number[][];
+/** Each tab title the controller gave a tab, as "tabId: title". */
+let retitled: string[];
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -68,7 +76,9 @@ beforeEach(() => {
   backend.runs = [];
   backend.unsentReply = true;
   backend.runsReplies = [];
+  backend.tabTitles = [];
   shownRuns = [];
+  retitled = [];
   backend.started = { runId: 7, clear: false, prompt: "Review the diff" };
   runs = createRunController<Tab>({
     flows: { showRuns: (here) => shownRuns.push(here.map((r) => r.id)), showBoxError: () => {}, reload: async () => {} },
@@ -82,6 +92,7 @@ beforeEach(() => {
     write: (_t, data) => write(decoder.decode(data)),
     editors: () => [],
     markWaiting: () => {},
+    retitle: (t, title) => retitled.push(`${t.tabId}: ${title}`),
     lockChanged: (_t, locked) => {
       locks.push(locked);
       onLock();
@@ -113,9 +124,83 @@ describe("a flow sending a prompt", () => {
     expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
   });
 
+  for (const [key, chunks] of [
+    ["Alt+Enter", ["first line", "\x1b\r"]],
+    ["a backslash before Enter", ["first line\\", "\r"]],
+    ["a backslash and Enter at once", ["first line\\\r"]],
+  ] as const) {
+    test(`a newline from ${key} leaves the input counted as typed in`, async () => {
+      for (const chunk of chunks) runs.typed(tab, chunk);
+      const done = runs.start(flow);
+      await vi.runAllTimersAsync();
+      await done;
+      expect(typed[0]).toBe("\x03");
+    });
+  }
+
+  for (const [key, chunks] of [
+    ["Esc pressed on its own before Enter", ["half a thought", "\x1b", "\r"]],
+    ["an Enter after a newline", ["first line\\", "\r", "\r"]],
+    ["an Enter after Alt+Enter", ["first line", "\x1b\r", "\r"]],
+    ["a backslash and a focus report before Enter", ["first line\\", "\x1b[I", "\r", "\r"]],
+  ] as const) {
+    test(`${key} sends the input`, async () => {
+      for (const chunk of chunks) runs.typed(tab, chunk);
+      const done = runs.start(flow);
+      await vi.runAllTimersAsync();
+      await done;
+      expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
+    });
+  }
+
+  test("a backslash the flow cleared away does not turn the next Enter into a newline", async () => {
+    runs.typed(tab, "half a thought\\");
+    let done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    runs.typed(tab, "\r");
+    typed = [];
+    done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
+  });
+
   test("a focus report from the terminal does not count as typing", async () => {
     runs.typed(tab, "\x1b[O");
     runs.typed(tab, "\x1b[I");
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
+  });
+
+  test.each([
+    ["an OSC color reply (BEL)", "\x1b]11;rgb:1e1e/1e1e/1e1e\x07"],
+    ["an OSC color reply (ST)", "\x1b]10;rgb:ffff/ffff/ffff\x1b\\"],
+    ["a DCS reply", "\x1bP1$r0m\x1b\\"],
+    ["a primary device attributes reply", "\x1b[?62;22c"],
+    ["a secondary device attributes reply", "\x1b[>1;10;0c"],
+    ["a cursor position report", "\x1b[12;40R"],
+    ["a status report", "\x1b[0n"],
+    ["a color scheme report", "\x1b[?997;1n"],
+    ["a mode report", "\x1b[?2026;2$y"],
+    ["a window size report", "\x1b[8;40;120t"],
+    ["a kitty keyboard flags reply", "\x1b[?1u"],
+    ["an SGR mouse report", "\x1b[<64;10;5M\x1b[<0;10;5m"],
+    ["an urxvt mouse report", "\x1b[96;10;5M"],
+    ["an X10 mouse report", "\x1b[M`*%"],
+  ])("%s from the terminal does not count as typing", async (_name, reply) => {
+    runs.typed(tab, reply);
+    const done = runs.start(flow);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(typed).toEqual(["\x1b[200~Review the diff\x1b[201~", "\r"]);
+  });
+
+  test("a terminal reply after an Enter still sends the input", async () => {
+    runs.typed(tab, "half a thought");
+    runs.typed(tab, "\r\x1b]11;rgb:1e1e/1e1e/1e1e\x07");
     const done = runs.start(flow);
     await vi.runAllTimersAsync();
     await done;
@@ -425,3 +510,23 @@ describe("a tab that does not take what is typed", () => {
   });
 });
 
+
+describe("a tab title step", () => {
+  test("names the open tab Claude titled and skips one that is gone", async () => {
+    backend.tabTitles = [
+      { tabId: "t1", title: "Fix login bug" },
+      { tabId: "closed", title: "Old" },
+    ];
+    await runs.poll();
+    expect(retitled).toEqual(["t1: Fix login bug"]);
+  });
+
+  test("titles that cannot be read leave the runs shown", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    backend.tabTitles = new Error("busy");
+    backend.runs = [{ id: 3, tabId: "t1", status: "running", outputs: [] }];
+    await runs.poll();
+    expect(retitled).toEqual([]);
+    expect(shownRuns.at(-1)).toEqual([3]);
+  });
+});

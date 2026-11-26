@@ -511,6 +511,7 @@ pub fn run() {
             commands::flow_unsent,
             commands::flow_stop,
             commands::flow_runs,
+            commands::flow_tab_titles,
             commands::flow_stop_tab,
         ])
         .build(tauri::generate_context!())
@@ -623,6 +624,7 @@ mod tests {
                 briefing: false,
             },
             "prefill": runs::Prefill { text: "Fix it".into(), token: 7 },
+            "tabTitle": runs::TabTitle { tab_id: "tab-1".into(), title: "Fix login".into() },
             "started": runs::Started { run_id: 1, clear: true, prompt: Some("Go".into()) },
             "cleared": [runs::Cleared::Pending, runs::Cleared::Ready { prompt: Some("Go".into()) }, runs::Cleared::Gone],
             "flow": db::FlowSummary { id: 1, name: "Deploy".into(), archived: false, clear: true, unconfirmed: true },
