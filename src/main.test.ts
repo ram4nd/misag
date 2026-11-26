@@ -262,7 +262,9 @@ type Flow = { id: number; name: string; archived: boolean; unconfirmed?: boolean
 let storedFlows: Flow[];
 /** Flows that flow_delete refuses, as the runner will for running ones. */
 let busyFlows: Set<number>;
-type Step = { id: string; kind: string; title: string; text: string; outputs: string[]; clear?: boolean; x: number; y: number };
+type Step = {
+  id: string; kind: string; title: string; text: string; outputs: string[]; clear?: boolean; pause?: boolean; draft?: boolean; note?: string; x: number; y: number;
+};
 type Graph = { nodes: Step[]; edges: { from: string; output: string; to: string }[] };
 const START: Step = { id: "start", kind: "start", title: "Start", text: "", outputs: ["next"], x: 40, y: 40 };
 /** Each flow's stored graph; a flow without one has only its Start step. */
@@ -272,7 +274,7 @@ let flowProblems: string[];
 type Run = {
   id: number; flowId: number; flowName: string; tabId: string; stepId: string; step: string;
   status: "running" | "manual" | "attention"; note: string | null; outputs: string[]; steps: number; done: number; total: number; resumable: boolean; prefill: boolean;
-  stepKind: "start" | "prompt" | "manual" | "manual_prompt" | "end" | null; briefing: boolean;
+  stepKind: "start" | "prompt" | "title" | "end" | null; briefing: boolean; suggested: string | null; awaitsPrompt: boolean;
 };
 /** What flow_runs reports. */
 let activeRuns: Run[];
@@ -3765,7 +3767,7 @@ describe("flows", () => {
     const row = rowOf("a");
     activeRuns = [{
       id: 5, flowId: 1, flowName: "a", tabId: "gone", stepId: "p", step: "P", status: "running", note: null,
-      outputs: ["pass"], steps: 1, done: 0, total: 1, resumable: false, prefill: false, stepKind: "prompt", briefing: false,
+      outputs: ["pass"], steps: 1, done: 0, total: 1, resumable: false, prefill: false, stepKind: "prompt", briefing: false, suggested: null, awaitsPrompt: false,
     }];
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
     await settle();
@@ -4032,10 +4034,10 @@ describe("flow editor", () => {
     await startApp();
     await openFromBox("Deploy");
     tool("add-prompt").click();
-    tool("add-pause").click();
+    tool("add-title").click();
     tool("add-end").click();
     await settle();
-    expect(titles()).toEqual(["Start", "Prompt", "Pause", "End"]);
+    expect(titles()).toEqual(["Start", "Prompt", "Tab title", "End"]);
     expect(callsOf("flow_save_graph")).toHaveLength(0);
     await afterSave();
     expect(callsOf("flow_save_graph")).toHaveLength(1);
@@ -4043,7 +4045,7 @@ describe("flow editor", () => {
     expect(graph.nodes.map((n) => [n.kind, n.outputs])).toEqual([
       ["start", ["next"]],
       ["prompt", ["done"]],
-      ["manual", ["done"]],
+      ["title", ["done"]],
       ["end", []],
     ]);
     expect(new Set(graph.nodes.map((n) => n.id)).size).toBe(4);
@@ -4128,10 +4130,10 @@ describe("flow editor", () => {
     expect(node("P").querySelector(".limit")).toBeNull();
     await select("Start");
     expect(field("maxRuns").closest("label")!.hidden).toBe(true);
-    // Leaving a manual step is always your pick, which no limit holds back.
-    tool("add-pause").click();
+    // Naming the tab again and again needs no limit.
+    tool("add-title").click();
     await settle();
-    await select("Pause");
+    await select("Tab title");
     expect(field("maxRuns").closest("label")!.hidden).toBe(true);
   });
 
@@ -4257,58 +4259,93 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await startApp();
     await openFromBox("Deploy");
-    tool("add-pause").click();
+    tool("add-title").click();
     await afterSave();
     const first = saved()!.nodes[1].id;
-    await select("Pause");
+    await select("Tab title");
     panel().querySelector<HTMLButtonElement>("button.delete-step")!.click();
-    tool("add-pause").click();
+    tool("add-title").click();
     await afterSave();
     expect(saved()!.nodes[1].id).not.toBe(first);
   });
 
-  test("a manual step has no outputs field, as it goes on one way", async () => {
+  test("there is one kind of prompt step, with no Pause or Manual prompt buttons", async () => {
     storedFlows = flows("Deploy");
     await startApp();
     await openFromBox("Deploy");
-    tool("add-pause").click();
-    await settle();
-    await select("Pause");
-    expect(field("outputs").closest("label")!.hidden).toBe(true);
+    expect(editor().querySelector("button.add-pause")).toBeNull();
+    expect(editor().querySelector("button.add-manual-prompt")).toBeNull();
   });
 
-  test("a manual prompt has a draft, one output and no run limit", async () => {
+  test("a prompt step can pause when done, with a note, and only waits without a prompt", async () => {
     storedFlows = flows("Deploy");
     await startApp();
     await openFromBox("Deploy");
-    tool("add-manual-prompt").click();
+    tool("add-prompt").click();
     await settle();
-    await select("Manual prompt");
-    expect(field("text").closest("label")!.hidden).toBe(false);
-    expect(panel().querySelector(".text-label")!.textContent).toContain("Draft");
-    expect(field("outputs").closest("label")!.hidden).toBe(true);
-    expect(field("maxRuns").closest("label")!.hidden).toBe(true);
+    await select("Prompt");
+    const pause = field("pause") as HTMLInputElement;
+    expect(pause.closest("label")!.hidden).toBe(false);
+    expect(field("note").closest("label")!.hidden, "the note goes with a pause").toBe(true);
+    pause.checked = true;
+    pause.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(field("note").closest("label")!.hidden).toBe(false);
+    expect(field("outputs").closest("label")!.hidden, "a pause may go on several ways").toBe(false);
+    expect(field("maxRuns").closest("label")!.hidden).toBe(false);
+    // With no prompt, it only waits, as the canvas says.
+    expect(node("Prompt").querySelector(".kind")!.textContent).toContain("Pause");
+    await edit("note", "Try the form.");
     await afterSave();
-    expect(saved()!.nodes.map((n) => [n.kind, n.outputs])).toEqual([
-      ["start", ["next"]],
-      ["manual_prompt", ["sent"]],
-    ]);
+    expect(saved()!.nodes[1]).toMatchObject({ kind: "prompt", pause: true, note: "Try the form." });
+    // With a prompt, Claude answers first, and the canvas marks the pause.
+    await edit("text", "Fix the form.");
+    expect(node("Prompt").querySelector(".kind")!.textContent).toMatch(/^Prompt/);
+    expect(node("Prompt").querySelector(".pauses")).not.toBeNull();
+    pause.checked = false;
+    pause.dispatchEvent(new Event("change", { bubbles: true }));
+    await afterSave();
+    expect(saved()!.nodes[1]).not.toHaveProperty("pause");
+    // The note goes with the pause: it would never be shown.
+    expect(saved()!.nodes[1]).not.toHaveProperty("note");
+    expect(node("Prompt").querySelector(".pauses")).toBeNull();
   });
 
-  test("a manual prompt from a flow file with several outputs says it has one", async () => {
+  test("a prompt step can be yours to write, its text a draft", async () => {
     storedFlows = flows("Deploy");
-    storedGraphs[1] = { nodes: [START, step("m", "manual_prompt", "Ask", ["a", "b"])], edges: [] };
+    await startApp();
+    await openFromBox("Deploy");
+    tool("add-prompt").click();
+    await settle();
+    await select("Prompt");
+    const draft = field("draft") as HTMLInputElement;
+    draft.checked = true;
+    draft.dispatchEvent(new Event("change", { bubbles: true }));
+    await settle();
+    expect(panel().querySelector(".text-label")!.textContent).toContain("Draft");
+    expect(field("outputs").closest("label")!.hidden).toBe(false);
+    expect(node("Prompt").querySelector(".kind")!.textContent).toContain("Manual prompt");
+    await afterSave();
+    expect(saved()!.nodes[1]).toMatchObject({ kind: "prompt", draft: true, outputs: ["done"] });
+    await select("Start");
+    expect(field("draft").closest("label")!.hidden).toBe(true);
+    expect(field("pause").closest("label")!.hidden).toBe(true);
+  });
+
+  test("a tab title from a flow file with several outputs says it has one", async () => {
+    storedFlows = flows("Deploy");
+    storedGraphs[1] = { nodes: [START, step("m", "title", "Ask", ["a", "b"])], edges: [] };
     await startApp();
     await openFromBox("Deploy");
     await select("Ask");
     await edit("outputs", "a, c");
-    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A manual prompt has one output");
+    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A tab title step has one output");
   });
 
-  test("a manual step from an older flow with several outputs shows them, to cut down to one", async () => {
+  test("a tab title from a flow file with several outputs shows them, to cut down to one", async () => {
     storedFlows = flows("Deploy");
     storedGraphs[1] = {
-      nodes: [START, step("m", "manual", "Review", ["approve", "reject"]), step("p", "prompt", "Fix", ["done"], "fix it")],
+      nodes: [START, step("m", "title", "Review", ["approve", "reject"]), step("p", "prompt", "Fix", ["done"], "fix it")],
       edges: [{ from: "m", output: "reject", to: "p" }],
     };
     await startApp();
@@ -4316,7 +4353,7 @@ describe("flow editor", () => {
     await select("Review");
     expect(field("outputs").closest("label")!.hidden).toBe(false);
     await edit("outputs", "approve, again");
-    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A pause has one output");
+    expect(panel().querySelector<HTMLElement>(".invalid")!.textContent).toContain("A tab title step has one output");
     await edit("outputs", "approve");
     await afterSave();
     expect(saved()!.nodes.find((n) => n.id === "m")!.outputs).toEqual(["approve"]);
@@ -4403,7 +4440,7 @@ describe("flow editor", () => {
       await startApp();
       await openFromBox("Deploy");
       tool("add-prompt").click();
-      tool("add-pause").click();
+      tool("add-title").click();
       await settle();
       await ctrl("z");
       expect(titles()).toEqual(["Start", "Prompt"]);
@@ -4416,9 +4453,9 @@ describe("flow editor", () => {
       expect(titles()).toEqual(["Start", "Prompt"]);
       await ctrl("y");
       await ctrl("y");
-      expect(titles()).toEqual(["Start", "Prompt", "Pause"]);
+      expect(titles()).toEqual(["Start", "Prompt", "Tab title"]);
       await afterSave();
-      expect(saved()!.nodes.map((n) => n.kind)).toEqual(["start", "prompt", "manual"]);
+      expect(saved()!.nodes.map((n) => n.kind)).toEqual(["start", "prompt", "title"]);
     });
 
     test("typing in a field is taken back as one step, and the panel shows it", async () => {
@@ -4591,7 +4628,7 @@ describe("flow editor", () => {
     const problems = () => [...editor().querySelectorAll(".problems li")].map((li) => li.textContent);
     expect(problems()).toEqual(["Start is not connected to a step."]);
     flowProblems = [];
-    tool("add-pause").click();
+    tool("add-title").click();
     await afterSave();
     expect(problems()).toEqual([]);
     expect(editor().querySelector(".problems")!.textContent).toContain("Ready to run");
@@ -4602,12 +4639,12 @@ describe("flow editor", () => {
     await startApp();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-pause").click();
+    tool("add-title").click();
     await afterSave();
     expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(false);
     expect(editor().querySelector(".error")!.textContent).toContain("flow_save_graph failed");
     failing.delete("flow_save_graph");
-    tool("add-pause").click();
+    tool("add-title").click();
     await afterSave();
     expect(editor().querySelector<HTMLElement>(".error")!.hidden).toBe(true);
     expect(storedGraphs[1].nodes).toHaveLength(3);
@@ -4617,11 +4654,11 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await startApp();
     await openFromBox("Deploy");
-    tool("add-pause").click();
+    tool("add-title").click();
     await settle();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await settle();
-    expect(storedGraphs[1].nodes.map((n) => n.kind)).toEqual(["start", "manual"]);
+    expect(storedGraphs[1].nodes.map((n) => n.kind)).toEqual(["start", "title"]);
     expect(tabs()).toHaveLength(0);
   });
 
@@ -4630,7 +4667,7 @@ describe("flow editor", () => {
     await startApp();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-pause").click();
+    tool("add-title").click();
     await settle();
     tabs()[0].querySelector<HTMLButtonElement>(".x")!.click();
     await settle();
@@ -4648,7 +4685,7 @@ describe("flow editor", () => {
     storedFlows = flows("Deploy");
     await startApp();
     await openFromBox("Deploy");
-    tool("add-pause").click();
+    tool("add-title").click();
     await settle();
     await win.closeRequested!();
     expect(win.prevented).toBe(false);
@@ -4660,7 +4697,7 @@ describe("flow editor", () => {
     await startApp();
     await openFromBox("Deploy");
     failing.add("flow_save_graph");
-    tool("add-pause").click();
+    tool("add-title").click();
     await settle();
     await win.closeRequested!();
     expect(win.prevented).toBe(true);
@@ -4692,7 +4729,7 @@ describe("flow editor", () => {
     await settle();
     expect(tabNames()).toEqual(["Ship", "Flows"]);
     // A change still waiting is dropped with the flow, not saved into nothing.
-    document.querySelector<HTMLElement>(".page.flow-editor button.add-pause")!.click();
+    document.querySelector<HTMLElement>(".page.flow-editor button.add-title")!.click();
     rows()[0].querySelector<HTMLButtonElement>("button.delete")!.click();
     await settle();
     await vi.advanceTimersByTimeAsync(SAVE_MS);
@@ -4715,7 +4752,7 @@ describe("flow runs", () => {
   const step = (id: string, kind: Step["kind"], title: string, outputs: string[]): Step => ({ id, kind, title, text: "x", outputs, x: 0, y: 0 });
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, done: 0, total: 2, resumable: false, prefill: false, stepKind: "prompt", briefing: false, ...over,
+    status: "running", note: null, outputs: ["pass", "fail"], steps: 1, done: 0, total: 2, resumable: false, prefill: false, stepKind: "prompt", briefing: false, suggested: null, awaitsPrompt: false, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);
@@ -4735,7 +4772,7 @@ describe("flow runs", () => {
   beforeEach(() => {
     storedFlows = [{ id: 1, name: "Deploy", archived: false }, { id: 2, name: "Review", archived: false }];
     storedGraphs[1] = {
-      nodes: [START, step("p", "prompt", "Fix the tests", ["pass", "fail"]), step("m", "manual", "Check the form", ["ok"])],
+      nodes: [START, step("p", "prompt", "Fix the tests", ["pass", "fail"]), { ...step("m", "prompt", "Check the form", ["ok"]), text: "", pause: true }],
       edges: [{ from: "start", output: "next", to: "p" }, { from: "p", output: "pass", to: "m" }],
     };
   });
@@ -4943,7 +4980,7 @@ describe("flow runs", () => {
 
   /** A run waiting at the manual prompt "Ask" in the first Claude tab. */
   const atManualPrompt = (over: Partial<Run> = {}) =>
-    run({ tabId: spawns()[0].tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], stepKind: "manual_prompt", ...over });
+    run({ tabId: spawns()[0].tabId, status: "manual", stepId: "mp", step: "Ask", outputs: ["sent"], awaitsPrompt: true, ...over });
 
   test("a manual prompt does not wipe what the person is typing, and says how to get its draft", async () => {
     prefills = [{ text: "Draft", token: 7 }];
@@ -5191,6 +5228,44 @@ describe("flow runs", () => {
     activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["approve", "reject"] })];
     await poll();
     expect(flowRow("Deploy").querySelector("button.go-on")).toBeNull();
+  });
+
+  test("a step that paused once Claude answered offers ▶ for Claude's pick, and the others besides", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [
+      run({ tabId: spawns()[0].tabId, status: "manual", stepId: "p", step: "Fix the tests", outputs: ["pass", "fail"], suggested: "pass", note: "Check the diff." }),
+    ];
+    await poll();
+    const go = flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!;
+    expect(go.title).toContain('"pass", as Claude picked');
+    expect([...flowRow("Deploy").querySelectorAll(".picks button")].map((b) => b.textContent)).toEqual(["pass", "fail"]);
+    expect(flowRow("Deploy").title).toContain("Check the diff.");
+    go.click();
+    await settle();
+    expect(callsOf("flow_continue").map((c) => c.args.output)).toEqual(["pass"]);
+    // The run bar marks Claude's pick among the outputs.
+    await open("Deploy");
+    expect(outputs().filter((b) => b.classList.contains("suggested")).map((b) => b.textContent)).toEqual(["pass"]);
+    expect(runBar().querySelector(".note")!.textContent).toBe("Check the diff.");
+  });
+
+  test("a pause with no pick from Claude and several outputs offers only the picks", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "m", step: "Review", outputs: ["approve", "reject"], suggested: null })];
+    await poll();
+    expect(flowRow("Deploy").querySelector("button.go-on")).toBeNull();
+    expect([...flowRow("Deploy").querySelectorAll(".picks button")].map((b) => b.textContent)).toEqual(["approve", "reject"]);
+  });
+
+  test("Claude's pick at a one-output step is ▶ alone, with no picks line", async () => {
+    await startApp();
+    await openClaudeTabs(1);
+    activeRuns = [run({ tabId: spawns()[0].tabId, status: "manual", stepId: "p", step: "Fix", outputs: ["done"], suggested: "done" })];
+    await poll();
+    expect(flowRow("Deploy").querySelector<HTMLButtonElement>("button.go-on")!.title).toContain("as Claude picked");
+    expect(flowRow("Deploy").querySelector(".picks")).toBeNull();
   });
 
   test("a pick in the flow list that cannot go on says why", async () => {
@@ -5509,7 +5584,7 @@ describe("flow runs and Claude's state", () => {
   const runError = () => document.querySelector<HTMLElement>(".page.flow-editor.active .run-bar .run-error")!;
   const run = (over: Partial<Run> = {}): Run => ({
     id: 5, flowId: 1, flowName: "Deploy", tabId: "", stepId: "p", step: "Fix the tests",
-    status: "manual", note: null, outputs: ["ok"], steps: 1, done: 0, total: 2, resumable: false, prefill: false, stepKind: "prompt", briefing: false, ...over,
+    status: "manual", note: null, outputs: ["ok"], steps: 1, done: 0, total: 2, resumable: false, prefill: false, stepKind: "prompt", briefing: false, suggested: null, awaitsPrompt: false, ...over,
   });
   async function poll() {
     await vi.advanceTimersByTimeAsync(TAB_POLL_MS);

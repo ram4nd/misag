@@ -60,8 +60,8 @@ A flow file:
        "text": "Fix the failing tests.", "outputs": ["done"]},
       {"id": "review", "kind": "prompt", "title": "Review", "maxRuns": 3,
        "text": "Review the change for bugs.", "outputs": ["ok", "changes"]},
-      {"id": "try", "kind": "manual", "title": "Try it",
-       "text": "Try the change in the app.", "outputs": ["done"]}
+      {"id": "try", "kind": "prompt", "title": "Try it", "pause": true,
+       "note": "Try the change in the app.", "outputs": ["done"]}
     ],
     "edges": [
       {"from": "start", "output": "next", "to": "fix"},
@@ -80,17 +80,10 @@ Steps ("nodes"):
             "prompt": sends "text" to Claude in the run's tab. misag adds an
               instruction to do only this step and to end the reply with
               "FLOW: <output>", which picks the output, so the text need not
-              mention the outputs.
-            "manual": a pause, shown as Pause in the app ("pause" is read
-              too): waits for the person, who goes on with ▶ in the app or
-              stops the run with ■; "text" says what to do. It has exactly
-              one output; a flow with more still imports, but does not run
-              until it has one.
-            "manual_prompt": puts "text" (an optional draft; after a /clear,
-              led by Start's base info) into Claude's input without sending
-              it. The person writes the prompt and sends it, and the run goes
-              on by the step's one output once Claude answers it; ▶ skips
-              the step.
+              mention the outputs. See "pause" and "draft" for the person's
+              part in it. ("manual", "pause" and "manual_prompt", the kinds
+              older versions wrote, are read as prompt steps with "pause"
+              or "draft".)
             "title": has Claude name the run's tab after what the person
               asked it. Claude replies with "TITLE: <title>", which becomes
               the tab's name, and the run goes on by the step's one output.
@@ -98,8 +91,9 @@ Steps ("nodes"):
             "end": ends the run and has no outputs. Optional: an output that
               leads nowhere ends it too.
   title     The step's name on the canvas (up to 200 characters).
-  text      The prompt, what the person does at a pause, a manual prompt's
-            draft, or a tab title's guidance (up to 20000 characters).
+  text      The prompt, a draft (see "draft"), or a tab title's guidance (up
+            to 20000 characters). A prompt step with "pause" and no text
+            only waits for the person.
             Optional on Start: base info, such as where things are (up to
             4000 characters). A run first briefs Claude with the flow's
             rules (one step at a time, end each with "FLOW: <output>") and
@@ -109,13 +103,33 @@ Steps ("nodes"):
             the flow is finished (unless a /clear came first).
   outputs   How the step can end: 1 to 8 short lowercase words (a-z, 0-9, -
             and _, starting with a letter or digit, up to 24 characters); a
-            pause, manual prompt or tab title has exactly one. "attention" is reserved:
+            tab title has exactly one. "attention" is reserved:
             Claude ends with it to ask for the person.
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run
-            waits for the person.
+            waits for the person at the step before. It holds back the flow
+            only, also at a pause or a draft step: the person can always go
+            on into the step.
   clear     Optional, Start only: true begins each run by typing /clear, so
             Claude starts the flow in a new conversation.
+  pause     Optional, prompt steps only: true has the run wait for the person
+            once Claude has answered, with the output Claude picked
+            suggested: ▶ in the app goes on by it, or the person picks
+            another, or stops the run with ■. Without "text", the step
+            only waits.
+  note      Optional, and only with "pause": what the person is to do
+            there, shown while the run waits (up to 20000 characters);
+            never sent to Claude.
+  draft     Optional, prompt steps only: true puts "text" (an optional
+            draft; after a /clear, led by Start's base info) into Claude's
+            input without sending it. The person writes the prompt and
+            sends it, and once Claude answers, the run goes on by the
+            step's output (with several, Claude is asked to end with a
+            FLOW line naming one). With one output, ▶ skips the step; with
+            several, the person picks one to skip it. With "pause" too, the
+            run waits for the person again once Claude has answered.
+  ("manual", "pause" and "manual_prompt" steps cannot also have "pause",
+  "draft" or "note": write them as "prompt" steps.)
   x, y      Optional position on the canvas: give both or neither. Steps
             without one are laid out in columns from Start.
 

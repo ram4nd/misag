@@ -36,6 +36,7 @@
     "token": 7
   },
   "run": {
+    "awaitsPrompt": false,
     "briefing": false,
     "done": 1,
     "flowId": 2,
@@ -52,6 +53,7 @@
     "stepId": "p",
     "stepKind": "prompt",
     "steps": 3,
+    "suggested": "done",
     "tabId": "tab-1",
     "total": 4
   },

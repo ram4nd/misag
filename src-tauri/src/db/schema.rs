@@ -277,6 +277,15 @@ const MIGRATIONS: &[&str] = &[r#"
         tab_id TEXT PRIMARY KEY,
         title  TEXT NOT NULL
     );
+"#, r#"
+    -- The output Claude picked at a prompt step that pauses once done, which the
+    -- person goes on by with ▶ (see runs::Phase::Waiting): set only while the run
+    -- waits for the person, owing no paste (Claude has already answered). Like
+    -- typed, it holds active runs only: an ended run keeps what it was left with,
+    -- and runs::RunState::from_columns ignores it there.
+    ALTER TABLE flow_runs ADD COLUMN suggested TEXT
+        CONSTRAINT suggested_only_when_waiting
+        CHECK (suggested IS NULL OR status IN ('done', 'stopped') OR (status = 'manual' AND prefill = 0));
 "#];
 
 /// The index in MIGRATIONS of the migration adding flow_runs' CHECKs, which
@@ -676,6 +685,32 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_keeps_a_waiting_run_waiting_with_nothing_suggested() {
+        let path = temp_db("upgrade-suggested");
+        let conn = Connection::open(&path).unwrap();
+        let before = MIGRATIONS.iter().position(|m| m.contains("ADD COLUMN suggested")).unwrap();
+        conn.execute_batch(&MIGRATIONS[..before].concat()).unwrap();
+        conn.pragma_update(None, "user_version", before as i64).unwrap();
+        // A pause as the version before stored it, in the flow and in the run's copy.
+        let graph = r#"{"version": 1, "nodes": [{"id": "start", "kind": "start", "outputs": ["next"], "x": 0, "y": 0},
+            {"id": "m", "kind": "manual", "text": "Try it", "outputs": ["ok"], "x": 0, "y": 0}],
+            "edges": [{"from": "start", "output": "next", "to": "m"}]}"#;
+        conn.execute("INSERT INTO flows (name, position, graph, created_at, updated_at) VALUES ('F', 0, ?1, 0, 0)", [graph]).unwrap();
+        conn.execute(
+            "INSERT INTO flow_runs (flow_id, tab_id, graph, node_id, status, started_at, updated_at) VALUES (1, 't1', ?1, 'm', 'manual', 0, 0)",
+            [graph],
+        )
+        .unwrap();
+        drop(conn);
+        Db::open(path.clone()).unwrap();
+        let conn = connect_existing(&path).unwrap();
+        let suggested: Option<String> = conn.query_row("SELECT suggested FROM flow_runs", [], |r| r.get(0)).unwrap();
+        assert_eq!(suggested, None);
+        let runs = crate::runs::active(&conn).unwrap();
+        assert_eq!((runs[0].status, runs[0].suggested.clone(), runs[0].note.as_deref()), (crate::runs::Status::Manual, None, Some("Try it")));
+    }
+
+    #[test]
     fn upgrading_asks_before_running_a_flow_whose_hidden_start_text_now_goes_to_claude() {
         let path = temp_db("upgrade-base-info");
         let conn = Connection::open(&path).unwrap();
@@ -1042,6 +1077,9 @@ mod tests {
             ("status = 'manual', typed = 1", "typed_only_when_running"),
             ("status = 'attention', note = 'why', typed = 2", "typed_only_when_running"),
             ("typed = 3", "typed_only_when_running"),
+            ("suggested = 'ok'", "suggested_only_when_waiting"),
+            ("status = 'attention', note = 'why', suggested = 'ok'", "suggested_only_when_waiting"),
+            ("status = 'manual', prefill = 1, suggested = 'ok'", "suggested_only_when_waiting"),
         ] {
             let e = conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_err().to_string();
             assert!(e.contains("CHECK constraint failed") && e.contains(check), "{set}: {e}");
@@ -1064,8 +1102,10 @@ mod tests {
             "typed = 2",
             "typed = 0",
             "status = 'manual', prefill = 1",
+            "prefill = 0, suggested = 'ok'",
+            "suggested = NULL",
             "status = 'attention', note = 'why', resume = 'remind'",
-            "status = 'stopped', briefing = 1, clear = 'done', closing = 1, typed = 2",
+            "status = 'stopped', briefing = 1, clear = 'done', closing = 1, typed = 2, suggested = 'ok'",
             "status = 'done', closing = 0, prefill = 1",
         ] {
             conn.execute(&format!("UPDATE flow_runs SET {set} WHERE id = ?1"), [run]).unwrap_or_else(|e| panic!("{set}: {e}"));

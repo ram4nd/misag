@@ -1,22 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
 import { createCanvas } from "./canvas";
 import { awaitsPrompt, statusLabel, type Run } from "./flows";
+import { stepMode } from "./stepMode";
 
-/** Mirrors `flows::Kind`; "manual" is a Pause, under the name older misags read. */
-export type StepKind = "start" | "prompt" | "manual" | "manual_prompt" | "title" | "end";
+/** Mirrors `flows::Kind`. A pause and a manual prompt are prompt steps (see `pause` and `draft`). */
+export type StepKind = "start" | "prompt" | "title" | "end";
 
 /** Mirrors `flows::Node`. */
 export interface Step {
   id: string;
   kind: StepKind;
   title: string;
-  /** A prompt, what the person does, a tab title's optional guidance, or for Start: optional base info, sent in the run's briefing. */
+  /** A prompt (or with `draft`, a draft), a tab title's optional guidance, or for Start: optional base info, sent in the run's briefing. */
   text: string;
   outputs: string[];
   /** How many times a run may take the step before it waits for the person; absent: no limit. */
   maxRuns?: number;
   /** For Start: a run begins by typing /clear, in a new conversation; absent: it does not. */
   clear?: boolean;
+  /** For a prompt step: the run waits for you once Claude has answered (with no text, it only waits); absent: it does not. */
+  pause?: boolean;
+  /** For a prompt step: the text is a draft put into Claude's input for you to finish and send; absent: it is sent. */
+  draft?: boolean;
+  /** For a prompt step that pauses: what you are to do there, shown while the run waits; absent: nothing. */
+  note?: string;
   x: number;
   y: number;
 }
@@ -50,10 +57,8 @@ const MAX_RUNS = 100;
 /** How many changes Ctrl+Z can take back. */
 const MAX_UNDO = 100;
 /** The steps the toolbar adds. An End marks where the flow ends; an output with no next step ends it too. */
-const NEW_STEPS: Record<"prompt" | "manual" | "manual_prompt" | "title" | "end", { title: string; outputs: string[] }> = {
+const NEW_STEPS: Record<"prompt" | "title" | "end", { title: string; outputs: string[] }> = {
   prompt: { title: "Prompt", outputs: ["done"] },
-  manual: { title: "Pause", outputs: ["done"] },
-  manual_prompt: { title: "Manual prompt", outputs: ["sent"] },
   title: { title: "Tab title", outputs: ["done"] },
   end: { title: "End", outputs: [] },
 };
@@ -86,9 +91,7 @@ function editorMarkup(): string {
     <form novalidate>
       <fieldset>
         <div class="toolbar">
-          <button type="button" class="add-prompt">+ Prompt</button>
-          <button type="button" class="add-manual-prompt" title="Puts a draft into Claude's input for you to finish and send; goes on once Claude answers">+ Manual prompt</button>
-          <button type="button" class="add-pause" title="Waits for you to do something and press ▶">+ Pause</button>
+          <button type="button" class="add-prompt" title="Sends a prompt to Claude; it can also be yours to write, or wait for you">+ Prompt</button>
           <button type="button" class="add-title" title="Has Claude name the tab after what you asked it, then goes on">+ Tab title</button>
           <button type="button" class="add-end">+ End</button>
           <span class="status" role="status"></span>
@@ -104,7 +107,16 @@ function editorMarkup(): string {
           <aside class="side">
             <div class="panel" hidden>
               <label>Title <input name="title" maxlength="200" /></label>
+              <label class="check"><input name="draft" type="checkbox" /> Write it myself
+                <span class="hint">The text is a draft put into Claude's input for you to finish and send; the step is done once Claude answers you.</span>
+              </label>
               <label><span class="text-label">Prompt</span> <textarea name="text" rows="8" maxlength="20000"></textarea></label>
+              <label class="check"><input name="pause" type="checkbox" /> Pause when done
+                <span class="hint">Once Claude has answered, the run waits for you: ▶ goes on by the output Claude picked, or pick another. With no prompt, the step only waits.</span>
+              </label>
+              <label class="note-field">Note while paused <textarea name="note" rows="3" maxlength="20000" placeholder="Optional: what to do or check before going on, such as: try the form in the browser"></textarea>
+                <span class="hint">Shown while the run waits here; never sent to Claude.</span>
+              </label>
               <label>Outputs <input name="outputs" />
                 <span class="hint">Comma-separated short words, such as <code>yes, no</code>. Each can lead to a next step (an earlier one makes a loop); an output that leads nowhere ends the flow.</span>
               </label>
@@ -142,6 +154,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   const outputs = $<HTMLInputElement>("[name=outputs]");
   const maxRuns = $<HTMLInputElement>("[name=maxRuns]");
   const clear = $<HTMLInputElement>("[name=clear]");
+  const pause = $<HTMLInputElement>("[name=pause]");
+  const draft = $<HTMLInputElement>("[name=draft]");
+  const note = $<HTMLTextAreaElement>("[name=note]");
   maxRuns.max = String(MAX_RUNS);
   const invalidRuns = $<HTMLElement>(".runs-invalid");
   const invalid = $<HTMLElement>(".invalid:not(.runs-invalid)");
@@ -233,19 +248,22 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     text.value = s.text;
     outputs.value = s.outputs.join(", ");
     maxRuns.value = s.maxRuns === undefined ? "" : String(s.maxRuns);
-    const oneWay = s.kind === "manual" || s.kind === "manual_prompt" || s.kind === "title";
+    const prompt = s.kind === "prompt";
     text.closest("label")!.hidden = s.kind === "end";
-    // A pause, manual prompt or tab title goes on one way; only one with several (from an older flow, or a file) shows them to cut down.
-    outputs.closest("label")!.hidden = !(s.kind === "prompt" || (oneWay && s.outputs.length > 1));
-    // Leaving a pause or a manual prompt is always your doing, which no limit holds back.
-    maxRuns.closest("label")!.hidden = s.kind !== "prompt";
+    // A tab title goes on one way; only one with several (from a file) shows them to cut down.
+    outputs.closest("label")!.hidden = !(prompt || (s.kind === "title" && s.outputs.length > 1));
+    maxRuns.closest("label")!.hidden = !prompt;
     clear.checked = s.clear === true;
     clear.closest("label")!.hidden = s.kind !== "start";
+    draft.checked = s.draft === true;
+    pause.checked = s.pause === true;
+    note.value = s.note ?? "";
+    draft.closest("label")!.hidden = !prompt;
+    pause.closest("label")!.hidden = !prompt;
+    note.closest("label")!.hidden = !(prompt && s.pause === true);
     $(".text-label").textContent = {
       start: "Base info",
-      prompt: "Prompt",
-      manual: "What the person does",
-      manual_prompt: "Draft, put into Claude's input for you to finish",
+      prompt: s.draft ? "Draft, put into Claude's input for you to finish" : "Prompt",
       title: "Guidance for the title (optional)",
       end: "",
     }[s.kind];
@@ -255,7 +273,11 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
         ? "Optional: where things are and what Claude should know, sent to Claude in the run's briefing before the first step"
         : s.kind === "title"
           ? "Claude names the tab after what you asked it, in 2 to 6 words. Add guidance if you like, such as: start with the ticket number"
-          : "";
+          : prompt && s.draft
+            ? "Optional: the start of your prompt"
+            : prompt && s.pause
+              ? "Optional with Pause when done: leave empty to only wait for you"
+              : "";
     $<HTMLButtonElement>(".delete-step").hidden = s.kind === "start";
   }
 
@@ -364,8 +386,6 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
   }
 
   $<HTMLButtonElement>(".add-prompt").onclick = () => addStep("prompt");
-  $<HTMLButtonElement>(".add-pause").onclick = () => addStep("manual");
-  $<HTMLButtonElement>(".add-manual-prompt").onclick = () => addStep("manual_prompt");
   $<HTMLButtonElement>(".add-title").onclick = () => addStep("title");
   $<HTMLButtonElement>(".add-end").onclick = () => addStep("end");
   $<HTMLButtonElement>(".delete-step").onclick = () => {
@@ -384,8 +404,30 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     if (!s) return;
     // The canvas marks a Start with base info.
     const marked = s.kind === "start" && s.text.trim() !== "";
+    // The canvas also tells a pause that only waits from one with a prompt.
+    const mode = stepMode(s);
     s.text = text.value;
-    changed(s.kind === "start" && marked !== (s.text.trim() !== ""), `text:${s.id}`);
+    changed((s.kind === "start" && marked !== (s.text.trim() !== "")) || mode !== stepMode(s), `text:${s.id}`);
+  };
+  /** Sets or drops a prompt step's flag, as the selected step's checkbox has it, and redraws the panel for it. */
+  function flag(name: "pause" | "draft", box: HTMLInputElement) {
+    const s = find(selected);
+    if (!s || s.kind !== "prompt") return;
+    if (box.checked) s[name] = true;
+    else delete s[name];
+    // A note only shows at a pause, so it goes with it (the backend refuses one without).
+    if (name === "pause" && !box.checked) delete s.note;
+    showPanel();
+    changed(true);
+  }
+  pause.onchange = () => flag("pause", pause);
+  draft.onchange = () => flag("draft", draft);
+  note.oninput = () => {
+    const s = find(selected);
+    if (!s || s.kind !== "prompt") return;
+    if (note.value === "") delete s.note;
+    else s.note = note.value;
+    changed(false, `note:${s.id}`);
   };
   /** Applies the outputs field to the selected step, or says why it cannot (and is false). */
   function commitOutputs(): boolean {
@@ -400,13 +442,9 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
           ? "A step needs at least one output."
           : words.length > MAX_OUTPUTS
             ? `A step has at most ${MAX_OUTPUTS} outputs.`
-            : s.kind === "manual" && words.length > 1
-              ? "A pause has one output: ▶ goes on from it, and ■ stops the run."
-              : s.kind === "manual_prompt" && words.length > 1
-                ? "A manual prompt has one output: the run goes on by it once Claude answers your prompt."
-                : s.kind === "title" && words.length > 1
-                  ? "A tab title step has one output: the run goes on by it once Claude names the tab."
-                  : null;
+            : s.kind === "title" && words.length > 1
+              ? "A tab title step has one output: the run goes on by it once Claude names the tab."
+              : null;
     invalid.hidden = why === null;
     invalid.textContent = why ?? "";
     if (why !== null) return false;
@@ -531,13 +569,15 @@ export function createFlowEditor(flowId: number, opts: FlowEditorOptions): FlowE
     const buttons = shown.outputs.map((output) => {
       const b = document.createElement("button");
       b.type = "button";
-      b.className = "output";
+      b.className = output === shown.suggested ? "output suggested" : "output";
       b.textContent = output;
       b.title = awaitsPrompt(shown)
         ? `Skip without sending your prompt: go on as "${output}"`
         : shown.status === "running"
           ? `For when Claude was interrupted (Esc) and no reply will come: go on as "${output}"`
-          : `Go on as "${output}"`;
+          : output === shown.suggested
+            ? `Go on as "${output}", as Claude picked`
+            : `Go on as "${output}"`;
       b.onclick = () => once(() => opts.onContinue(shown, output));
       return b;
     });

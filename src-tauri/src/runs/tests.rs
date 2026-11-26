@@ -1,6 +1,6 @@
 use super::*;
 use crate::db::{self, Db};
-use crate::flows::tests::{edge, node, runnable};
+use crate::flows::tests::{draft, edge, node, pause, runnable};
 use crate::flows::Edge;
 
 fn tab(id: &str) -> TabId {
@@ -26,7 +26,7 @@ pub(super) fn graph(nodes: Vec<Node>, edges: Vec<Edge>) -> Graph {
 /// Start → a pause → a prompt.
 pub(super) fn manual_first() -> Graph {
     graph(
-        vec![node("m", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
+        vec![pause("m", &["ok"]), node("p", Kind::Prompt, &["done"])],
         vec![edge("start", "next", "m"), edge("m", "ok", "p")],
     )
 }
@@ -370,7 +370,7 @@ fn start_s_base_info_goes_in_the_briefing_and_again_after_a_clear() {
 #[test]
 fn a_run_that_starts_at_pauses_is_briefed_before_them() {
     let mut g = graph(
-        vec![node("m", Kind::Pause, &["ok"]), node("m2", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
+        vec![pause("m", &["ok"]), pause("m2", &["ok"]), node("p", Kind::Prompt, &["done"])],
         vec![edge("start", "next", "m"), edge("m", "ok", "m2"), edge("m2", "ok", "p")],
     );
     g.nodes[0].text = "The app is in src/.".into();
@@ -402,7 +402,7 @@ fn picking_an_output_after_a_clear_sends_base_info_again() {
 fn a_clear_at_a_manual_step_owes_base_info_to_the_next_prompt() {
     let g = briefing(
         graph(
-            vec![node("m", Kind::Pause, &["ok"]), node("p", Kind::Prompt, &["done"])],
+            vec![pause("m", &["ok"]), node("p", Kind::Prompt, &["done"])],
             vec![edge("start", "next", "m"), edge("m", "ok", "p"), edge("p", "done", "m")],
         ),
         "The app is in src/.",
@@ -463,7 +463,7 @@ fn a_run_counts_its_finished_steps_once_each_out_of_the_flow_s_steps() {
     // Step u is not reachable from Start, so it never runs and is not counted.
     let g = graph(
         vec![
-            node("m", Kind::Pause, &["ok"]),
+            pause("m", &["ok"]),
             node("p", Kind::Prompt, &["pass", "fail"]),
             node("end", Kind::End, &[]),
             node("u", Kind::Prompt, &["done"]),
@@ -620,12 +620,153 @@ fn a_valid_flow_line_while_a_run_waits_moves_it_on() {
 }
 
 #[test]
-fn a_manual_step_from_an_older_flow_with_several_outputs_does_not_start() {
+fn a_pause_with_several_outputs_offers_them_all() {
     let mut g = manual_first();
     g.nodes[1].outputs.push("redo".into());
+    g.nodes[1].note = " Try the form. ".into();
     let (_db, mut conn, flow) = setup("runs-manual-several", &g);
-    assert!(begin(&mut conn, flow, &tab("t1")).unwrap_err().contains("more than one output"));
-    assert!(active(&conn).unwrap().is_empty());
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    let run = only_run(&conn);
+    assert_eq!((run.status, run.outputs.clone(), run.suggested), (Status::Manual, vec!["ok".to_string(), "redo".into()], None));
+    assert_eq!(run.note.as_deref(), Some("Try the form."));
+    assert_eq!(pick(&mut conn, run.id, "redo").unwrap(), None, "redo leads nowhere: the flow ends");
+}
+
+/// Start → a prompt that pauses once done, with a note, passing to another prompt.
+fn pausing_prompt() -> Graph {
+    let mut p = node("p", Kind::Prompt, &["pass", "fail"]);
+    (p.pause, p.note) = (true, "Check the diff.".into());
+    graph(vec![p, node("q", Kind::Prompt, &["done"])], vec![edge("start", "next", "p"), edge("p", "pass", "q"), edge("p", "fail", "p")])
+}
+
+#[test]
+fn a_prompt_that_pauses_waits_with_claude_s_output_suggested() {
+    let g = pausing_prompt();
+    let (_db, mut conn, flow) = setup("runs-pause-after", &g);
+    let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    assert_eq!(only_run(&conn).status, Status::Running, "the step's prompt is sent");
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("All good.\nFLOW: pass")).unwrap(), None, "nothing is sent yet");
+    let waiting = only_run(&conn);
+    assert_eq!((waiting.status, waiting.step_id.as_str(), waiting.suggested.as_deref()), (Status::Manual, "p", Some("pass")));
+    assert_eq!((waiting.note.as_deref(), waiting.awaits_prompt), (Some("Check the diff."), false));
+    assert_eq!(waiting.done, 0, "the step is not done until the person goes on");
+    // Chatting with Claude while it waits changes nothing, not even the suggestion.
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: fail")).unwrap(), None);
+    on_prompt(&mut conn, &tab("t1"), "Why?").unwrap();
+    assert_eq!(only_run(&conn).suggested.as_deref(), Some("pass"));
+    // The person may go on another way than Claude suggested.
+    assert_eq!(pick(&mut conn, run, "fail").unwrap(), prompt_of(&g, "p"));
+    on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap();
+    assert_eq!(pick(&mut conn, run, "pass").unwrap(), prompt_of(&g, "q"));
+    assert_eq!(only_run(&conn).suggested, None);
+}
+
+#[test]
+fn a_prompt_that_pauses_still_needs_attention_when_claude_asks_for_it() {
+    let (_db, mut conn, flow) = setup("runs-pause-after-attention", &pausing_prompt());
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    on_stop(&mut conn, &tab("t1"), Some("Which branch?\nFLOW: attention")).unwrap();
+    let run = only_run(&conn);
+    assert_eq!((run.status, run.suggested, run.resumable), (Status::Attention, None, true));
+    // Answering Claude until it picks an output pauses there, as the step does.
+    on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap();
+    let run = only_run(&conn);
+    assert_eq!((run.status, run.suggested.as_deref()), (Status::Manual, Some("pass")));
+}
+
+#[test]
+fn a_draft_step_with_several_outputs_asks_claude_for_a_flow_line() {
+    let mut mp = draft("mp", &["ok", "redo"]);
+    mp.text = "Fix ".into();
+    let g = graph(vec![mp, node("p", Kind::Prompt, &["done"])], vec![edge("start", "next", "mp"), edge("mp", "ok", "p")]);
+    let (_db, mut conn, flow) = setup("runs-draft-several", &g);
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    let context = on_prompt(&mut conn, &tab("t1"), "Fix main.rs").unwrap().unwrap();
+    assert!(context.contains("`FLOW: ok` or `FLOW: redo`"), "{context}");
+    // Without one, the run needs the person.
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed.")).unwrap(), None);
+    assert_eq!(only_run(&conn).status, Status::Attention);
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("FLOW: ok")).unwrap(), prompt_of(&g, "p"));
+    // A one-output draft step adds nothing to the prompt.
+    let (_db, mut conn, flow) = setup("runs-draft-one", &manual_prompt_first("Fix "));
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    assert_eq!(on_prompt(&mut conn, &tab("t1"), "Fix main.rs").unwrap(), None);
+}
+
+#[test]
+fn a_draft_step_that_pauses_with_several_outputs_suggests_claude_s_flow_line() {
+    let mut mp = draft("mp", &["ok", "redo"]);
+    mp.pause = true;
+    let g = graph(vec![mp, node("p", Kind::Prompt, &["done"])], vec![edge("start", "next", "mp"), edge("mp", "ok", "p")]);
+    let (_db, mut conn, flow) = setup("runs-draft-pause-several", &g);
+    let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    assert!(on_prompt(&mut conn, &tab("t1"), "Fix it").unwrap().unwrap().contains("`FLOW: ok` or `FLOW: redo`"));
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Not quite.\nFLOW: redo")).unwrap(), None);
+    let waiting = only_run(&conn);
+    assert_eq!((waiting.status, waiting.suggested.as_deref(), waiting.awaits_prompt), (Status::Manual, Some("redo"), false));
+    assert_eq!(pick(&mut conn, run, "ok").unwrap(), prompt_of(&g, "p"));
+    // Without a FLOW line, the run needs the person, suggesting nothing.
+    let (_db, mut conn, flow) = setup("runs-draft-pause-several-none", &g);
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    on_prompt(&mut conn, &tab("t1"), "Fix it").unwrap();
+    on_stop(&mut conn, &tab("t1"), Some("Fixed.")).unwrap();
+    let needing = only_run(&conn);
+    assert_eq!((needing.status, needing.suggested), (Status::Attention, None));
+}
+
+#[test]
+fn a_run_limit_holds_the_flow_back_from_a_pause_or_a_draft_step_too() {
+    for (name, mut limited) in [("pause", pause("m", &["ok"])), ("draft", draft("m", &["ok"]))] {
+        limited.max_runs = Some(1);
+        // A prompt that loops back to itself until it passes, then the limited step, then back.
+        let g = graph(
+            vec![node("p", Kind::Prompt, &["pass"]), limited],
+            vec![edge("start", "next", "p"), edge("p", "pass", "m"), edge("m", "ok", "p")],
+        );
+        let (_db, mut conn, flow) = setup(&format!("runs-limit-{name}"), &g);
+        let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+        on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap();
+        assert_eq!((only_run(&conn).step_id.as_str(), only_run(&conn).status), ("m", Status::Manual), "{name}");
+        pick(&mut conn, run, "ok").unwrap();
+        // The second time, the flow waits at the step before; the person may still go on.
+        on_stop(&mut conn, &tab("t1"), Some("FLOW: pass")).unwrap();
+        let held = only_run(&conn);
+        assert_eq!((held.step_id.as_str(), held.status), ("p", Status::Attention), "{name}");
+        assert!(held.note.unwrap().contains("already run once"), "{name}");
+        pick(&mut conn, run, "pass").unwrap();
+        assert_eq!(only_run(&conn).step_id, "m", "{name}");
+    }
+}
+
+#[test]
+fn a_finished_run_s_note_is_not_carried_into_a_draft_step_s_rule() {
+    // A new run drops the note an earlier one owed, so only the draft's rule goes along.
+    let g = graph(vec![draft("mp", &["ok", "redo"])], vec![edge("start", "next", "mp")]);
+    let (_db, mut conn, flow) = setup("runs-draft-rule-alone", &g);
+    let first = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    stop(&mut conn, first).unwrap();
+    begin(&mut conn, flow, &tab("t1")).unwrap();
+    let context = on_prompt(&mut conn, &tab("t1"), "Fix it").unwrap().unwrap();
+    assert_eq!(Some(context), flows::draft_rule(&g.nodes[1]));
+}
+
+#[test]
+fn a_draft_step_that_pauses_waits_once_claude_answers() {
+    let mut g = manual_prompt_first("Fix ");
+    g.nodes[1].pause = true;
+    let (_db, mut conn, flow) = setup("runs-draft-pause", &g);
+    let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    on_prompt(&mut conn, &tab("t1"), "Fix main.rs").unwrap();
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed.")).unwrap(), None);
+    let waiting = only_run(&conn);
+    assert_eq!((waiting.status, waiting.suggested.as_deref(), waiting.awaits_prompt), (Status::Manual, Some("sent"), false));
+    // Another prompt is a chat, not the step's again.
+    on_prompt(&mut conn, &tab("t1"), "And the tests?").unwrap();
+    assert_eq!(only_run(&conn).status, Status::Manual);
+    // Nor does a clear or a restart put the draft back.
+    clear_tab(&mut conn, &tab("t1"), "cleared").unwrap();
+    assert_eq!(owed(&mut conn, run, "mp"), None);
+    assert_eq!(pick(&mut conn, run, "sent").unwrap().map(|p| p.contains("do p")), Some(true));
 }
 
 #[test]
@@ -645,9 +786,9 @@ fn a_manual_step_waits_for_the_person() {
 }
 
 /// Start (with base info) → a manual prompt with a draft → a prompt.
-pub(super) fn manual_prompt_first(draft: &str) -> Graph {
-    let mut mp = node("mp", Kind::ManualPrompt, &["sent"]);
-    mp.text = draft.into();
+pub(super) fn manual_prompt_first(text: &str) -> Graph {
+    let mut mp = draft("mp", &["sent"]);
+    mp.text = text.into();
     briefing(
         graph(vec![mp, node("p", Kind::Prompt, &["done"])], vec![edge("start", "next", "mp"), edge("mp", "sent", "p")]),
         "The app is in src/.",
@@ -736,7 +877,7 @@ fn a_manual_prompt_with_nothing_to_fill_waits_for_the_person_s_prompt() {
 
 #[test]
 fn a_prompt_can_lead_to_a_manual_prompt() {
-    let mut mp = node("mp", Kind::ManualPrompt, &["sent"]);
+    let mut mp = draft("mp", &["sent"]);
     mp.text = "Now ask about ".into();
     let g = briefing(
         graph(vec![node("p", Kind::Prompt, &["done"]), mp], vec![edge("start", "next", "p"), edge("p", "done", "mp")]),
@@ -755,9 +896,9 @@ fn a_prompt_can_lead_to_a_manual_prompt() {
 
 #[test]
 fn manual_prompts_can_follow_each_other() {
-    let mut first = node("a", Kind::ManualPrompt, &["sent"]);
+    let mut first = draft("a", &["sent"]);
     first.text = "one".into();
-    let mut second = node("b", Kind::ManualPrompt, &["sent"]);
+    let mut second = draft("b", &["sent"]);
     second.text = "two".into();
     let g = graph(vec![first, second], vec![edge("start", "next", "a"), edge("a", "sent", "b")]);
     let (_db, mut conn, flow) = setup("runs-manual-prompts", &g);
@@ -902,7 +1043,8 @@ fn a_run_says_what_kind_of_step_it_is_at() {
     let g = manual_prompt_first("");
     let (_db, mut conn, flow) = setup("runs-step-kind", &g);
     begin(&mut conn, flow, &tab("t1")).unwrap();
-    assert_eq!(only_run(&conn).step_kind, Some(Kind::ManualPrompt));
+    let run = only_run(&conn);
+    assert_eq!((run.step_kind, run.awaits_prompt), (Some(Kind::Prompt), true));
 }
 
 #[test]
@@ -917,14 +1059,39 @@ fn the_person_can_skip_a_manual_prompt_and_base_info_still_goes() {
     assert!(!only_run(&conn).prefill);
 }
 
+/// `graph` as a run of an older misag stored it: `old_step` in place of step `id`.
+fn stored_as_older(conn: &Connection, run: i64, graph: &Graph, id: &str, old_step: serde_json::Value) {
+    let mut json = serde_json::to_value(graph).unwrap();
+    let nodes = json["nodes"].as_array_mut().unwrap();
+    let at = nodes.iter().position(|n| n["id"] == id).unwrap();
+    nodes[at] = old_step;
+    conn.execute("UPDATE flow_runs SET graph = ?1 WHERE id = ?2", params![json.to_string(), run]).unwrap();
+}
+
 #[test]
 fn a_run_stored_with_the_old_kind_name_goes_on_from_its_pause() {
     let g = manual_first();
     let (_db, mut conn, flow) = setup("runs-old-manual", &g);
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
-    let stored: String = conn.query_row("SELECT graph FROM flow_runs", [], |r| r.get(0)).unwrap();
-    assert!(stored.contains(r#""kind":"manual""#), "older misags read it: {stored}");
+    let old = serde_json::json!({ "id": "m", "kind": "manual", "title": "M", "text": "Try it", "outputs": ["ok"], "x": 0, "y": 0 });
+    stored_as_older(&conn, run, &g, "m", old);
+    let waiting = only_run(&conn);
+    assert_eq!((waiting.status, waiting.note.as_deref()), (Status::Manual, Some("Try it")));
     assert_eq!(pick(&mut conn, run, "ok").unwrap(), prompt_of(&g, "p"));
+}
+
+#[test]
+fn a_run_stored_with_the_old_manual_prompt_kind_still_waits_for_the_prompt() {
+    let g = manual_prompt_first("Fix ");
+    let (_db, mut conn, flow) = setup("runs-old-manual-prompt", &g);
+    let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
+    let old = serde_json::json!({ "id": "mp", "kind": "manual_prompt", "title": "MP", "text": "Fix ", "outputs": ["sent"], "x": 0, "y": 0 });
+    stored_as_older(&conn, run, &g, "mp", old);
+    let waiting = only_run(&conn);
+    assert_eq!((waiting.awaits_prompt, waiting.prefill), (true, true));
+    assert_eq!(paste(&mut conn, run).as_deref(), Some("Fix "));
+    on_prompt(&mut conn, &tab("t1"), "Fix main.rs").unwrap();
+    assert_eq!(on_stop(&mut conn, &tab("t1"), Some("Fixed.")).unwrap(), prompt_of(&g, "p"));
 }
 
 #[test]
@@ -1073,7 +1240,7 @@ fn a_stopped_run_moved_on_by_hand_takes_no_lock_for_a_prompt() {
 #[test]
 fn a_prompt_can_lead_to_a_manual_step() {
     let g = graph(
-        vec![node("p", Kind::Prompt, &["done"]), node("m", Kind::Pause, &["ok"])],
+        vec![node("p", Kind::Prompt, &["done"]), pause("m", &["ok"])],
         vec![edge("start", "next", "p"), edge("p", "done", "m")],
     );
     let (_db, mut conn, flow) = setup("runs-to-manual", &g);
@@ -1661,8 +1828,9 @@ fn phases() -> Vec<Phase> {
         Phase::Working,
         Phase::Typed { turn_ended: false },
         Phase::Typed { turn_ended: true },
-        Phase::Waiting { prefill: false },
-        Phase::Waiting { prefill: true },
+        Phase::Waiting { prefill: false, suggested: None },
+        Phase::Waiting { prefill: true, suggested: None },
+        Phase::Waiting { prefill: false, suggested: Some("fail".into()) },
         needs("why", Some(Resume::Prompt), true),
         needs("why", Some(Resume::Remind), false),
         needs("why", None, false),
@@ -1714,7 +1882,10 @@ fn columns_the_status_leaves_no_room_for_are_refused_and_named() {
         (Columns { note: None, ..attention.clone() }, "attention with no note"),
         (Columns { briefing: true, briefing_at: Some(1), ..attention.clone() }, "attention with a briefing"),
         (Columns { typed: 2, ..attention.clone() }, "attention with a typed prompt"),
-        (Columns { clear: Some("pending".into()), ..attention }, "attention with a clear"),
+        (Columns { clear: Some("pending".into()), ..attention.clone() }, "attention with a clear"),
+        (Columns { suggested: Some("ok".into()), ..attention }, "attention with a suggested output"),
+        (Columns { suggested: Some("ok".into()), ..working_columns() }, "running with a suggested output"),
+        (Columns { status: "manual".into(), prefill: true, suggested: Some("ok".into()), ..working_columns() }, "both a paste owed and a suggested output"),
     ];
     for (columns, named) in cases {
         let e = RunState::from_columns(columns.clone()).unwrap_err();
@@ -1772,11 +1943,12 @@ fn owes_closing_and_its_sql_agree() {
 fn a_run_this_version_cannot_read_can_still_be_stopped_and_owes_what_its_row_says() {
     let (_db, mut conn, flow) = setup("runs-stop-unreadable", &runnable());
     conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
-    for (tab_id, odd, owes) in [("t1", "clear = 'later'", false), ("t2", "resume = 'someday'", true)] {
+    for (tab_id, odd, owes) in [("t1", "clear = 'later'", false), ("t2", "resume = 'someday', suggested = 'pass'", true)] {
         let run = begin(&mut conn, flow, &tab(tab_id)).unwrap().run_id;
         conn.execute(&format!("UPDATE flow_runs SET {odd} WHERE id = ?1"), [run]).unwrap();
         stop(&mut conn, run).unwrap();
         assert_eq!((column::<String>(&conn, run, "status"), column::<bool>(&conn, run, "closing")), ("stopped".into(), owes), "{odd}");
+        assert_eq!(column::<Option<String>>(&conn, run, "suggested"), None, "a stop drops a suggestion");
     }
     assert!(stop(&mut conn, 999).unwrap_err().contains("no active run 999"));
 }
@@ -1916,7 +2088,7 @@ fn a_transition_leaves_alone_what_it_does_not_change() {
     let run = begin(&mut conn, flow, &tab("t1")).unwrap().run_id;
     let before = state(&conn, run);
     let token = before.prefill_token.unwrap();
-    assert_eq!(before.phase, Phase::Waiting { prefill: true });
+    assert_eq!(before.phase, Phase::Waiting { prefill: true, suggested: None });
     // The paste stays owed, under the same token.
     prompt_unseen(&mut conn, &tab("t1"), "bad").unwrap();
     let after = state(&conn, run);

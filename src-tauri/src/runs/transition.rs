@@ -27,7 +27,7 @@ impl<'a> Cx<'a> {
         self.taken.0.get(step).copied().unwrap_or(0) + i64::from(state.node_id == step)
     }
 
-    /// `state`, at the manual prompt `node`, owing the app the paste of its text
+    /// `state`, at the draft step `node`, owing the app the paste of its text
     /// (see `prefill_text`), if there is any: Start's base info unless Claude has
     /// it, then the step's draft. Each time under a new token, so the record of an
     /// earlier paste cannot cancel it (see `prefilled`).
@@ -39,7 +39,7 @@ impl<'a> Cx<'a> {
     }
 
     /// `state`, owing the app a fill of Claude's input again if the run waits at a
-    /// manual prompt, as that input was lost (a clear, a restart): with the base
+    /// draft step, as that input was lost (a clear, a restart): with the base
     /// info, if Claude lacks it now.
     fn refill(&self, state: RunState) -> Result<RunState, String> {
         let node = self.node(&state.node_id)?;
@@ -70,8 +70,8 @@ pub(super) fn first_turn(cx: &Cx, state: &RunState, start: &Node, now: i64) -> C
 }
 
 /// Moves the run from `from` along `output` to the step it leads to, if any, with
-/// the run's step count at `steps`, with the prompt to send when that is a prompt
-/// step (a run that ends sends nothing; see `RunState::finished`). The run
+/// the run's step count at `steps`, with the prompt to send when that step sends one
+/// (a run that ends sends nothing; see `RunState::finished`). The run
 /// instead waits at `from` for the person when going on would pass
 /// `MAX_RUN_STEPS` (into a prompt step) or, for `By::Flow` only, when the next
 /// step has already run its `max_runs`.
@@ -79,7 +79,7 @@ pub(super) fn go(cx: &Cx, state: &RunState, from: &Node, output: &str, steps: i6
     let next = flows::next_step(cx.graph, &from.id, output);
     // Going on with `from` would only redo it and stop here again.
     let wait = |why: String| Change::to(state.waiting(&from.id, steps, &why, None));
-    if next.is_some_and(|n| matches!(n.kind, Kind::Prompt | Kind::Title)) && steps >= MAX_RUN_STEPS {
+    if next.is_some_and(Node::sends) && steps >= MAX_RUN_STEPS {
         return wait(format!("The run has taken {MAX_RUN_STEPS} steps without you; pick an output to go on."));
     }
     if let (Some(next), By::Flow) = (next, by)
@@ -96,17 +96,30 @@ pub(super) fn go(cx: &Cx, state: &RunState, from: &Node, output: &str, steps: i6
         // The output leads nowhere: the flow is done.
         None => (state.finished(&from.id, steps), None),
         Some(next) => match next.kind {
+            Kind::Prompt if next.drafts() => (cx.owe_prefill(state.moved(&next.id, WAITING, steps), next), None),
+            Kind::Prompt if next.only_waits() => (state.moved(&next.id, WAITING, steps), None),
             Kind::Prompt | Kind::Title => {
                 let mut state = state.moved(&next.id, Phase::Working, steps + 1);
                 let say = state.prompt(next);
                 (state, Some(say))
             }
-            Kind::Pause => (state.moved(&next.id, Phase::Waiting { prefill: false }, steps), None),
-            Kind::ManualPrompt => (cx.owe_prefill(state.moved(&next.id, Phase::Waiting { prefill: false }, steps), next), None),
             Kind::End | Kind::Start => (state.finished(&next.id, steps), None),
         },
     };
     Change { state, left: Some((from.id.clone(), output.to_owned())), say }
+}
+
+/// Waiting for the person, with no paste owed and nothing suggested.
+const WAITING: Phase = Phase::Waiting { prefill: false, suggested: None };
+
+/// Claude's reply at `node` picked `output`: the run goes on by it (see `go`), or,
+/// at a step that pauses, waits there for the person with `output` suggested, which
+/// ▶ goes on by (see `proceed`).
+fn settle(cx: &Cx, state: &RunState, node: &Node, output: &str, steps: i64) -> Change {
+    if node.pauses() {
+        return Change::to(state.moved(&node.id, Phase::Waiting { prefill: false, suggested: Some(output.to_owned()) }, steps));
+    }
+    go(cx, state, node, output, steps, By::Flow)
 }
 
 /// Claude ended its turn with `reply` (None when Claude Code did not report it):
@@ -144,14 +157,16 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
             Some(_) => go(cx, state, node, flows::START_OUTPUT, 0, By::Flow),
         }));
     }
-    if node.kind == Kind::ManualPrompt {
+    if node.drafts() && node.outputs.len() == 1 {
         // Working only once the person sent their prompt (see `on_prompt`): this is
-        // Claude's answer to it. Waiting for the person, any turn is left alone.
+        // Claude's answer to it, which needs no FLOW line. Waiting for the person, any
+        // turn is left alone. (With several outputs, Claude was asked for a FLOW line,
+        // which is read as at any prompt step, below.)
         let Some(output) = node.outputs.first().filter(|_| state.phase == Phase::Working) else {
             return Ok(None);
         };
         // The person stepped in, which restarts the count toward MAX_RUN_STEPS.
-        return Ok(Some(go(cx, state, node, output, 0, By::Flow)));
+        return Ok(Some(settle(cx, state, node, output, 0)));
     }
     match &state.phase {
         Phase::NeedsPerson { .. } => {
@@ -162,7 +177,7 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
             let output = reply.and_then(|reply| reply_output(node, reply)).filter(|m| {
                 continue_offered(&state.phase, node.kind).is_some() && m != flows::ATTENTION && node.outputs.contains(m)
             });
-            Ok(output.map(|output| go(cx, state, node, &output, state.steps, By::Flow)))
+            Ok(output.map(|output| settle(cx, state, node, &output, state.steps)))
         }
         Phase::Working => {
             let wait = |why: String| Change::to(state.waiting(&node.id, state.steps, &why, Some(Resume::Remind)));
@@ -172,7 +187,7 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
             };
             if node.kind == Kind::Title && flows::parse_marker(reply).as_deref() != Some(flows::ATTENTION) {
                 return Ok(Some(match reply_output(node, reply) {
-                    Some(output) => go(cx, state, node, &output, state.steps, By::Flow),
+                    Some(output) => settle(cx, state, node, &output, state.steps),
                     None => wait("Claude's reply did not end with a TITLE line, so the tab cannot be named.".into()),
                 }));
             }
@@ -182,10 +197,11 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
                 Some(m) if !node.outputs.contains(&m) => {
                     wait(format!("Claude ended with \"FLOW: {m}\", which is not an output of \"{}\".", node.name()))
                 }
-                Some(m) => go(cx, state, node, &m, state.steps, By::Flow),
+                Some(m) => settle(cx, state, node, &m, state.steps),
             }))
         }
-        // Waiting at a pause, a chat turn is not its reply; an ended run has none.
+        // Waiting for the person (at a pause, or a draft step), a chat turn is not its
+        // reply; an ended run has none.
         // (Clearing, Briefing, which is only at Start, and Typed are seen to above.)
         _ => Ok(None),
     }
@@ -225,7 +241,7 @@ pub(super) fn proceed(cx: &Cx, state: &RunState, step_id: &str, output: &str) ->
     Ok(change)
 }
 
-/// The app pasted the manual prompt named by `token` at `step_id`: the run no
+/// The app pasted the draft step's text named by `token` at `step_id`: the run no
 /// longer owes it, unless a paste was owed since (see `super::prefilled`).
 pub(super) fn prefilled(state: &RunState, step_id: &str, token: i64) -> Option<RunState> {
     if state.node_id != step_id || state.prefill_token.unwrap_or(NO_TOKEN) != token {
@@ -234,7 +250,7 @@ pub(super) fn prefilled(state: &RunState, step_id: &str, token: i64) -> Option<R
     Some(RunState { phase: state.phase.clone().with_prefill(false), ..state.clone() })
 }
 
-/// `prompt` was sent to Claude: a run waiting at a manual prompt runs it (see
+/// `prompt` was sent to Claude: a run waiting at a draft step runs it (see
 /// `super::on_prompt`). A run waiting for the prompt the app typed (`Phase::Typed`)
 /// counts the next turn as the step's reply if `prompt` is that prompt (see
 /// `is_step_prompt`); another prompt (one the person queued, or the prompt of an
@@ -281,7 +297,7 @@ pub(super) fn prompt_unseen(cx: &Cx, state: &RunState, error: &str) -> Result<Op
         );
         return Ok(Some(state.waiting_here(&why, Some(Resume::Remind))));
     }
-    if !matches!(state.phase, Phase::Waiting { .. }) || cx.node(&state.node_id)?.kind != Kind::ManualPrompt {
+    if !matches!(state.phase, Phase::Waiting { suggested: None, .. }) || !cx.node(&state.node_id)?.drafts() {
         return Ok(None);
     }
     let why = format!("misag could not record your prompt ({error}), so Claude's answer will not move the run on. Pick an output to go on.");
@@ -343,7 +359,7 @@ pub(super) fn stop_failed(cx: &Cx, state: RunState, why: &str) -> Result<RunStat
 
 /// `state` once Claude will not reply to its running step (see `cleared_tab` and
 /// `stop_failed`); unchanged unless it runs a step Claude was to reply to (see
-/// `answer_lost` for a manual prompt). A run waiting for the prompt the app typed
+/// `answer_lost` for a draft step). A run waiting for the prompt the app typed
 /// may have had it sent before, so `why` must not say Claude never got it.
 pub(super) fn pause(cx: &Cx, state: RunState, why: &str) -> Result<RunState, String> {
     if let Some(lost) = answer_lost(cx, &state, why)? {
@@ -356,12 +372,12 @@ pub(super) fn pause(cx: &Cx, state: RunState, why: &str) -> Result<RunState, Str
     })
 }
 
-/// Claude's answer to the person's manual prompt the run runs will not be seen
+/// Claude's answer to the person's prompt at the draft step the run runs will not be seen
 /// (`why`: the conversation was cleared, misag restarted): the run waits for the
 /// prompt again, or an output. Continue has no step prompt to remind Claude of.
-/// None unless the run is working on a manual prompt.
+/// None unless the run is working on a draft step.
 fn answer_lost(cx: &Cx, state: &RunState, why: &str) -> Result<Option<RunState>, String> {
-    if state.phase != Phase::Working || cx.node(&state.node_id)?.kind != Kind::ManualPrompt {
+    if state.phase != Phase::Working || !cx.node(&state.node_id)?.drafts() {
         return Ok(None);
     }
     let note = format!("{why} Claude's answer to your prompt will not be seen: send your prompt again, or pick an output to go on.");
@@ -520,7 +536,7 @@ mod tests {
     #[test]
     fn a_chat_turn_while_the_run_waits_changes_nothing() {
         let g = manual_first();
-        let at_pause = at_step("m", Phase::Waiting { prefill: false });
+        let at_pause = at_step("m", Phase::Waiting { prefill: false, suggested: None });
         assert_eq!(reply(&g, &at_pause, Some("FLOW: ok")), None);
         let needing = at_step("p", needs("cleared", Some(Resume::Prompt), false));
         for text in [Some("Just chatting."), Some("FLOW: attention"), Some("FLOW: nope"), None] {
@@ -622,7 +638,7 @@ mod tests {
         let answering = at_step("mp", Phase::Working);
         let lost = pause(&cx, answering, "Cleared.").unwrap();
         assert!(matches!(&lost.phase, Phase::NeedsPerson { why, resume: None, .. } if why.contains("send your prompt again")));
-        for left_alone in [at_step("mp", Phase::Waiting { prefill: true }), at_step("start", Phase::Clearing { done: true })] {
+        for left_alone in [at_step("mp", Phase::Waiting { prefill: true, suggested: None }), at_step("start", Phase::Clearing { done: true })] {
             assert_eq!(pause(&cx, left_alone.clone(), "lost").unwrap(), left_alone);
         }
     }
@@ -641,11 +657,11 @@ mod tests {
             cleared_tab(&cx, &clearing, "Cleared.").unwrap(),
             RunState { briefed: false, phase: Phase::Clearing { done: true }, ..clearing }
         );
-        // A manual prompt owes its paste again, now with the base info, under the new token.
-        let waiting = at_step("mp", Phase::Waiting { prefill: false });
+        // A draft step owes its paste again, now with the base info, under the new token.
+        let waiting = at_step("mp", Phase::Waiting { prefill: false, suggested: None });
         assert_eq!(
             cleared_tab(&cx, &waiting, "Cleared.").unwrap(),
-            RunState { briefed: false, prefill_token: Some(TOKEN), phase: Phase::Waiting { prefill: true }, ..waiting }
+            RunState { briefed: false, prefill_token: Some(TOKEN), phase: Phase::Waiting { prefill: true, suggested: None }, ..waiting }
         );
     }
 

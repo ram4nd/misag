@@ -18,7 +18,7 @@ const ROW: f64 = 180.0;
 /// The fields each part of a file may have, as `write` writes them.
 const FILE_FIELDS: &[&str] = &["misagFlow", "name", "graph"];
 const GRAPH_FIELDS: &[&str] = &["version", "nodes", "edges"];
-const STEP_FIELDS: &[&str] = &["id", "kind", "title", "text", "outputs", "maxRuns", "clear", "x", "y"];
+const STEP_FIELDS: &[&str] = &["id", "kind", "title", "text", "outputs", "maxRuns", "clear", "pause", "draft", "note", "x", "y"];
 const EDGE_FIELDS: &[&str] = &["from", "output", "to"];
 
 /// The flow in `text` as its name and steps, checked like an edit (see `flows::check`).
@@ -172,6 +172,27 @@ mod tests {
         let graph = flows::stored(graph);
         assert!(write("Deploy", &graph).contains("\"clear\": true"));
         assert_eq!(parse(&write("Deploy", &graph)).unwrap().1, graph);
+    }
+
+    #[test]
+    fn a_flow_whose_prompts_pause_or_draft_reads_back_the_same() {
+        let mut graph = runnable();
+        (graph.nodes[1].pause, graph.nodes[1].note) = (true, "Check the diff.".into());
+        graph.nodes.push(crate::flows::tests::draft("d", &["sent"]));
+        let graph = flows::stored(graph);
+        let text = write("Deploy", &graph);
+        for field in ["\"pause\": true", "\"draft\": true", "\"note\": \"Check the diff.\""] {
+            assert!(text.contains(field), "{field} in {text}");
+        }
+        assert_eq!(parse(&text).unwrap().1, graph);
+    }
+
+    #[test]
+    fn a_file_with_the_older_pause_and_manual_prompt_kinds_imports_as_prompt_steps() {
+        let (_, graph) = parse(MINIMAL).unwrap();
+        let check = graph.nodes.iter().find(|n| n.id == "check").unwrap();
+        assert_eq!((check.kind, check.pause), (Kind::Prompt, true));
+        assert_eq!(graph.version, 7, "stored in the format that holds it");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import Drawflow, { type ConnectionEvent } from "drawflow";
 import "drawflow/dist/drawflow.min.css";
 import type { Graph, Step } from "./flowEditor";
+import { stepMode } from "./stepMode";
 
 /** What the user did on the canvas, in terms of the flow's steps and outputs. */
 export interface CanvasEvents {
@@ -23,7 +24,10 @@ export interface Canvas {
   mark(id: string | null): void;
 }
 
-const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", manual: "Pause", manual_prompt: "Manual prompt", title: "Tab title", end: "End" };
+const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", title: "Tab title", end: "End" };
+
+/** What kind of step `s` is, as the canvas names it: a prompt step is a Pause or a Manual prompt by its mode. */
+const kindLabel = (s: Step) => ({ wait: "Pause", draft: "Manual prompt", send: KIND_LABELS[s.kind] })[stepMode(s) ?? "send"];
 
 /**
  * A Drawflow canvas showing a flow's steps, drawn in an element it adds to `canvasEl`.
@@ -131,9 +135,13 @@ export function createCanvas(canvasEl: HTMLElement, events: CanvasEvents): Canva
         const clears = s.clear ? `<span class="clears" title="Starts with /clear">/clear</span>` : "";
         const info =
           s.kind === "start" && s.text.trim() !== "" ? `<span class="info" title="Sends base info in the run's briefing">info</span>` : "";
-        const html = `<div class="kind">${KIND_LABELS[s.kind]}${limit}${clears}${info}</div><div class="title"></div>`;
+        // A pause that only waits says so in its kind; one after a prompt is marked.
+        const pauses = s.pause && stepMode(s) !== "wait" && stepMode(s) !== null ? `<span class="pauses" title="Waits for you once done">pause</span>` : "";
+        const html = `<div class="kind">${kindLabel(s)}${limit}${pauses}${clears}${info}</div><div class="title"></div>`;
         // A tab title's class is not "title", which names the step's title inside every step.
-        const cls = s.kind === "title" ? "tab-title" : s.kind;
+        // A step that is yours (a pause that only waits, or a prompt you write) is drawn as such.
+        const mode = stepMode(s);
+        const cls = s.kind === "title" ? "tab-title" : mode === "wait" || mode === "draft" ? "yours" : s.kind;
         const id = df.addNode(s.kind, inputs, s.outputs.length, s.x, s.y, cls, {}, html, false);
         stepOf.set(String(id), s);
         drawnAs.set(s.id, id);

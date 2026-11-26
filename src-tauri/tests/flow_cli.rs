@@ -68,7 +68,7 @@ fn help_describes_the_command_and_the_file_format() {
         let o = misag(None, args, "");
         assert!(o.status.success(), "{args:?}: {}", err(&o));
         let help = out(&o);
-        for needed in ["misag flow import", "misag flow export", "misag flow list", "\"misagFlow\": 1", "\"kind\": \"prompt\"", "maxRuns"] {
+        for needed in ["misag flow import", "misag flow export", "misag flow list", "\"misagFlow\": 1", "\"kind\": \"prompt\"", "maxRuns", "\"pause\": true", "draft"] {
             assert!(help.contains(needed), "{args:?} help lacks {needed:?}");
         }
     }

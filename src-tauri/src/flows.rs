@@ -29,9 +29,10 @@ pub const ATTENTION: &str = "attention";
 /// `stored`), so older misags keep reading the flows they can run correctly.
 /// Version 2 added step run limits (`Node::max_runs`), version 3 clearing the
 /// conversation at Start (`Node::clear`), version 4 Start's base info (its `text`),
-/// version 5 manual prompts (`Kind::ManualPrompt`), version 6 tab title steps
-/// (`Kind::Title`).
-pub const GRAPH_VERSION: u32 = 6;
+/// version 5 manual prompts (a `manual_prompt` kind then), version 6 tab title
+/// steps (`Kind::Title`), version 7 the prompt step's `pause`, `draft` and `note`,
+/// which took over the pause and manual prompt kinds (see `StoredNode`).
+pub const GRAPH_VERSION: u32 = 7;
 /// The most a tab title Claude writes can be, in characters (see `parse_title`).
 pub const MAX_TAB_TITLE: usize = 60;
 
@@ -54,19 +55,11 @@ fn first_version() -> u32 {
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Start,
-    /// Sends `text` to Claude.
+    /// Sends `text` to Claude; or, with `Node::draft`, puts it into Claude's input
+    /// for the person to finish and send; or, a pause with no text, only waits for
+    /// the person (see `Node::only_waits`). With `Node::pause`, the run waits for the
+    /// person once Claude has answered, Claude's output suggested.
     Prompt,
-    /// Waits for a person, who goes on by its one output. Flows from older versions
-    /// may have several, which `problems` reports, so such a flow does not start.
-    /// Saved as "manual", its name before, so older misags still read flows with
-    /// pauses; "pause" loads too.
-    #[serde(rename = "manual", alias = "pause")]
-    Pause,
-    /// Puts Start's base info (if Claude lacks it) and `text` into Claude's input
-    /// without sending it; the person writes the prompt and sends it, and the run
-    /// goes on by its one output when Claude ends that turn.
-    #[serde(rename = "manual_prompt")]
-    ManualPrompt,
     /// Has Claude name the run's tab after what the person asked it: Claude replies
     /// with a `TITLE: <title>` line (see `parse_title`), which the app makes the tab's
     /// name, and the run goes on by the step's one output. `text`, optional, guides
@@ -75,17 +68,19 @@ pub enum Kind {
     End,
 }
 
+/// Read through `StoredNode`, which turns the step kinds older versions saved into
+/// prompt steps.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "StoredNode")]
 pub struct Node {
     pub id: String,
     pub kind: Kind,
     #[serde(default)]
     pub title: String,
-    /// A prompt step's prompt, what the person does at a pause, or a manual prompt's
-    /// draft, put into Claude's input for the person to finish. For Start:
+    /// A prompt step's prompt, or with `draft` its draft, put into Claude's input
+    /// for the person to finish; empty at a pause that only waits. For Start:
     /// optional base info (where things are and the like), sent in the run's
-    /// briefing (see `briefing_text`).
+    /// briefing (see `briefing_text`). For a tab title step, optional guidance.
     #[serde(default)]
     pub text: String,
     /// The ways the step can end, each leading to at most one next step.
@@ -100,8 +95,106 @@ pub struct Node {
     /// flow in a new conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub clear: bool,
+    /// For a prompt step: the run waits for the person when the step is done, with
+    /// the output Claude picked suggested, for the person to go on by (▶) or pick
+    /// another. Without text (and no `draft`), the step only waits.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pause: bool,
+    /// For a prompt step: `text` is a draft the app puts into Claude's input without
+    /// sending it; the person finishes and sends the prompt, and Claude's answer
+    /// ends the step. With `pause` too, the run waits for the person once more after
+    /// Claude has answered, as at any step that pauses.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
+    /// For a prompt step that pauses (and only one, see `check_node`): what the person
+    /// is to do there, shown while the run waits; never sent to Claude.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
     pub x: f64,
     pub y: f64,
+}
+
+/// A step as stored, by this version or an older one: older versions had kinds of
+/// their own for a pause ("manual", or "pause") and a manual prompt, which load as
+/// prompt steps that pause, or that are drafts.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredNode {
+    id: String,
+    kind: StoredKind,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    outputs: Vec<String>,
+    #[serde(default)]
+    max_runs: Option<u32>,
+    #[serde(default)]
+    clear: bool,
+    #[serde(default)]
+    pause: bool,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    note: String,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum StoredKind {
+    Start,
+    Prompt,
+    /// A pause, before version 7: its text said what the person does.
+    #[serde(alias = "pause")]
+    Manual,
+    /// A manual prompt, before version 7: its text was the draft.
+    #[serde(rename = "manual_prompt")]
+    ManualPrompt,
+    Title,
+    End,
+}
+
+impl TryFrom<StoredNode> for Node {
+    type Error = String;
+
+    /// The step `n` holds. An older kind never had the fields that replaced it, so
+    /// one with them (a file edited by hand) is refused rather than read as some
+    /// other step.
+    fn try_from(n: StoredNode) -> Result<Self, String> {
+        let older = matches!(n.kind, StoredKind::Manual | StoredKind::ManualPrompt);
+        if older && (n.pause || n.draft || !n.note.is_empty()) {
+            return Err(format!(
+                "step {:?} has an older step kind (\"manual\", \"pause\" or \"manual_prompt\") with \"pause\", \"draft\" or \"note\"; \
+                 make it a \"prompt\" step with those instead",
+                n.id
+            ));
+        }
+        let (kind, text, pause, draft, note) = match n.kind {
+            StoredKind::Start => (Kind::Start, n.text, n.pause, n.draft, n.note),
+            StoredKind::Prompt => (Kind::Prompt, n.text, n.pause, n.draft, n.note),
+            StoredKind::Manual => (Kind::Prompt, String::new(), true, false, n.text),
+            StoredKind::ManualPrompt => (Kind::Prompt, n.text, false, true, String::new()),
+            StoredKind::Title => (Kind::Title, n.text, n.pause, n.draft, n.note),
+            StoredKind::End => (Kind::End, n.text, n.pause, n.draft, n.note),
+        };
+        Ok(Node { id: n.id, kind, title: n.title, text, outputs: n.outputs, max_runs: n.max_runs, clear: n.clear, pause, draft, note, x: n.x, y: n.y })
+    }
+}
+
+/// What a prompt step has the run do when it gets there (see `Node::mode`).
+/// Mirrored by `stepMode` in src/stepMode.ts, which the editor draws steps by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Sends its prompt to Claude (and, with `pause`, waits for the person once
+    /// Claude has answered).
+    Send,
+    /// Puts its draft into Claude's input for the person to finish and send.
+    Draft,
+    /// Only waits for the person: it pauses, with no prompt for Claude.
+    Wait,
 }
 
 /// From `from`'s output `output` to the step `to`.
@@ -124,6 +217,9 @@ impl Default for Graph {
             outputs: vec![START_OUTPUT.into()],
             max_runs: None,
             clear: false,
+            pause: false,
+            draft: false,
+            note: String::new(),
             x: 40.0,
             y: 40.0,
         };
@@ -136,13 +232,45 @@ impl Node {
     pub fn name(&self) -> &str {
         match (self.title.trim(), self.kind) {
             ("", Kind::Start) => "Start",
+            ("", Kind::Prompt) if self.only_waits() => "Pause",
+            ("", Kind::Prompt) if self.draft => "Manual prompt",
             ("", Kind::Prompt) => "Prompt step",
-            ("", Kind::Pause) => "Pause",
-            ("", Kind::ManualPrompt) => "Manual prompt",
             ("", Kind::Title) => "Tab title",
             ("", Kind::End) => "End",
             (title, _) => title,
         }
+    }
+
+    /// What a prompt step has the run do; None for another kind of step. The one
+    /// place a step's flags and text are read for it: a pause whose prompt is
+    /// cleared only waits from then on, as the editor's canvas shows.
+    pub fn mode(&self) -> Option<Mode> {
+        match self {
+            Node { kind: Kind::Prompt, draft: true, .. } => Some(Mode::Draft),
+            Node { kind: Kind::Prompt, pause: true, text, .. } if text.trim().is_empty() => Some(Mode::Wait),
+            Node { kind: Kind::Prompt, .. } => Some(Mode::Send),
+            _ => None,
+        }
+    }
+
+    /// Whether the step waits for the person's own prompt, its text a draft for it.
+    pub fn drafts(&self) -> bool {
+        self.mode() == Some(Mode::Draft)
+    }
+
+    /// Whether the step only waits for the person: a pause with no prompt for Claude.
+    pub fn only_waits(&self) -> bool {
+        self.mode() == Some(Mode::Wait)
+    }
+
+    /// Whether taking the step sends Claude a prompt of the flow's.
+    pub fn sends(&self) -> bool {
+        self.kind == Kind::Title || self.mode() == Some(Mode::Send)
+    }
+
+    /// Whether the run waits for the person once the step is done (see `pause`).
+    pub fn pauses(&self) -> bool {
+        self.kind == Kind::Prompt && self.pause
     }
 }
 
@@ -179,7 +307,7 @@ fn check_outputs(node: &Node) -> Result<(), String> {
         }
         Kind::End if !node.outputs.is_empty() => return Err(format!("End step \"{name}\" cannot have outputs")),
         Kind::Start | Kind::End => return Ok(()),
-        Kind::Prompt | Kind::Pause | Kind::ManualPrompt | Kind::Title => {}
+        Kind::Prompt | Kind::Title => {}
     }
     if node.outputs.is_empty() || node.outputs.len() > MAX_OUTPUTS {
         return Err(format!("\"{name}\" needs between 1 and at most {MAX_OUTPUTS} outputs"));
@@ -202,10 +330,10 @@ fn check_node(node: &Node) -> Result<(), String> {
     if !plain_id(&node.id) {
         return Err(format!("bad step id {:?}: a step id is 1 to {MAX_ID} letters, digits, - or _", node.id));
     }
-    if node.title.chars().count() > MAX_TITLE || node.text.chars().count() > MAX_TEXT {
-        return Err(format!("\"{}\" has a title or text that is too long", node.name()));
+    if node.title.chars().count() > MAX_TITLE || node.text.chars().count() > MAX_TEXT || node.note.chars().count() > MAX_TEXT {
+        return Err(format!("\"{}\" has a title, text or note that is too long", node.name()));
     }
-    if let Some(c) = node.title.chars().chain(node.text.chars()).find(|&c| hidden(c)) {
+    if let Some(c) = node.title.chars().chain(node.text.chars()).chain(node.note.chars()).find(|&c| hidden(c)) {
         return Err(format!(
             "\"{}\" has a hidden character (U+{:04X}) that Claude would read but the editor does not show",
             node.name(),
@@ -220,9 +348,8 @@ fn check_node(node: &Node) -> Result<(), String> {
     }
     match (node.max_runs, node.kind) {
         (None, _) => {}
-        // Leaving a pause or a manual prompt is always the person's doing, which no
-        // limit holds back; naming the tab again and again needs none.
-        (Some(_), Kind::Start | Kind::Pause | Kind::ManualPrompt | Kind::Title | Kind::End) => {
+        // Naming the tab again and again needs no limit.
+        (Some(_), Kind::Start | Kind::Title | Kind::End) => {
             return Err(format!("\"{}\" cannot have a run limit: only prompt steps can", node.name()));
         }
         (Some(n), _) if !(1..=MAX_RUNS).contains(&n) => {
@@ -233,6 +360,13 @@ fn check_node(node: &Node) -> Result<(), String> {
     if node.clear && node.kind != Kind::Start {
         return Err(format!("\"{}\" cannot clear the conversation: only Start can", node.name()));
     }
+    if node.kind != Kind::Prompt && (node.pause || node.draft || !node.note.is_empty()) {
+        return Err(format!("\"{}\" cannot pause, be a draft or have a note: only prompt steps can", node.name()));
+    }
+    // It would never be shown, yet would keep older misags from reading the flow.
+    if !node.pause && !node.note.is_empty() {
+        return Err(format!("\"{}\" has a note but does not pause: a note only shows at a pause", node.name()));
+    }
     check_outputs(node)
 }
 
@@ -240,9 +374,10 @@ fn check_node(node: &Node) -> Result<(), String> {
 /// ignore a newer field refuses the graph rather than run it differently.
 pub fn stored(mut graph: Graph) -> Graph {
     // The format each step needs, by the newest field it uses.
+    // A note goes with a pause (see `check_node`).
     let needs = |n: &Node| match n {
+        Node { pause: true, .. } | Node { draft: true, .. } => 7,
         Node { kind: Kind::Title, .. } => 6,
-        Node { kind: Kind::ManualPrompt, .. } => 5,
         Node { kind: Kind::Start, text, .. } if !text.trim().is_empty() => 4,
         Node { kind: Kind::Start, clear: true, .. } => 3,
         Node { max_runs: Some(_), .. } => 2,
@@ -409,7 +544,7 @@ fn background(graph: &Graph) -> String {
     if info.is_empty() { String::new() } else { format!("\n\nBackground for the flow:\n\n{info}") }
 }
 
-/// What a manual prompt puts into Claude's input: Start's base info (trimmed) when
+/// What a draft step puts into Claude's input: Start's base info (trimmed) when
 /// `with_info`, then the step's draft (trimmed), either of which may be empty.
 pub fn prefill_text(graph: &Graph, node: &Node, with_info: bool) -> String {
     let info = if with_info { base_info(graph) } else { String::new() };
@@ -428,6 +563,14 @@ pub fn base_info(graph: &Graph) -> String {
 pub fn resume_text(node: &Node) -> String {
     let rule = if node.kind == Kind::Title { title_rule() } else { reply_rule(node) };
     typeable(format!("Go on with the flow step \"{}\". {rule}", node.name()))
+}
+
+/// What Claude is told along with the person's prompt at a draft step with several
+/// outputs, so it ends its answer with one (see `runs::on_prompt`); None for a draft
+/// step with one, which goes on by it whatever Claude answers.
+pub fn draft_rule(node: &Node) -> Option<String> {
+    (node.drafts() && node.outputs.len() > 1)
+        .then(|| typeable(format!("This prompt is the flow step \"{}\". {}", node.name(), reply_rule(node))))
 }
 
 fn reply_rule(node: &Node) -> String {
@@ -475,19 +618,9 @@ pub fn problems(graph: &Graph) -> Vec<String> {
     // Steps Start cannot reach never run, so they are left alone.
     for node in graph.nodes.iter().filter(|n| reached.contains(n.id.as_str())) {
         let name = node.name();
-        if node.kind == Kind::Prompt && node.text.trim().is_empty() {
+        // A draft is optional, as the person writes the prompt; a pause may only wait.
+        if node.kind == Kind::Prompt && !node.draft && !node.pause && node.text.trim().is_empty() {
             problems.push(format!("\"{name}\" has no prompt."));
-        }
-        // Older versions let the person pick among several; ■ stops the run instead.
-        if node.kind == Kind::Pause && node.outputs.len() > 1 {
-            problems.push(format!(
-                "\"{name}\" has more than one output; a pause goes on one way, with ▶, so give it a single output."
-            ));
-        }
-        if node.kind == Kind::ManualPrompt && node.outputs.len() > 1 {
-            problems.push(format!(
-                "\"{name}\" has more than one output; a manual prompt goes on one way once Claude answers, so give it a single output."
-            ));
         }
         if node.kind == Kind::Title && node.outputs.len() > 1 {
             problems.push(format!(
@@ -515,9 +648,22 @@ pub(crate) mod tests {
             outputs: outputs.iter().map(|o| o.to_string()).collect(),
             max_runs: None,
             clear: false,
+            pause: false,
+            draft: false,
+            note: String::new(),
             x: 0.0,
             y: 0.0,
         }
+    }
+
+    /// A prompt step that only waits for the person (a pause).
+    pub(crate) fn pause(id: &str, outputs: &[&str]) -> Node {
+        Node { text: String::new(), pause: true, ..node(id, Kind::Prompt, outputs) }
+    }
+
+    /// A prompt step whose text is a draft for the person's own prompt (a manual prompt).
+    pub(crate) fn draft(id: &str, outputs: &[&str]) -> Node {
+        Node { text: String::new(), draft: true, ..node(id, Kind::Prompt, outputs) }
     }
 
     pub(crate) fn edge(from: &str, output: &str, to: &str) -> Edge {
@@ -683,9 +829,7 @@ pub(crate) mod tests {
         for max in [1, 3, 100] {
             check(&with_limit("p", Kind::Prompt, max)).unwrap();
         }
-        // Leaving a pause or a manual prompt is always the person's doing, which no limit holds back.
-        rejected(&with_limit("p", Kind::Pause, 2), "cannot have a run limit");
-        rejected(&with_limit("p", Kind::ManualPrompt, 2), "cannot have a run limit");
+        rejected(&with_limit("p", Kind::Title, 2), "cannot have a run limit");
         rejected(&with_limit("e", Kind::End, 2), "cannot have a run limit");
         rejected(&with_limit("start", Kind::Start, 2), "cannot have a run limit");
         for bad in [0, 101] {
@@ -788,16 +932,120 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_graph_with_a_manual_prompt_is_a_newer_format() {
+    fn a_graph_whose_prompts_pause_or_draft_is_a_newer_format() {
+        for step in [pause("m", &["ok"]), draft("m", &["sent"]), Node { note: "Look".into(), ..pause("m", &["ok"]) }] {
+            let mut g = runnable();
+            g.nodes.push(step);
+            assert_eq!(stored(g.clone()).version, 7);
+            check(&stored(g)).unwrap();
+        }
+        assert_eq!(serde_json::to_value(pause("m", &["ok"])).unwrap()["pause"], true);
+        let plain = serde_json::to_value(node("p", Kind::Prompt, &["ok"])).unwrap();
+        for field in ["pause", "draft", "note"] {
+            assert!(plain.get(field).is_none(), "{field} is left out when unused");
+        }
+    }
+
+    #[test]
+    fn only_prompt_steps_pause_draft_or_have_a_note() {
+        for kind in [Kind::Start, Kind::Title, Kind::End] {
+            let sets: [fn(&mut Node); 3] = [|n| n.pause = true, |n| n.draft = true, |n| n.note = "x".into()];
+            for set in sets {
+                let mut g = runnable();
+                g.nodes.push(node("x", kind, if kind == Kind::Title { &["done"] } else { &[] }));
+                if kind == Kind::Start {
+                    g.nodes.retain(|n| n.id != "start");
+                    g.edges.retain(|e| e.from != "start");
+                    g.nodes.last_mut().unwrap().outputs = vec!["next".into()];
+                }
+                set(g.nodes.last_mut().unwrap());
+                rejected(&g, "only prompt steps can");
+            }
+        }
+    }
+
+    #[test]
+    fn older_pause_and_manual_prompt_kinds_load_as_prompt_steps() {
+        let old: Node = serde_json::from_str(r#"{"id": "m", "kind": "manual", "text": "Try it", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
+        assert_eq!((old.kind, old.pause, old.draft, old.text.as_str(), old.note.as_str()), (Kind::Prompt, true, false, "", "Try it"));
+        assert!(old.only_waits() && !old.sends());
+        let named: Node = serde_json::from_str(r#"{"id": "m", "kind": "pause", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
+        assert_eq!((named.kind, named.pause, named.name()), (Kind::Prompt, true, "Pause"));
+        let mp: Node = serde_json::from_str(r#"{"id": "m", "kind": "manual_prompt", "text": "Fix ", "outputs": ["sent"], "x": 0, "y": 0}"#).unwrap();
+        assert_eq!((mp.kind, mp.pause, mp.draft, mp.text.as_str()), (Kind::Prompt, false, true, "Fix "));
+        assert!(mp.drafts() && !mp.sends());
+        assert_eq!(mp.name(), "Manual prompt");
+        // Saved as a prompt step from then on.
+        let saved = serde_json::to_value(&old).unwrap();
+        assert_eq!((saved["kind"].as_str(), saved["pause"].as_bool(), saved["note"].as_str()), (Some("prompt"), Some(true), Some("Try it")));
+        assert!(saved.get("text").is_some_and(|t| t == ""));
+    }
+
+    #[test]
+    fn a_prompt_that_pauses_still_sends_its_text() {
+        let p = Node { pause: true, ..node("p", Kind::Prompt, &["ok"]) };
+        assert!(p.sends() && !p.only_waits() && p.pauses());
+        assert!(!node("p", Kind::Prompt, &["ok"]).pauses());
+        // A pause needs no prompt, nor a draft; a plain prompt step does.
         let mut g = runnable();
-        g.nodes[0].text = "The app is in src/.".into();
-        g.nodes.push(Node { text: String::new(), ..node("m", Kind::ManualPrompt, &["sent"]) });
-        assert_eq!(stored(g.clone()).version, 5);
-        check(&stored(g)).unwrap();
-        // A pause is the manual step older misags know, so it needs no newer format.
+        g.nodes[1].text.clear();
+        assert_eq!(problems(&g), vec!["\"P\" has no prompt."]);
+        g.nodes[1].pause = true;
+        assert!(problems(&g).is_empty());
+        g.nodes[1].pause = false;
+        g.nodes[1].draft = true;
+        assert!(problems(&g).is_empty());
+    }
+
+    #[test]
+    fn a_draft_step_with_several_outputs_tells_claude_to_pick_one() {
+        let one = draft("m", &["sent"]);
+        assert_eq!(draft_rule(&one), None);
+        let two = draft("m", &["ok", "redo"]);
+        let rule = draft_rule(&two).unwrap();
+        assert!(rule.contains("\"M\"") && rule.contains("`FLOW: ok` or `FLOW: redo`"), "{rule}");
+        assert_eq!(draft_rule(&node("p", Kind::Prompt, &["a", "b"])), None);
+    }
+
+    #[test]
+    fn a_note_goes_with_a_pause() {
         let mut g = runnable();
-        g.nodes.push(node("m", Kind::Pause, &["ok"]));
-        assert_eq!(stored(g).version, 1);
+        g.nodes[1].note = "Check the diff.".into();
+        rejected(&g, "a note only shows at a pause");
+        g.nodes[1].pause = true;
+        check(&g).unwrap();
+    }
+
+    #[test]
+    fn an_older_kind_with_a_newer_field_is_refused_not_dropped() {
+        for json in [
+            r#"{"id": "m", "kind": "manual", "draft": true, "outputs": ["ok"], "x": 0, "y": 0}"#,
+            r#"{"id": "m", "kind": "pause", "note": "x", "outputs": ["ok"], "x": 0, "y": 0}"#,
+            r#"{"id": "m", "kind": "manual_prompt", "pause": true, "outputs": ["ok"], "x": 0, "y": 0}"#,
+        ] {
+            let e = serde_json::from_str::<Node>(json).unwrap_err().to_string();
+            assert!(e.contains("older step kind"), "{json}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_step_s_mode_is_worked_out_in_one_place() {
+        assert_eq!(node("p", Kind::Prompt, &["ok"]).mode(), Some(Mode::Send));
+        assert_eq!(Node { pause: true, ..node("p", Kind::Prompt, &["ok"]) }.mode(), Some(Mode::Send));
+        assert_eq!(pause("m", &["ok"]).mode(), Some(Mode::Wait));
+        assert_eq!(draft("m", &["ok"]).mode(), Some(Mode::Draft));
+        assert_eq!(Node { pause: true, ..draft("m", &["ok"]) }.mode(), Some(Mode::Draft));
+        assert_eq!(node("t", Kind::Title, &["ok"]).mode(), None);
+    }
+
+    #[test]
+    fn a_note_is_checked_like_the_text() {
+        let mut g = runnable();
+        g.nodes[1].pause = true;
+        g.nodes[1].note = "x".repeat(20_001);
+        rejected(&g, "too long");
+        g.nodes[1].note = "look\u{200B}".into();
+        rejected(&g, "hidden character");
     }
 
     #[test]
@@ -877,39 +1125,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_manual_prompt_goes_on_one_way() {
-        let mut g = runnable();
-        g.nodes.push(node("m", Kind::ManualPrompt, &["ok", "redo"]));
-        g.edges.push(edge("p", "pass", "m"));
-        g.edges.retain(|e| e.to != "e");
-        g.nodes.retain(|n| n.id != "e");
-        check(&g).unwrap();
-        assert_eq!(
-            problems(&g),
-            vec!["\"M\" has more than one output; a manual prompt goes on one way once Claude answers, so give it a single output."]
-        );
-        // Its draft is optional: the person writes the prompt.
-        g.nodes.last_mut().unwrap().outputs.truncate(1);
-        assert!(problems(&g).is_empty());
-    }
-
-    #[test]
-    fn manual_and_manual_prompt_kinds_load() {
-        let old: Node = serde_json::from_str(r#"{"id": "m", "kind": "manual", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
-        assert_eq!(old.kind, Kind::Pause);
-        // Saved under the name older misags read; the new name loads too.
-        assert_eq!(serde_json::to_value(Kind::Pause).unwrap(), "manual");
-        let new: Node = serde_json::from_str(r#"{"id": "m", "kind": "pause", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
-        assert_eq!(new.kind, Kind::Pause);
-        let mp: Node = serde_json::from_str(r#"{"id": "m", "kind": "manual_prompt", "outputs": ["ok"], "x": 0, "y": 0}"#).unwrap();
-        assert_eq!(mp.kind, Kind::ManualPrompt);
+    fn pauses_and_drafts_may_go_on_several_ways() {
+        for step in [pause("m", &["ok", "redo"]), draft("m", &["ok", "redo"])] {
+            let mut g = runnable();
+            g.nodes.push(step);
+            g.edges.push(edge("p", "pass", "m"));
+            g.edges.retain(|e| e.to != "e");
+            g.nodes.retain(|n| n.id != "e");
+            check(&g).unwrap();
+            assert!(problems(&g).is_empty(), "{:?}", problems(&g));
+        }
     }
 
     #[test]
     fn a_manual_prompt_s_prefill_leads_with_base_info_when_owed() {
         let mut g = runnable();
         g.nodes[0].text = " The app is in src/. ".into();
-        let mut m = node("m", Kind::ManualPrompt, &["ok"]);
+        let mut m = draft("m", &["ok"]);
         m.text = "Fix the \u{1b}bug ".into();
         // A trailing space stays, so what the person types does not run into the draft.
         assert_eq!(prefill_text(&g, &m, true), "The app is in src/.\n\nFix the bug ");
@@ -921,26 +1153,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_manual_step_goes_on_one_way() {
-        let mut g = runnable();
-        g.nodes.push(node("m", Kind::Pause, &["ok", "redo"]));
-        g.edges.push(edge("p", "pass", "m"));
-        g.edges.retain(|e| e.to != "e");
-        g.nodes.retain(|n| n.id != "e");
-        // Flows from older versions still load, to be cut down to one output.
-        check(&g).unwrap();
-        assert_eq!(
-            problems(&g),
-            vec!["\"M\" has more than one output; a pause goes on one way, with ▶, so give it a single output."]
-        );
-    }
-
-    #[test]
     fn steps_start_cannot_reach_are_ignored() {
         let mut g = runnable();
         g.nodes.push(node("x", Kind::End, &[]));
         g.nodes.push(Node { text: String::new(), ..node("q", Kind::Prompt, &["done"]) });
-        g.nodes.push(node("m", Kind::Pause, &["ok", "redo"]));
+        g.nodes.push(Node { title: "M".into(), ..node("m", Kind::Title, &["ok", "redo"]) });
         g.edges.push(edge("q", "done", "m"));
         assert!(problems(&g).is_empty());
     }
@@ -951,7 +1168,7 @@ pub(crate) mod tests {
         g.nodes[1].text = "  ".into();
         // An output with no next step ends the flow there, which is fine.
         g.edges.retain(|e| e.output != "fail");
-        g.nodes.push(Node { title: String::new(), ..node("m", Kind::Pause, &["done"]) });
+        g.nodes.push(Node { title: String::new(), ..pause("m", &["done"]) });
         assert_eq!(problems(&g), vec!["\"P\" has no prompt."]);
         let mut g = runnable();
         g.nodes.remove(0);

@@ -28,18 +28,22 @@ export interface Run {
   total: number;
   /** Whether Claude can be asked to go on with the step (a prompt step that needs attention). */
   resumable: boolean;
-  /** Whether the app has yet to fill Claude's input for the manual prompt the run waits at. */
+  /** Whether the app has yet to fill Claude's input for the draft step (one that is yours to write) the run waits at. */
   prefill: boolean;
   /** The kind of the step the run is at; null for a run that cannot be read. */
   stepKind: StepKind | null;
   /** Whether the run waits at Start for Claude's reply to its briefing. */
   briefing: boolean;
+  /** The output Claude picked at a step that pauses once done, which ▶ goes on by; null for none. */
+  suggested: string | null;
+  /** Whether the run waits for your own prompt at a step that is yours to write. */
+  awaitsPrompt: boolean;
 }
 
 export const STATUS_LABELS: Record<RunStatus, string> = { running: "Running", manual: "Waiting for you", attention: "Needs attention" };
 
-/** Whether the run waits for the person's own prompt, at a manual prompt (not while Claude answers it). */
-export const awaitsPrompt = (run: Run) => run.stepKind === "manual_prompt" && run.status !== "running";
+/** Whether the run waits for the person's own prompt, at a draft step (not while Claude answers it). */
+export const awaitsPrompt = (run: Run) => run.awaitsPrompt;
 
 /** What the run is doing, for the person. */
 export function statusLabel(run: Run): string {
@@ -76,8 +80,9 @@ export interface FlowsOptions {
   /** Stops the run (the ■ button that takes ▶'s place). */
   onStop(run: Run): void;
   /**
-   * Goes on from a run waiting for you (a Pause, a Manual prompt, a step that needs
-   * attention) as `output`: ▶ for its only output, else its buttons under the flow.
+   * Goes on from a run waiting for you (at a step that paused, one that is yours to
+   * write, or one that needs attention) as `output`: ▶ for Claude's pick or the step's
+   * only output, and its buttons under the flow when it has several.
    * Resolves to why it could not, shown in the run's row, or null.
    */
   onContinue(run: Run, output: string): Promise<string | null>;
@@ -378,14 +383,17 @@ export function createFlows(opts: FlowsOptions): Flows {
         : run.status === "attention"
           ? `Go on from "${run.step}" to the next step`
           : `Done with "${run.step}": go on`;
-    if (waits && mine.outputs.length === 1) {
-      // One way on (a Pause, a Manual prompt to skip, a one-output step): ▶ takes it.
-      const go = button("go-on", "play", title(mine), () => void goOn(mine, mine.outputs[0]));
+    // The way ▶ goes on: the output Claude picked at a step that paused, or a step's one output.
+    const way = !waits ? null : mine.status === "manual" && mine.suggested !== null ? mine.suggested : mine.outputs.length === 1 ? mine.outputs[0] : null;
+    if (waits && way !== null) {
+      // One way on (a pause, a draft step to skip, a one-output step, Claude's pick): ▶ takes it.
+      const go = button("go-on", "play", mine.suggested === way ? `Go on as "${way}", as Claude picked at "${mine.step}"` : title(mine), () => void goOn(mine, way));
       go.disabled = busy;
       go.addEventListener("click", (e) => e.stopPropagation());
       li.insertBefore(go, action);
-    } else if (waits && mine.outputs.length > 1) {
-      // Several ways on (a step that needs attention, or an older flow's Pause): its outputs, on a line of their own.
+    }
+    if (waits && mine.outputs.length > 1) {
+      // Several ways on (a step that needs attention, a pause with several, or another than Claude's pick): its outputs, on a line of their own.
       const picks = document.createElement("div");
       picks.className = "picks";
       picks.append(

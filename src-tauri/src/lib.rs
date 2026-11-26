@@ -622,6 +622,8 @@ mod tests {
                 prefill: false,
                 step_kind: Some(crate::flows::Kind::Prompt),
                 briefing: false,
+                suggested: Some("done".into()),
+                awaits_prompt: false,
             },
             "prefill": runs::Prefill { text: "Fix it".into(), token: 7 },
             "tabTitle": runs::TabTitle { tab_id: "tab-1".into(), title: "Fix login".into() },

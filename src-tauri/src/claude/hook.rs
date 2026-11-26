@@ -373,7 +373,7 @@ mod tests {
         let db = Db::open(path.clone()).unwrap();
         let flow = db.create_flow("F").unwrap().id;
         let mut g = crate::flows::tests::runnable();
-        g.nodes.push(crate::flows::tests::node("mp", crate::flows::Kind::ManualPrompt, &["sent"]));
+        g.nodes.push(crate::flows::tests::draft("mp", &["sent"]));
         g.edges[0].to = "mp".into();
         g.edges.push(crate::flows::tests::edge("mp", "sent", "p"));
         db.save_flow_graph(flow, &g).unwrap();
@@ -392,7 +392,7 @@ mod tests {
         let db = Db::open(path.clone()).unwrap();
         let flow = db.create_flow("F").unwrap().id;
         let mut g = crate::flows::tests::runnable();
-        g.nodes.push(crate::flows::tests::node("mp", crate::flows::Kind::ManualPrompt, &["sent"]));
+        g.nodes.push(crate::flows::tests::draft("mp", &["sent"]));
         g.edges[0].to = "mp".into();
         db.save_flow_graph(flow, &g).unwrap();
         let mut conn = db::connect_existing(&path).unwrap();
