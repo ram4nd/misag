@@ -80,20 +80,24 @@ Steps ("nodes"):
             "prompt": sends "text" to Claude in the run's tab. misag adds an
               instruction to do only this step and to end the reply with
               "FLOW: <output>", which picks the output, so the text need not
-              mention the outputs. See "pause" and "draft" for the person's
-              part in it. ("manual", "pause" and "manual_prompt", the kinds
-              older versions wrote, are read as prompt steps with "pause"
-              or "draft".)
+              mention the outputs. See "pause" for the person's part in it.
             "title": has Claude name the run's tab after what the person
               asked it. Claude replies with "TITLE: <title>", which becomes
               the tab's name, and the run goes on by the step's one output.
               "text" is optional guidance, such as "Use the ticket number".
             "end": ends the run and has no outputs. Optional: an output that
               leads nowhere ends it too.
+            "manual", "pause" and "manual_prompt", kinds of older versions,
+              and a "prompt" with "draft": true, which older versions had
+              the person write, import as unknown steps: shown gray in the
+              app with what they hold, they keep the flow from running
+              until replaced with a new step and deleted. An unknown step
+              is exported as "unknown", with the kind it had in
+              "unknownKind". Any other kind is refused, as a typo.
   title     The step's name on the canvas (up to 200 characters).
-  text      The prompt, a draft (see "draft"), or a tab title's guidance (up
-            to 20000 characters). A prompt step with "pause" and no text
-            only waits for the person.
+  text      The prompt, or a tab title's guidance (up to 20000 characters).
+            A prompt step with "pause" and no text only waits for the
+            person.
             Optional on Start: base info, such as where things are (up to
             4000 characters). A run first briefs Claude with the flow's
             rules (one step at a time, end each with "FLOW: <output>") and
@@ -108,8 +112,7 @@ Steps ("nodes"):
   maxRuns   Optional, prompt steps only: how many times a run may take the
             step (1 to 100), for loops such as review and fix; then the run
             waits for the person at the step before. It holds back the flow
-            only, also at a pause or a draft step: the person can always go
-            on into the step.
+            only, also at a pause: the person can always go on into the step.
   clear     Optional, Start only: true begins each run by typing /clear, so
             Claude starts the flow in a new conversation.
   pause     Optional, prompt steps only: true has the run wait for the person
@@ -120,16 +123,9 @@ Steps ("nodes"):
   note      Optional, and only with "pause": what the person is to do
             there, shown while the run waits (up to 20000 characters);
             never sent to Claude.
-  draft     Optional, prompt steps only: true puts "text" (an optional
-            draft; after a /clear, led by Start's base info) into Claude's
-            input without sending it. The person writes the prompt and
-            sends it, and once Claude answers, the run goes on by the
-            step's output (with several, Claude is asked to end with a
-            FLOW line naming one). With one output, ▶ skips the step; with
-            several, the person picks one to skip it. With "pause" too, the
-            run waits for the person again once Claude has answered.
-  ("manual", "pause" and "manual_prompt" steps cannot also have "pause",
-  "draft" or "note": write them as "prompt" steps.)
+  unknownKind  Only on an "unknown" step: the kind it was stored with. Written
+            by misag when it exports an unknown step; not for new flows.
+  draft     Read only for older flows (see "kind"); not for new flows.
   x, y      Optional position on the canvas: give both or neither. Steps
             without one are laid out in columns from Start.
 

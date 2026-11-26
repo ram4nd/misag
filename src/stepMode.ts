@@ -1,7 +1,7 @@
 import type { Step } from "./flowEditor";
 
-/** What a prompt step has the run do: send its prompt, put your draft into Claude's input, or only wait for you. */
-export type StepMode = "send" | "draft" | "wait";
+/** What a prompt step has the run do: send its prompt, or only wait for you. */
+export type StepMode = "send" | "wait";
 
 /**
  * What prompt step `s` has the run do; null for another kind of step. Mirrors
@@ -10,7 +10,6 @@ export type StepMode = "send" | "draft" | "wait";
  */
 export function stepMode(s: Step): StepMode | null {
   if (s.kind !== "prompt") return null;
-  if (s.draft === true) return "draft";
   if (s.pause === true && s.text.trim() === "") return "wait";
   return "send";
 }

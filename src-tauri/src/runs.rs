@@ -12,13 +12,7 @@
 //! A prompt step that pauses (`Node::pause`) waits for the person once Claude has
 //! answered, with the output Claude picked suggested: ▶ in the Flows box goes on by
 //! it, or the person picks another, or stops the run. One with no prompt only
-//! waits. A draft step has the app put the step's draft (led by Start's base info
-//! after a clear) into Claude's input without sending it (`prefill_text`,
-//! `prefilled`); the person's own prompt, reported by the UserPromptSubmit hook
-//! (`on_prompt`), has the step run, and Claude's answer moves it on: by its one
-//! output, with no `FLOW:` line, or by the `FLOW:` line Claude was asked for along
-//! with the prompt when it has several. ▶ skips it. A reply the
-//! runner cannot follow waits too: the person picks an output in the editor's run
+//! waits. A reply the runner cannot follow waits too: the person picks an output in the editor's run
 //! bar (and can do so for a running step too, if Claude was interrupted) or has
 //! Claude go on with the step. A pick or Continue names the step it was made for,
 //! so one that arrives after the run moved on is refused. An output with no next
@@ -66,8 +60,7 @@ pub enum Status {
     /// Claude is working on a prompt step.
     Running,
     /// Waiting for the person: at a pause, to go on (▶, by the output Claude
-    /// suggested, or the step's one output) or stop the run; at a draft step, also
-    /// to send their prompt, which makes the step `Running` until Claude answers.
+    /// suggested, or the step's one output) or stop the run.
     Manual,
     /// The run needs a person (its note says why): Claude's reply could not be
     /// followed, it asked for one, or the run hit `MAX_RUN_STEPS`. The person picks
@@ -101,17 +94,10 @@ pub struct Run {
     pub total: i64,
     /// Whether Claude can be asked to go on with the step (see `resume`).
     pub resumable: bool,
-    /// Whether the app has yet to fill Claude's input for the draft step the run
-    /// waits at (see `prefill_text`).
-    pub prefill: bool,
-    /// The kind of the step the run is at; None for a run that cannot be read.
-    pub step_kind: Option<Kind>,
     /// Whether the run waits at Start for Claude's reply to its briefing.
     pub briefing: bool,
     /// The output Claude picked at a step that pauses, which ▶ goes on by.
     pub suggested: Option<String>,
-    /// Whether the run waits for the person's own prompt at a draft step.
-    pub awaits_prompt: bool,
 }
 
 /// How Continue has Claude go on with a step that needs attention.
@@ -231,10 +217,6 @@ impl Status {
     /// The statuses in which Claude's turn ending may move a run on (see `on_stop`).
     const LISTENING: [Status; 2] = [Status::Running, Status::Attention];
 
-    /// The statuses in which the person's prompt may change a run (see `on_prompt`),
-    /// besides a running one whose typed prompt is pending (`Phase::Typed`).
-    const PROMPTED: [Status; 2] = [Status::Manual, Status::Attention];
-
     fn as_str(self) -> &'static str {
         match self {
             Status::Running => "running",
@@ -275,17 +257,6 @@ fn parse_graph(json: &str) -> Result<Graph, String> {
     serde_json::from_str(json).map_err(|e| format!("the run's steps cannot be read ({e})"))
 }
 
-/// A new token naming a paste (see `prefilled`), kept within what JavaScript
-/// numbers hold exactly (2^53 - 1), as the app hands it back; never `NO_TOKEN`.
-fn new_token() -> i64 {
-    const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
-    i64::try_from(uuid::Uuid::new_v4().as_u64_pair().0 % (MAX_SAFE_INTEGER - 1) + 1).unwrap_or(1)
-}
-
-/// The token naming a paste owed with none stored (`prefill_token` NULL, as a
-/// database edited by hand may leave it), so that paste too can be recorded.
-const NO_TOKEN: i64 = 0;
-
 /// Where a run is with its step, and what only that place has. Each phase has one
 /// status (see `Phase::status`); `RunState::from_columns` and `RunState::columns`
 /// map it to and from `flow_runs`' columns. The CHECKs on `flow_runs` (in `db::schema`'s
@@ -301,8 +272,7 @@ enum Phase {
     /// Running at Start, waiting for Claude's reply to the briefing sent at `sent_at`
     /// (see `expire`; status running, briefing 1, briefing_at).
     Briefing { sent_at: i64 },
-    /// Running a step (status running): Claude works on a prompt step, or answers the
-    /// person's prompt at a draft step.
+    /// Running a step (status running): Claude works on a prompt step.
     Working,
     /// Running a prompt step whose prompt the app typed into the tab after the person
     /// moved a running step on, entered from `Working` or from `Typed` itself (a
@@ -321,14 +291,13 @@ enum Phase {
     /// hook. Moving on by hand into a step that clears or briefs Claude first (a
     /// late reply landing on those) is out of scope: only prompt steps are `Typed`.
     Typed { turn_ended: bool },
-    /// Waiting for the person (status manual): at a pause to go on, at a draft step
-    /// for their prompt; `prefill`, whether the app has yet to fill Claude's input for
-    /// that prompt (prefill 1; see `prefill_text`); `suggested`, the output Claude
-    /// picked at a step that pauses once done (suggested), which ▶ goes on by.
-    Waiting { prefill: bool, suggested: Option<String> },
+    /// Waiting for the person to go on (status manual), at a pause; `suggested`, the
+    /// output Claude picked at a step that pauses once done (suggested), which ▶ goes
+    /// on by.
+    Waiting { suggested: Option<String> },
     /// Needing a person (status attention), saying `why` (note), with how Continue
-    /// goes on (`resume`; None, it cannot help), and `prefill` as for `Waiting`.
-    NeedsPerson { why: String, resume: Option<Resume>, prefill: bool },
+    /// goes on (`resume`; None, it cannot help).
+    NeedsPerson { why: String, resume: Option<Resume> },
     /// Done, or `stopped` (status done or stopped), with whether Claude has yet to be
     /// told its flow is finished (closing 1; see `RunState::owes_closing`).
     Ended { stopped: bool, owes_closing: bool },
@@ -344,21 +313,6 @@ impl Phase {
             Phase::Ended { stopped: false, .. } => Status::Done,
         }
     }
-
-    /// Whether the app has yet to fill Claude's input for the draft step the run
-    /// waits at (see `prefill_text`).
-    fn prefill(&self) -> bool {
-        matches!(self, Phase::Waiting { prefill: true, .. } | Phase::NeedsPerson { prefill: true, .. })
-    }
-
-    /// The same phase, owing a paste or not; a phase that cannot owe one is as it is.
-    fn with_prefill(self, owed: bool) -> Self {
-        match self {
-            Phase::Waiting { suggested, .. } => Phase::Waiting { prefill: owed, suggested },
-            Phase::NeedsPerson { why, resume, .. } => Phase::NeedsPerson { why, resume, prefill: owed },
-            other => other,
-        }
-    }
 }
 
 /// A run's state as `flow_runs` stores it, column by column (see `RunState::COLUMNS`).
@@ -371,8 +325,6 @@ struct Columns {
     resume: Option<String>,
     clear: Option<String>,
     briefed: bool,
-    prefill: bool,
-    prefill_token: Option<i64>,
     briefing: bool,
     briefing_at: Option<i64>,
     closing: bool,
@@ -392,8 +344,6 @@ impl Columns {
             resume: row.get("resume")?,
             clear: row.get("clear")?,
             briefed: row.get("briefed")?,
-            prefill: row.get("prefill")?,
-            prefill_token: row.get("prefill_token")?,
             briefing: row.get("briefing")?,
             briefing_at: row.get("briefing_at")?,
             closing: row.get("closing")?,
@@ -421,16 +371,13 @@ struct RunState {
     /// Whether Claude has the run's rules and Start's base info (see `first_turn` and
     /// `RunState::prompt`): false until the briefing is sent, and after a clear.
     briefed: bool,
-    /// Names the last paste owed (see `prefilled`). It outlives the paste, so a
-    /// record of an earlier one that arrives late cannot cancel one owed since.
-    prefill_token: Option<i64>,
     phase: Phase,
 }
 
 impl RunState {
     /// The columns `from_row` reads.
     const COLUMNS: &str =
-        "node_id, status, steps, note, resume, clear, briefed, prefill, prefill_token, briefing, briefing_at, closing, typed, suggested";
+        "node_id, status, steps, note, resume, clear, briefed, briefing, briefing_at, closing, typed, suggested";
 
     /// The state in `row`'s `COLUMNS`; an error for a state this version cannot read
     /// (see `from_columns`), including a column of the wrong type, so one such run
@@ -446,7 +393,10 @@ impl RunState {
     /// (a raw stop, as for an unreadable run, leaves the rest as it was), and a
     /// `briefing_at` the briefing has outlived, which the CHECKs now refuse (the
     /// migration that added them cleared it), so only a writer that bypasses them
-    /// (such as a database edited by hand) can leave one. Changing what this reads
+    /// (such as a database edited by hand) can leave one. Nor are `prefill` and
+    /// `prefill_token` read, which recorded a paste owed into Claude's input at the
+    /// prompt steps the person wrote, which this version no longer has: such a run
+    /// waits as at a pause, and the next save clears them. Changing what this reads
     /// needs a new migration rebuilding `flow_runs` with matching CHECKs (see `Phase`).
     fn from_columns(c: Columns) -> Result<Self, String> {
         let status = Status::parse(&c.status)?;
@@ -463,9 +413,6 @@ impl RunState {
                 }
                 if resume.is_some() {
                     return cannot("a way to continue");
-                }
-                if c.prefill {
-                    return cannot("a paste owed");
                 }
                 let typed = match c.typed {
                     0 => None,
@@ -503,20 +450,16 @@ impl RunState {
                     if resume.is_some() {
                         return cannot("a way to continue");
                     }
-                    // A suggestion means Claude has answered: no prompt of the person's is owed.
-                    if c.prefill && c.suggested.is_some() {
-                        return cannot("both a paste owed and a suggested output");
-                    }
-                    Phase::Waiting { prefill: c.prefill, suggested: c.suggested }
+                    Phase::Waiting { suggested: c.suggested }
                 } else {
                     match c.note {
-                        Some(why) => Phase::NeedsPerson { why, resume, prefill: c.prefill },
+                        Some(why) => Phase::NeedsPerson { why, resume },
                         None => return cannot("no note saying why"),
                     }
                 }
             }
         };
-        Ok(RunState { node_id: c.node_id, steps: c.steps, briefed: c.briefed, prefill_token: c.prefill_token, phase })
+        Ok(RunState { node_id: c.node_id, steps: c.steps, briefed: c.briefed, phase })
     }
 
     /// The columns that store this state.
@@ -529,8 +472,6 @@ impl RunState {
             resume: None,
             clear: None,
             briefed: self.briefed,
-            prefill: false,
-            prefill_token: self.prefill_token,
             briefing: false,
             briefing_at: None,
             closing: false,
@@ -542,10 +483,8 @@ impl RunState {
             Phase::Briefing { sent_at } => (c.briefing, c.briefing_at) = (true, Some(*sent_at)),
             Phase::Working => {}
             Phase::Typed { turn_ended } => c.typed = 1 + i64::from(*turn_ended),
-            Phase::Waiting { prefill, suggested } => (c.prefill, c.suggested) = (*prefill, suggested.clone()),
-            Phase::NeedsPerson { why, resume, prefill } => {
-                (c.note, c.resume, c.prefill) = (Some(why.clone()), resume.map(|r| r.as_str().to_owned()), *prefill);
-            }
+            Phase::Waiting { suggested } => c.suggested = suggested.clone(),
+            Phase::NeedsPerson { why, resume } => (c.note, c.resume) = (Some(why.clone()), resume.map(|r| r.as_str().to_owned())),
             Phase::Ended { owes_closing, .. } => c.closing = *owes_closing,
         }
         c
@@ -559,7 +498,6 @@ impl RunState {
             node_id: start.id.clone(),
             steps: 0,
             briefed: false,
-            prefill_token: None,
             phase: if clears { Phase::Clearing { done: false } } else { Phase::Working },
         }
     }
@@ -589,7 +527,7 @@ impl RunState {
         let changed = conn
             .execute(
                 "UPDATE flow_runs SET node_id = :node_id, status = :status, steps = :steps, note = :note, resume = :resume,
-                 clear = :clear, briefed = :briefed, prefill = :prefill, prefill_token = :prefill_token, briefing = :briefing,
+                 clear = :clear, briefed = :briefed, prefill = 0, prefill_token = NULL, briefing = :briefing,
                  briefing_at = :briefing_at, closing = :closing, typed = :typed, suggested = :suggested, updated_at = :updated_at
                  WHERE id = :id",
                 named_params! {
@@ -601,8 +539,6 @@ impl RunState {
                     ":resume": c.resume,
                     ":clear": c.clear,
                     ":briefed": c.briefed,
-                    ":prefill": c.prefill,
-                    ":prefill_token": c.prefill_token,
                     ":briefing": c.briefing,
                     ":briefing_at": c.briefing_at,
                     ":closing": c.closing,
@@ -618,8 +554,8 @@ impl RunState {
         Ok(())
     }
 
-    /// The run at `node_id` in `phase` with `steps`. What Claude has (`briefed`) and
-    /// the last paste's token carry over.
+    /// The run at `node_id` in `phase` with `steps`. What Claude has (`briefed`)
+    /// carries over.
     fn moved(&self, node_id: &str, phase: Phase, steps: i64) -> Self {
         RunState { node_id: node_id.to_owned(), steps, phase, ..self.clone() }
     }
@@ -627,13 +563,13 @@ impl RunState {
     /// The run waiting at `node_id` for the person, saying why, and how Continue goes
     /// on from there (None: it cannot help, and the person picks an output).
     fn waiting(&self, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Self {
-        self.moved(node_id, Phase::NeedsPerson { why: why.to_owned(), resume, prefill: false }, steps)
+        self.moved(node_id, Phase::NeedsPerson { why: why.to_owned(), resume }, steps)
     }
 
     /// The run waiting where it is for the person, saying why, and how Continue goes on
-    /// from there (see `waiting`); a paste it owes stays owed.
+    /// from there (see `waiting`).
     fn waiting_here(&self, why: &str, resume: Option<Resume>) -> Self {
-        let phase = Phase::NeedsPerson { why: why.to_owned(), resume, prefill: self.phase.prefill() };
+        let phase = Phase::NeedsPerson { why: why.to_owned(), resume };
         RunState { phase, ..self.clone() }
     }
 
@@ -669,11 +605,6 @@ impl RunState {
     /// this version cannot read.
     fn owes_closing(&self) -> bool {
         self.briefed && !matches!(self.phase, Phase::Clearing { .. })
-    }
-
-    /// The run owing the app a paste named by `token` (see `prefilled`).
-    fn with_prefill(self, token: i64) -> Self {
-        RunState { prefill_token: Some(token), phase: self.phase.with_prefill(true), ..self }
     }
 
     /// Has Claude get `node`'s prompt, led by the run's rules and Start's base info if
@@ -756,14 +687,6 @@ fn continue_offered(phase: &Phase, kind: Kind) -> Option<Resume> {
     }
 }
 
-/// Whether the run waits for the person at a draft step (`node`, where it is): for
-/// their prompt, or, once Claude's answer to it was lost or could not be followed,
-/// for it again or an output. Not once Claude has answered a step that pauses,
-/// which waits for the person to go on.
-fn awaits_prompt(state: &RunState, node: &Node) -> bool {
-    node.drafts() && matches!(state.phase, Phase::Waiting { suggested: None, .. } | Phase::NeedsPerson { .. })
-}
-
 mod transition;
 
 use transition::Cx;
@@ -776,10 +699,10 @@ struct Stored {
 }
 
 impl Stored {
-    /// What its changes are worked out from (see `transition::Cx`), with a fresh
-    /// paste token, and `taken` for how often it took each step.
+    /// What its changes are worked out from (see `transition::Cx`), with `taken` for
+    /// how often it took each step.
     fn cx<'a>(&'a self, taken: &'a Taken) -> Cx<'a> {
-        Cx { graph: &self.graph, taken, token: new_token() }
+        Cx { graph: &self.graph, taken }
     }
 
     /// Saves `state` as the run's; skips the write (and its `updated_at` stamp) when
@@ -966,9 +889,7 @@ pub fn cleared(conn: &mut Connection, run_id: i64) -> Result<Cleared, String> {
 /// any. A tab with no run is left alone. A run that waits for the person at a
 /// prompt step is left alone too, unless Claude's reply ends with one of the
 /// step's outputs and Continue is offered there (see `continue_offered`); one
-/// that waits at Start, a pause or a draft step always is. A draft step with one
-/// output the person sent takes it, whatever the reply (and waits there with it
-/// suggested if the step pauses).
+/// that waits at Start or a pause always is.
 pub fn on_stop(conn: &mut Connection, tab_id: &TabId, reply: Option<&str>) -> Result<Option<String>, String> {
     // Every turn of every tab ends here: most tabs run no flow, so look before
     // taking the write lock.
@@ -1044,69 +965,24 @@ pub fn proceed(conn: &mut Connection, run_id: i64, step_id: &str, output: &str) 
     Ok(next)
 }
 
-/// What the app puts into Claude's input for a draft step (see `prefill_text`).
-#[derive(Serialize, Clone, Debug, PartialEq)]
-pub struct Prefill {
-    pub text: String,
-    /// Names this paste to `prefilled`.
-    pub token: i64,
-}
-
-/// The text to put into Claude's input for the draft step run `run_id` waits at,
-/// `step_id`: Start's base info if Claude lacks it, then the step's draft. None if
-/// the app owes no paste there (anymore): the run moved on or was stopped, or the
-/// text was pasted. Reading it changes nothing; `prefilled` records the paste, so
-/// one that fails is tried again.
-pub fn prefill_text(conn: &mut Connection, run_id: i64, step_id: &str) -> Result<Option<Prefill>, String> {
-    let Some(run) = active_run(conn, "id = ?1", &run_id)? else { return Ok(None) };
-    let state = &run.state;
-    if state.node_id != step_id || !state.phase.prefill() {
-        return Ok(None);
-    }
-    let node = node_of(&run.graph, &state.node_id)?;
-    if !awaits_prompt(state, node) {
-        return Ok(None);
-    }
-    let text = flows::prefill_text(&run.graph, node, !state.briefed);
-    Ok(Some(Prefill { text, token: state.prefill_token.unwrap_or(NO_TOKEN) }).filter(|p| !p.text.is_empty()))
-}
-
-/// The app put the draft step's text named by `token` into Claude's input (see
-/// `prefill_text`). A paste owed since (after a clear, say) stays owed. Claude has
-/// the base info only once the person sends it (see `on_prompt`).
-pub fn prefilled(conn: &mut Connection, run_id: i64, step_id: &str, token: i64) -> Result<(), String> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-    let Some(state) = RunState::load_active(&tx, run_id)?.transpose()? else { return Ok(()) };
-    let Some(state) = transition::prefilled(&state, step_id, token) else { return Ok(()) };
-    state.save(&tx, run_id)?;
-    tx.commit().map_err(sql)
-}
-
 /// The person sent `prompt` to Claude in tab `tab_id` (the UserPromptSubmit hook):
-/// a run waiting at a draft step runs it, so Claude's answer moves it on (see
-/// `on_stop`); with several outputs, Claude is told to end with one of them (see
-/// `flows::draft_rule`). Claude has Start's base info if the prompt carried it. A run moved
-/// on by hand (`Phase::Typed`) reacts to the step's own prompt, which the app
-/// typed: Claude's answer to it is the step's reply (see `transition::prompt_sent`).
-/// A command Claude Code handles itself is not a prompt to Claude (see
-/// `local_command`), and prompts at any other step change nothing.
+/// a run moved on by hand (`Phase::Typed`) reacts to the step's own prompt, which
+/// the app typed: Claude's answer to it is the step's reply (see
+/// `transition::prompt_sent`). A command Claude Code handles itself is not a prompt
+/// to Claude (see `local_command`), and prompts at any other step change nothing.
 /// Returns what to add to Claude's context with the prompt: that a flow which ran
-/// in the tab is finished, owed since it ended (see `RunState::owes_closing`), and
-/// a draft step's rule.
+/// in the tab is finished, owed since it ended (see `RunState::owes_closing`).
 pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<Option<String>, String> {
     if local_command(prompt) {
         return Ok(None);
     }
     // Every prompt in every tab comes here: look before taking the write lock. The
-    // phases listed are those `transition::prompt_sent` changes: Waiting and
-    // NeedsPerson (manual, attention) and Typed (running, typed 1 or 2).
+    // phase listed is the one `transition::prompt_sent` changes: Typed (running,
+    // typed 1 or 2).
     let waiting = conn
         .query_row(
-            &format!(
-                "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND (status IN {} OR (status = ?2 AND typed <> 0))
-                 UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
-                sql_list(&Status::PROMPTED)
-            ),
+            "SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND status = ?2 AND typed <> 0
+             UNION ALL SELECT 1 FROM flow_runs WHERE tab_id = ?1 AND closing = 1 LIMIT 1",
             params![tab_id.as_str(), Status::Running.as_str()],
             |_| Ok(()),
         )
@@ -1124,30 +1000,23 @@ pub fn on_prompt(conn: &mut Connection, tab_id: &TabId, prompt: &str) -> Result<
         .optional()
         .map_err(sql)?;
     let closing = finished.map(|run| flow_name(&tx, run)).transpose()?.map(|name| flows::closing_text(&name));
-    let mut rule = None;
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())?
         && let Some(state) = transition::prompt_sent(&run.cx(NOTHING_TAKEN), &run.state, prompt)?
     {
-        let node = node_of(&run.graph, &state.node_id)?;
-        if state.phase == Phase::Working && awaits_prompt(&run.state, node) {
-            rule = flows::draft_rule(node);
-        }
         state.save(&tx, run.id)?;
     }
     tx.commit().map_err(sql)?;
-    let context: Vec<String> = closing.into_iter().chain(rule).collect();
-    Ok((!context.is_empty()).then(|| context.join("\n\n")))
+    Ok(closing)
 }
 
 /// Commands Claude Code runs itself, whose output is not an answer to the person's
-/// prompt: sending one is not their prompt at a draft step (no answer would move
-/// the step on), nor does it carry a finished flow's note. Other text that starts
+/// prompt: sending one does not carry a finished flow's note. Other text that starts
 /// with a slash is a prompt: a skill, a custom or MCP command, a built-in sent to
 /// Claude as a prompt (/review, /init, /doctor), or a file path.
 ///
 /// Matches the first word only, aliases included, as listed for Claude Code 2.1.326
 /// (code.claude.com/docs/en/commands). A command missing here counts as a prompt:
-/// the step shows Running, and the person can still pick an output. Update it when
+/// the note goes along with it. Update it when
 /// Claude Code adds commands.
 const LOCAL_COMMANDS: &[&str] = &[
     "add-dir", "advisor", "agents", "android", "app", "autocompact", "bashes", "branch", "btw", "bug", "cd", "checkpoint",
@@ -1170,14 +1039,13 @@ fn local_command(prompt: &str) -> bool {
 }
 
 /// The UserPromptSubmit hook could not record a prompt in tab `tab_id`, failing
-/// with `error`: a run waiting at a draft step, or for the prompt the app typed
-/// (`Phase::Typed`), would never see Claude's answer, so it waits for the person,
-/// saying why (see `transition::prompt_unseen`), rather than for a prompt already
-/// sent. Its paste, if still owed, stays owed.
+/// with `error`: a run waiting for the prompt the app typed (`Phase::Typed`) would
+/// never see Claude's answer, so it waits for the person, saying why (see
+/// `transition::prompt_unseen`), rather than for a prompt already sent.
 fn prompt_unseen(conn: &mut Connection, tab_id: &TabId, error: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? else { return Ok(()) };
-    let Some(state) = transition::prompt_unseen(&run.cx(NOTHING_TAKEN), &run.state, error)? else { return Ok(()) };
+    let Some(state) = transition::prompt_unseen(&run.state, error) else { return Ok(()) };
     state.save(&tx, run.id)?;
     tx.commit().map_err(sql)
 }
@@ -1193,9 +1061,8 @@ pub enum Hook {
 
 /// `hook` in tab `tab_id` failed with `error`, so the tab's run would wait for what
 /// it will never see: after the Stop hook, a running step waits for the person (see
-/// `pause_tab`); after the UserPromptSubmit hook, so does a draft step waiting
-/// for the person's prompt, or a run waiting for the prompt the app typed (see
-/// `prompt_unseen`). Best effort: returns `error`, with why the run could not be
+/// `pause_tab`); after the UserPromptSubmit hook, so does a run waiting for the
+/// prompt the app typed (see `prompt_unseen`). Best effort: returns `error`, with why the run could not be
 /// marked if it could not.
 pub fn hook_failed(conn: &mut Connection, tab_id: &TabId, hook: Hook, error: String) -> String {
     let marked = match hook {
@@ -1258,7 +1125,7 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     drop_closing(&tx, tab_id)?;
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
-        run.save(&tx, &transition::cleared_tab(&run.cx(NOTHING_TAKEN), &run.state, why)?)?;
+        run.save(&tx, &transition::cleared_tab(&run.state, why))?;
     }
     tx.commit().map_err(sql)
 }
@@ -1266,15 +1133,13 @@ pub fn clear_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(),
 /// The Stop hook failed in tab `tab_id`: makes the tab's running run wait for the
 /// person, saying why, as Claude's reply to its step was not seen (see
 /// `transition::stop_failed`), so Continue sends the step's prompt again, except
-/// while the run reads its briefing, where the person picks an output, and while it
-/// runs a draft step, where the person sends their prompt again or picks one
-/// (see `transition::answer_lost`). A run still at Start waiting for its clear has
+/// while the run reads its briefing, where the person picks an output. A run still at Start waiting for its clear has
 /// no step to reply to, and one waiting for the prompt the app typed lost no reply
 /// of its step: both are left alone.
 fn pause_tab(conn: &mut Connection, tab_id: &TabId, why: &str) -> Result<(), String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
     if let Some(run) = active_run(&tx, "tab_id = ?1", &tab_id.as_str())? {
-        run.save(&tx, &transition::stop_failed(&run.cx(NOTHING_TAKEN), run.state.clone(), why)?)?;
+        run.save(&tx, &transition::stop_failed(run.state.clone(), why))?;
     }
     tx.commit().map_err(sql)
 }
@@ -1353,9 +1218,9 @@ pub fn after_restart(conn: &mut Connection, open_tabs: &[TabId]) -> Result<(), S
             }
             Err(LoadError::Sql(e)) => return Err(e),
         };
-        // An error here is a step its steps lack: the run cannot be read either.
-        match transition::restarted(&run.cx(NOTHING_TAKEN), &run.state) {
-            Ok(state) => run.save(&tx, &state)?,
+        // A run at a step its steps lack cannot be read either.
+        match node_of(&run.graph, &run.state.node_id) {
+            Ok(_) => run.save(&tx, &transition::restarted(&run.state))?,
             Err(e) => left(e),
         }
     }
@@ -1467,39 +1332,37 @@ struct Shown {
     outputs: Vec<String>,
     note: Option<String>,
     resumable: bool,
-    step_kind: Option<Kind>,
-    prefill: bool,
     briefing: bool,
     steps: i64,
     suggested: Option<String>,
-    awaits_prompt: bool,
 }
 
 impl Shown {
     /// What is shown of a run at `node` in `state`.
     fn of(node: Node, state: RunState) -> Self {
         let resumable = continue_offered(&state.phase, node.kind).is_some();
-        let awaits_prompt = awaits_prompt(&state, &node);
         let mut shown = Shown {
             step: node.name().to_owned(),
             outputs: Vec::new(),
             note: None,
             resumable: false,
-            step_kind: Some(node.kind),
-            prefill: state.phase.prefill(),
             briefing: false,
             steps: state.steps,
             suggested: None,
-            awaits_prompt,
         };
         match state.phase {
             // Nothing to pick until the first step is taken (see `proceed`).
             Phase::Clearing { .. } => shown.note = Some("Clearing the conversation before the first step.".to_owned()),
             Phase::Briefing { .. } => shown.briefing = true,
             Phase::NeedsPerson { why, .. } => (shown.outputs, shown.note, shown.resumable) = (node.outputs, Some(why), resumable),
-            // A pause says what to do there; a draft step waiting for the prompt has nothing to say yet.
+            // A pause says what to do there.
             Phase::Waiting { suggested, .. } => {
-                let note = (node.pauses() && !awaits_prompt && !node.note.trim().is_empty()).then(|| node.note.trim().to_owned());
+                // A run an older version left waiting at a step this one does not know
+                // (such as one the person was to write) says why it waits.
+                let unknown = node.unknown_kind.as_deref().map(|was| {
+                    format!("\"{}\" is a kind of step this version does not know ({was:?}): pick its output to go on, or stop the run.", node.name())
+                });
+                let note = unknown.or_else(|| (node.pauses() && !node.note.trim().is_empty()).then(|| node.note.trim().to_owned()));
                 (shown.outputs, shown.note, shown.suggested) = (node.outputs, note, suggested);
             }
             _ => (shown.outputs, shown.resumable) = (node.outputs, resumable),
@@ -1514,12 +1377,9 @@ impl Shown {
             outputs: Vec::new(),
             note: Some(format!("This run cannot be read: {why}. Stop it.")),
             resumable: false,
-            step_kind: None,
-            prefill: false,
             briefing: false,
             steps: 0,
             suggested: None,
-            awaits_prompt: false,
         }
     }
 }
@@ -1569,7 +1429,7 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
             });
             // Only active statuses are selected, so this one is known.
             let status = Status::parse(&status)?;
-            let Shown { step, outputs, note, resumable, step_kind, prefill, briefing, steps, suggested, awaits_prompt } =
+            let Shown { step, outputs, note, resumable, briefing, steps, suggested } =
                 match node.and_then(|node| state.map(|state| (node, state))) {
                     Ok((node, state)) => Shown::of(node, state),
                     Err(e) => Shown::unreadable(&step_id, &e),
@@ -1588,11 +1448,8 @@ pub fn active(conn: &Connection) -> Result<Vec<Run>, String> {
                 done,
                 total,
                 resumable,
-                prefill,
-                step_kind,
                 briefing,
                 suggested,
-                awaits_prompt,
             })
         })
         .collect()

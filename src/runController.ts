@@ -17,12 +17,6 @@ export interface StepPrompt {
   briefs: boolean;
 }
 
-/** Mirrors `runs::Prefill`. */
-export interface Prefill {
-  text: string;
-  token: number;
-}
-
 /** Mirrors `runs::TabTitle`: a title Claude wrote for a tab at a flow's tab title step. */
 export interface TabTitle {
   tabId: string;
@@ -146,12 +140,6 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
   const dirtyTabs = new Set<string>();
   /** Tabs whose last input ended in a backslash, which turns an Enter that follows on its own into a newline. */
   const backslashTabs = new Set<string>();
-  /** Runs whose manual prompt is being put into Claude's input right now. */
-  const filling = new Set<number>();
-  /** Runs whose manual prompt could not be put into Claude's input, or waits for the person to clear it, said once. */
-  const fillFailed = new Set<number>();
-  /** Tabs whose Claude input holds a manual prompt's paste the person has not touched. */
-  const pastedTabs = new Set<string>();
   /** How many flow starts and prompts are typing into each tab right now. */
   const lockCounts = new Map<string, number>();
 
@@ -222,65 +210,6 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       await opts.write(tab, encoder.encode("\r"));
       return true;
     });
-  }
-
-  /**
-   * Puts the text of the manual prompt `run` waits at into its tab's Claude input,
-   * as a paste without Enter, for the person to finish and send. Waits while Claude
-   * works or a flow types there, and while the input holds text the person typed,
-   * which it does not wipe: it says how to get the draft, once. The backend owes
-   * the paste until it is told it was made, so a paste that fails is tried again
-   * at the next poll; its error is shown once.
-   */
-  async function fill(run: Run) {
-    const tab = opts.tabs().find((t) => t.tabId === run.tabId);
-    if (!tab || filling.has(run.id) || lockCounts.has(tab.tabId) || opts.busy(tab)) return;
-    if (dirtyTabs.has(tab.tabId)) {
-      if (!fillFailed.has(run.id)) {
-        fillFailed.add(run.id);
-        flows.showBoxError(
-          `Claude's input in ${opts.label(tab)} has text in it: clear it (Ctrl+C) or send it, and "${run.step}"'s draft goes in.`,
-        );
-      }
-      return;
-    }
-    filling.add(run.id);
-    let pasted = false;
-    try {
-      await withLock(tab, async () => {
-        if (!(await opts.live(tab))) return;
-        const fill = await invoke<Prefill | null>("flow_prefill_text", { runId: run.id, stepId: run.stepId });
-        // Claude may have started a turn, or the person typed, meanwhile.
-        if (fill === null || opts.busy(tab) || dirtyTabs.has(tab.tabId)) return;
-        await opts.write(tab, encoder.encode(`\x1b[200~${fill.text}\x1b[201~`));
-        pasted = true;
-        dirtyTabs.add(tab.tabId);
-        pastedTabs.add(tab.tabId);
-        await invoke("flow_prefilled", { runId: run.id, stepId: run.stepId, token: fill.token });
-      });
-      fillFailed.delete(run.id);
-    } catch (err) {
-      console.error("misag: could not fill Claude's input for the manual prompt", err);
-      if (!fillFailed.has(run.id)) {
-        fillFailed.add(run.id);
-        flows.showBoxError(
-          pasted
-            ? `Pasted "${run.step}" into ${opts.label(tab)}, but could not record it (${opts.errorText(err)}); it is pasted again once the input is cleared.`
-            : `Could not put the manual prompt into ${opts.label(tab)}: ${opts.errorText(err)}`,
-        );
-      }
-    } finally {
-      filling.delete(run.id);
-    }
-  }
-
-  /** Takes a manual prompt's paste the person has not touched back out of the tab's Claude input. */
-  async function clearPaste(tab: T) {
-    if (!pastedTabs.delete(tab.tabId) || !(await opts.live(tab))) return;
-    await opts.write(tab, encoder.encode("\x03"));
-    dirtyTabs.delete(tab.tabId);
-    backslashTabs.delete(tab.tabId);
-    await new Promise((resolve) => setTimeout(resolve, CLEAR_INPUT_MS));
   }
 
   /** Why a prompt typed into `tab` was not sent, for the person. */
@@ -435,10 +364,7 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
           // this waited for the check above or for the lock.
           error = stillWorking(tab);
           if (error !== null) return null;
-          const next = await go();
-          // Gone on from a manual prompt: its unsent draft is no longer for anything.
-          await clearPaste(tab);
-          return next;
+          return go();
         });
         if (prompt !== null) error = await typeStepPrompt(run, tab, prompt);
       } catch (err) {
@@ -496,8 +422,6 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       // UserPromptSubmit hook), so nothing is typed into a turn or a permission prompt.
       await invoke("flow_stop", { runId: run.id });
       flows.showBoxError(null);
-      const tab = opts.tabs().find((t) => t.tabId === run.tabId);
-      if (tab) await withLock(tab, () => clearPaste(tab));
     } catch (err) {
       console.error("misag: could not stop the run", err);
       flows.showBoxError(`Could not stop the run: ${opts.errorText(err)}`);
@@ -525,7 +449,6 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
         if (run.status !== "running") waitingTabs.add(run.tabId);
       }
       opts.markWaiting((tab) => waitingTabs.has(tab.tabId));
-      for (const run of runs) if (run.prefill) void fill(run);
     } catch (err) {
       console.error("misag: could not read the flow runs", err);
       if (seq < shownPoll) return;
@@ -579,8 +502,6 @@ export function createRunController<T extends RunTab>(opts: RunControllerOptions
       else if (text) dirtyTabs.add(tab.tabId);
       if (text.endsWith("\\")) backslashTabs.add(tab.tabId);
       else if (text) backslashTabs.delete(tab.tabId);
-      // A paste the person has added to, sent or cleared is theirs.
-      if (text) pastedTabs.delete(tab.tabId);
     },
     locked: (tab) => lockCounts.has(tab.tabId),
   };

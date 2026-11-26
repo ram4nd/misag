@@ -324,16 +324,20 @@ svg.lucide { display: block; flex: none; }
 }
 .flow-editor .drawflow .drawflow-node.selected { border-color: var(--accent); background: var(--surface); box-shadow: 0 0 0 2px var(--accent); }
 .flow-editor .drawflow .drawflow-node .limit,
-.flow-editor .drawflow .drawflow-node .pauses,
+.flow-editor .drawflow .drawflow-node .pause-mark,
 .flow-editor .drawflow .drawflow-node .clears,
 .flow-editor .drawflow .drawflow-node .info { float: right; margin-left: 6px; color: var(--fg); text-transform: none; letter-spacing: 0; }
 .flow-editor .drawflow .drawflow-node .kind { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
 .flow-editor .drawflow .drawflow-node .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flow-editor .drawflow .drawflow-node.start { border-left: 4px solid #1e8e3e; }
 .flow-editor .drawflow .drawflow-node.prompt { border-left: 4px solid #d97757; }
-.flow-editor .drawflow .drawflow-node.yours { border-left: 4px solid var(--accent); }
+/* A step that pauses for you, marked by a blue stripe. */
+.flow-editor .drawflow .drawflow-node.pauses { border-left: 4px solid var(--accent); }
+.flow-editor .drawflow .drawflow-node .pause-mark { display: inline-flex; color: var(--accent); }
 .flow-editor .drawflow .drawflow-node.tab-title { border-left: 4px solid #8e6fd8; }
 .flow-editor .drawflow .drawflow-node.end { border-left: 4px solid var(--muted); }
+/* A kind of step that no longer exists: gray, for the person to replace. */
+.flow-editor .drawflow .drawflow-node.unknown, .flow-editor .drawflow .drawflow-node.unknown.selected { background: var(--press); color: var(--muted); border: 1px dashed var(--line); border-left: 4px dashed var(--muted); }
 .flow-editor .drawflow .drawflow-node .input, .flow-editor .drawflow .drawflow-node .output {
   width: 14px; height: 14px; border: 2px solid var(--muted); background: var(--surface);
 }

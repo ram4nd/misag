@@ -1,20 +1,19 @@
 //! How a run changes, worked out without the database: from its state, its steps
 //! and what happened, the state it goes to and what to send Claude. The functions
-//! outside load the run, pass in what this needs (the time, a fresh paste token,
-//! how often it took each step), and save and send what comes back.
+//! outside load the run, pass in what this needs (the time, how often it took each
+//! step), and save and send what comes back.
 
 use super::{
-    awaits_prompt, continue_offered, node_of, By, Change, Phase, Resume, RunState, Say, Status, Taken, BRIEFING_TIMEOUT_SECS,
-    CLEAR_TIMEOUT_SECS, MAX_RUN_STEPS, NO_REPLY, NO_TOKEN,
+    continue_offered, node_of, By, Change, Phase, Resume, RunState, Say, Status, Taken, BRIEFING_TIMEOUT_SECS, CLEAR_TIMEOUT_SECS,
+    MAX_RUN_STEPS, NO_REPLY,
 };
 use crate::flows::{self, Graph, Kind, Node};
 
-/// What a change is worked out from besides the run's state: its steps, how often
-/// it took each (see `Taken`), and a fresh token for a paste it may come to owe.
+/// What a change is worked out from besides the run's state: its steps, and how
+/// often it took each (see `Taken`).
 pub(super) struct Cx<'a> {
     pub(super) graph: &'a Graph,
     pub(super) taken: &'a Taken,
-    pub(super) token: i64,
 }
 
 impl<'a> Cx<'a> {
@@ -27,24 +26,6 @@ impl<'a> Cx<'a> {
         self.taken.0.get(step).copied().unwrap_or(0) + i64::from(state.node_id == step)
     }
 
-    /// `state`, at the draft step `node`, owing the app the paste of its text
-    /// (see `prefill_text`), if there is any: Start's base info unless Claude has
-    /// it, then the step's draft. Each time under a new token, so the record of an
-    /// earlier paste cannot cancel it (see `prefilled`).
-    fn owe_prefill(&self, state: RunState, node: &Node) -> RunState {
-        if flows::prefill_text(self.graph, node, !state.briefed).is_empty() {
-            return state;
-        }
-        state.with_prefill(self.token)
-    }
-
-    /// `state`, owing the app a fill of Claude's input again if the run waits at a
-    /// draft step, as that input was lost (a clear, a restart): with the base
-    /// info, if Claude lacks it now.
-    fn refill(&self, state: RunState) -> Result<RunState, String> {
-        let node = self.node(&state.node_id)?;
-        Ok(if awaits_prompt(&state, node) { self.owe_prefill(state, node) } else { state })
-    }
 }
 
 /// Fails unless the run is at `step_id`, the step the person saw it at.
@@ -96,7 +77,6 @@ pub(super) fn go(cx: &Cx, state: &RunState, from: &Node, output: &str, steps: i6
         // The output leads nowhere: the flow is done.
         None => (state.finished(&from.id, steps), None),
         Some(next) => match next.kind {
-            Kind::Prompt if next.drafts() => (cx.owe_prefill(state.moved(&next.id, WAITING, steps), next), None),
             Kind::Prompt if next.only_waits() => (state.moved(&next.id, WAITING, steps), None),
             Kind::Prompt | Kind::Title => {
                 let mut state = state.moved(&next.id, Phase::Working, steps + 1);
@@ -104,20 +84,32 @@ pub(super) fn go(cx: &Cx, state: &RunState, from: &Node, output: &str, steps: i6
                 (state, Some(say))
             }
             Kind::End | Kind::Start => (state.finished(&next.id, steps), None),
+            // Only a run of a flow stored by another version can get here (`problems`
+            // keeps one from starting).
+            Kind::Unknown => return wait(gone(next)),
         },
     };
     Change { state, left: Some((from.id.clone(), output.to_owned())), say }
 }
 
-/// Waiting for the person, with no paste owed and nothing suggested.
-const WAITING: Phase = Phase::Waiting { prefill: false, suggested: None };
+/// Why a run does not go into `step`, an unknown step.
+fn gone(step: &Node) -> String {
+    let was = step.unknown_kind.as_deref().unwrap_or_default();
+    format!(
+        "\"{}\" is a kind of step this version does not know ({was:?}), so the run cannot go into it. Pick another output, or stop the run and fix the flow.",
+        step.name()
+    )
+}
+
+/// Waiting for the person, with nothing suggested.
+const WAITING: Phase = Phase::Waiting { suggested: None };
 
 /// Claude's reply at `node` picked `output`: the run goes on by it (see `go`), or,
 /// at a step that pauses, waits there for the person with `output` suggested, which
 /// ▶ goes on by (see `proceed`).
 fn settle(cx: &Cx, state: &RunState, node: &Node, output: &str, steps: i64) -> Change {
     if node.pauses() {
-        return Change::to(state.moved(&node.id, Phase::Waiting { prefill: false, suggested: Some(output.to_owned()) }, steps));
+        return Change::to(state.moved(&node.id, Phase::Waiting { suggested: Some(output.to_owned()) }, steps));
     }
     go(cx, state, node, output, steps, By::Flow)
 }
@@ -157,17 +149,6 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
             Some(_) => go(cx, state, node, flows::START_OUTPUT, 0, By::Flow),
         }));
     }
-    if node.drafts() && node.outputs.len() == 1 {
-        // Working only once the person sent their prompt (see `on_prompt`): this is
-        // Claude's answer to it, which needs no FLOW line. Waiting for the person, any
-        // turn is left alone. (With several outputs, Claude was asked for a FLOW line,
-        // which is read as at any prompt step, below.)
-        let Some(output) = node.outputs.first().filter(|_| state.phase == Phase::Working) else {
-            return Ok(None);
-        };
-        // The person stepped in, which restarts the count toward MAX_RUN_STEPS.
-        return Ok(Some(settle(cx, state, node, output, 0)));
-    }
     match &state.phase {
         Phase::NeedsPerson { .. } => {
             // The person may be chatting with Claude while the run waits. Only a reply
@@ -200,8 +181,8 @@ pub(super) fn on_stop(cx: &Cx, state: &RunState, reply: Option<&str>) -> Result<
                 Some(m) => settle(cx, state, node, &m, state.steps),
             }))
         }
-        // Waiting for the person (at a pause, or a draft step), a chat turn is not its
-        // reply; an ended run has none.
+        // Waiting for the person at a pause, a chat turn is not its reply; an ended run
+        // has none.
         // (Clearing, Briefing, which is only at Start, and Typed are seen to above.)
         _ => Ok(None),
     }
@@ -231,6 +212,9 @@ pub(super) fn proceed(cx: &Cx, state: &RunState, step_id: &str, output: &str) ->
     if !node.outputs.iter().any(|o| o == output) {
         return Err(format!("\"{}\" has no output {output:?}", node.name()));
     }
+    if let Some(next) = flows::next_step(cx.graph, &node.id, output).filter(|n| n.kind == Kind::Unknown) {
+        return Err(gone(next));
+    }
     let mut change = go(cx, state, node, output, 0, By::Person);
     // Claude may still be answering: the next step's reply comes only after Claude
     // Code has submitted its prompt (see `Phase::Typed`). A repeat pick types a new
@@ -241,35 +225,21 @@ pub(super) fn proceed(cx: &Cx, state: &RunState, step_id: &str, output: &str) ->
     Ok(change)
 }
 
-/// The app pasted the draft step's text named by `token` at `step_id`: the run no
-/// longer owes it, unless a paste was owed since (see `super::prefilled`).
-pub(super) fn prefilled(state: &RunState, step_id: &str, token: i64) -> Option<RunState> {
-    if state.node_id != step_id || state.prefill_token.unwrap_or(NO_TOKEN) != token {
-        return None;
-    }
-    Some(RunState { phase: state.phase.clone().with_prefill(false), ..state.clone() })
-}
-
-/// `prompt` was sent to Claude: a run waiting at a draft step runs it (see
-/// `super::on_prompt`). A run waiting for the prompt the app typed (`Phase::Typed`)
-/// counts the next turn as the step's reply if `prompt` is that prompt (see
+/// `prompt` was sent to Claude (see `super::on_prompt`): a run waiting for the
+/// prompt the app typed (`Phase::Typed`) counts the next turn as the step's reply if `prompt` is that prompt (see
 /// `is_step_prompt`); another prompt (one the person queued, or the prompt of an
 /// earlier pick) leaves it waiting, its turn yet to end. None for any other run.
 /// `super::on_prompt` looks for the phases this changes in SQL before taking the
 /// write lock: a phase added here must be added there.
 pub(super) fn prompt_sent(cx: &Cx, state: &RunState, prompt: &str) -> Result<Option<RunState>, String> {
     let node = cx.node(&state.node_id)?;
-    if let Phase::Typed { turn_ended } = state.phase {
-        return Ok(if is_step_prompt(prompt, node) {
-            Some(RunState { phase: Phase::Working, ..state.clone() })
-        } else {
-            // A turn is to end before the step's prompt goes: not a sign it was lost.
-            turn_ended.then(|| RunState { phase: Phase::Typed { turn_ended: false }, ..state.clone() })
-        });
-    }
-    // The prompt may carry Start's base info, but never the run's rules: after a
-    // clear, the next prompt step still briefs Claude again.
-    Ok(awaits_prompt(state, node).then(|| state.moved(&node.id, Phase::Working, state.steps)))
+    let Phase::Typed { turn_ended } = state.phase else { return Ok(None) };
+    Ok(if is_step_prompt(prompt, node) {
+        Some(RunState { phase: Phase::Working, ..state.clone() })
+    } else {
+        // A turn is to end before the step's prompt goes: not a sign it was lost.
+        turn_ended.then(|| RunState { phase: Phase::Typed { turn_ended: false }, ..state.clone() })
+    })
 }
 
 /// Whether `prompt`, as Claude Code reported it sent, is prompt step `node`'s prompt
@@ -287,21 +257,15 @@ const TYPED_NOT_SENT: &str = "This step's prompt, which misag typed when you mov
      it may have gone along with the turn before, or been cleared from Claude's input. Press Continue to send it again, or pick an output to go on.";
 
 /// A prompt could not be recorded, failing with `error` (see `super::prompt_unseen`).
-pub(super) fn prompt_unseen(cx: &Cx, state: &RunState, error: &str) -> Result<Option<RunState>, String> {
+pub(super) fn prompt_unseen(state: &RunState, error: &str) -> Option<RunState> {
     // The prompt misag typed was likely sent, but Claude's answer would not count.
-    if let Phase::Typed { .. } = state.phase {
-        let why = format!(
-            "misag could not record a prompt sent to Claude ({error}). If it was this step's prompt, which misag typed when you \
-             moved the run on, Claude's answer will not move the run on: once Claude has answered, press Continue to have it \
-             go on with the step, or pick an output to go on."
-        );
-        return Ok(Some(state.waiting_here(&why, Some(Resume::Remind))));
-    }
-    if !matches!(state.phase, Phase::Waiting { suggested: None, .. }) || !cx.node(&state.node_id)?.drafts() {
-        return Ok(None);
-    }
-    let why = format!("misag could not record your prompt ({error}), so Claude's answer will not move the run on. Pick an output to go on.");
-    Ok(Some(state.waiting_here(&why, None)))
+    let Phase::Typed { .. } = state.phase else { return None };
+    let why = format!(
+        "misag could not record a prompt sent to Claude ({error}). If it was this step's prompt, which misag typed when you \
+         moved the run on, Claude's answer will not move the run on: once Claude has answered, press Continue to have it \
+         go on with the step, or pick an output to go on."
+    );
+    Some(state.waiting_here(&why, Some(Resume::Remind)))
 }
 
 /// The person has Claude go on with `step_id`, which needs attention (see
@@ -336,68 +300,49 @@ pub(super) fn unsent(state: &RunState, step_id: &str, briefs: bool, why: &str) -
 }
 
 /// Claude cleared its conversation (see `super::clear_tab`).
-pub(super) fn cleared_tab(cx: &Cx, state: &RunState, why: &str) -> Result<RunState, String> {
+pub(super) fn cleared_tab(state: &RunState, why: &str) -> RunState {
     let lost = RunState { briefed: false, ..state.clone() };
-    let state = if lost.phase == (Phase::Clearing { done: false }) {
+    if lost.phase == (Phase::Clearing { done: false }) {
         RunState { phase: Phase::Clearing { done: true }, ..lost }
     } else {
-        pause(cx, lost, why)?
-    };
-    cx.refill(state)
+        pause(lost, why)
+    }
 }
 
 /// `state` once the Stop hook failed (see `super::pause_tab`): as `pause`, but a
 /// run waiting for the prompt the app typed is left as it is, as the turn whose
 /// Stop that was is the one the prompt waited behind (see `Phase::Typed`). Pausing
 /// it would have Continue type the prompt again while Claude Code still holds it.
-pub(super) fn stop_failed(cx: &Cx, state: RunState, why: &str) -> Result<RunState, String> {
+pub(super) fn stop_failed(state: RunState, why: &str) -> RunState {
     if let Phase::Typed { .. } = state.phase {
-        return Ok(state);
+        return state;
     }
-    pause(cx, state, why)
+    pause(state, why)
 }
 
 /// `state` once Claude will not reply to its running step (see `cleared_tab` and
-/// `stop_failed`); unchanged unless it runs a step Claude was to reply to (see
-/// `answer_lost` for a draft step). A run waiting for the prompt the app typed
-/// may have had it sent before, so `why` must not say Claude never got it.
-pub(super) fn pause(cx: &Cx, state: RunState, why: &str) -> Result<RunState, String> {
-    if let Some(lost) = answer_lost(cx, &state, why)? {
-        return Ok(lost);
-    }
-    Ok(match state.phase {
+/// `stop_failed`); unchanged unless it runs a step Claude was to reply to. A run
+/// waiting for the prompt the app typed may have had it sent before, so `why` must
+/// not say Claude never got it.
+pub(super) fn pause(state: RunState, why: &str) -> RunState {
+    match state.phase {
         Phase::Briefing { .. } => state.briefing_lost(why),
         Phase::Working | Phase::Typed { .. } => state.waiting_here(why, Some(Resume::Prompt)),
         _ => state,
-    })
-}
-
-/// Claude's answer to the person's prompt at the draft step the run runs will not be seen
-/// (`why`: the conversation was cleared, misag restarted): the run waits for the
-/// prompt again, or an output. Continue has no step prompt to remind Claude of.
-/// None unless the run is working on a draft step.
-fn answer_lost(cx: &Cx, state: &RunState, why: &str) -> Result<Option<RunState>, String> {
-    if state.phase != Phase::Working || !cx.node(&state.node_id)?.drafts() {
-        return Ok(None);
     }
-    let note = format!("{why} Claude's answer to your prompt will not be seen: send your prompt again, or pick an output to go on.");
-    Ok(Some(state.waiting_here(&note, None)))
 }
 
 /// `state` once misag has restarted (see `super::after_restart`).
-pub(super) fn restarted(cx: &Cx, state: &RunState) -> Result<RunState, String> {
-    let state = match state.phase {
+pub(super) fn restarted(state: &RunState) -> RunState {
+    match state.phase {
         // The app that would have sent the briefing after the clear is gone.
         Phase::Clearing { .. } => state.clear_lost("Mischief of Agents was restarted before the conversation was cleared. Pick an output to go on without clearing, or stop the run and press ▶ again."),
         Phase::Briefing { .. } => state.briefing_lost("Mischief of Agents was restarted while Claude read the flow's briefing. Pick an output to go on; the first step briefs Claude again."),
-        Phase::Working => match answer_lost(cx, state, "Mischief of Agents was restarted while Claude answered your prompt.")? {
-            Some(lost) => lost,
-            // Claude comes back in its conversation, so it can be reminded.
-            None => state.waiting_here(
-                "Mischief of Agents was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.",
-                Some(Resume::Remind),
-            ),
-        },
+        // Claude comes back in its conversation, so it can be reminded.
+        Phase::Working => state.waiting_here(
+            "Mischief of Agents was restarted while Claude worked on this step, so its reply was not seen. Pick an output to go on.",
+            Some(Resume::Remind),
+        ),
         // A prompt Claude Code still held went with the Claude that misag stopped.
         Phase::Typed { .. } => state.waiting_here(
             "Mischief of Agents was restarted while this step's prompt waited to be sent, so Claude may not have received it. \
@@ -405,8 +350,7 @@ pub(super) fn restarted(cx: &Cx, state: &RunState) -> Result<RunState, String> {
             Some(Resume::Prompt),
         ),
         _ => state.clone(),
-    };
-    cx.refill(state)
+    }
 }
 
 /// `state` at `now` if it has timed out at Start, for a run started at
@@ -430,15 +374,13 @@ pub(super) fn timed_out(state: &RunState, started_at: i64, now: i64) -> Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::tests::{at_step, graph, manual_first, manual_prompt_first, needs, review_loop};
+    use super::super::tests::{at_step, graph, needs, pause_first, review_loop};
     use super::super::NOTHING_TAKEN;
     use crate::flows::tests::{edge, node, runnable};
     use std::collections::BTreeMap;
 
-    const TOKEN: i64 = 7;
-
     fn cx<'a>(graph: &'a Graph, taken: &'a Taken) -> Cx<'a> {
-        Cx { graph, taken, token: TOKEN }
+        Cx { graph, taken }
     }
 
     fn reply(graph: &Graph, state: &RunState, text: Option<&str>) -> Option<Change> {
@@ -446,7 +388,7 @@ mod tests {
     }
 
     fn waits(state: &RunState, node_id: &str, steps: i64, why: &str, resume: Option<Resume>) -> Change {
-        Change::to(RunState { node_id: node_id.into(), steps, phase: needs(why, resume, false), ..state.clone() })
+        Change::to(RunState { node_id: node_id.into(), steps, phase: needs(why, resume), ..state.clone() })
     }
 
     #[test]
@@ -528,17 +470,17 @@ mod tests {
         let change = on_stop(&cx(&g, &twice), &fixing, Some("FLOW: done")).unwrap().unwrap();
         assert!(matches!(&change.state.phase, Phase::NeedsPerson { why, resume: None, .. } if why.contains("already run 2 times")));
         // The person is not held back by it.
-        let waiting = RunState { phase: needs("x", None, false), ..fixing };
+        let waiting = RunState { phase: needs("x", None), ..fixing };
         let change = proceed(&cx(&g, &twice), &waiting, "fix", "done").unwrap();
         assert_eq!((change.state.node_id.as_str(), change.state.steps), ("review", 1));
     }
 
     #[test]
     fn a_chat_turn_while_the_run_waits_changes_nothing() {
-        let g = manual_first();
-        let at_pause = at_step("m", Phase::Waiting { prefill: false, suggested: None });
+        let g = pause_first();
+        let at_pause = at_step("m", WAITING);
         assert_eq!(reply(&g, &at_pause, Some("FLOW: ok")), None);
-        let needing = at_step("p", needs("cleared", Some(Resume::Prompt), false));
+        let needing = at_step("p", needs("cleared", Some(Resume::Prompt)));
         for text in [Some("Just chatting."), Some("FLOW: attention"), Some("FLOW: nope"), None] {
             assert_eq!(reply(&g, &needing, text), None, "{text:?}");
         }
@@ -546,7 +488,7 @@ mod tests {
         let change = reply(&g, &needing, Some("FLOW: done")).unwrap();
         assert_eq!(change.left, Some(("p".into(), "done".into())));
         // At a step limit, it does not.
-        assert_eq!(reply(&g, &at_step("p", needs("limit", None, false)), Some("FLOW: done")), None);
+        assert_eq!(reply(&g, &at_step("p", needs("limit", None)), Some("FLOW: done")), None);
     }
 
     const TYPED: Phase = Phase::Typed { turn_ended: false };
@@ -564,7 +506,7 @@ mod tests {
         // Picking again while it waits types a new prompt, which waits afresh; a waiting run's pick does not.
         assert_eq!(proceed(&cx, &typed, "p", "fail").unwrap().state.phase, TYPED);
         assert_eq!(proceed(&cx, &ended, "p", "fail").unwrap().state.phase, TYPED);
-        let needing = at_step("p", needs("x", None, false));
+        let needing = at_step("p", needs("x", None));
         assert_eq!(proceed(&cx, &needing, "p", "fail").unwrap().state.phase, Phase::Working);
         let prompt = flows::prompt_text(cx.node("p").unwrap());
         for state in [&typed, &ended] {
@@ -607,80 +549,55 @@ mod tests {
 
     #[test]
     fn a_lost_reply_or_prompt_while_the_typed_prompt_waits() {
-        let g = runnable();
-        let cx = cx(&g, NOTHING_TAKEN);
         let typed = at_step("p", TYPED);
         // The failed Stop was the turn the prompt waited behind: no Continue to type it twice.
-        assert_eq!(stop_failed(&cx, typed.clone(), "lost").unwrap(), typed);
-        assert_eq!(stop_failed(&cx, at_step("p", Phase::Working), "lost").unwrap().phase, needs("lost", Some(Resume::Prompt), false));
+        assert_eq!(stop_failed(typed.clone(), "lost"), typed);
+        assert_eq!(stop_failed(at_step("p", Phase::Working), "lost").phase, needs("lost", Some(Resume::Prompt)));
         // A clear or a restart: the prompt may or may not have reached Claude.
-        assert_eq!(pause(&cx, typed.clone(), "lost").unwrap().phase, needs("lost", Some(Resume::Prompt), false));
-        let after = restarted(&cx, &typed).unwrap();
-        let Phase::NeedsPerson { why, resume: Some(Resume::Prompt), .. } = &after.phase else { panic!("{after:?}") };
+        assert_eq!(pause(typed.clone(), "lost").phase, needs("lost", Some(Resume::Prompt)));
+        let after = restarted(&typed);
+        let Phase::NeedsPerson { why, resume: Some(Resume::Prompt) } = &after.phase else { panic!("{after:?}") };
         assert!(why.contains("may not have received") && why.contains("Press Continue to send it again"), "{why}");
         // A prompt the hook could not record may have been the one misag typed.
-        let unseen = prompt_unseen(&cx, &typed, "boom").unwrap().unwrap();
-        let Phase::NeedsPerson { why, resume: Some(Resume::Remind), .. } = &unseen.phase else { panic!("{unseen:?}") };
-        assert!(why.contains("(boom)") && why.contains("which misag typed") && !why.contains("your prompt"), "{why}");
+        let unseen = prompt_unseen(&typed, "boom").unwrap();
+        let Phase::NeedsPerson { why, resume: Some(Resume::Remind) } = &unseen.phase else { panic!("{unseen:?}") };
+        assert!(why.contains("(boom)") && why.contains("which misag typed"), "{why}");
+        // At any other phase, a prompt was the person chatting.
+        assert_eq!(prompt_unseen(&at_step("m", WAITING), "boom"), None);
     }
 
     #[test]
     fn a_pause_makes_a_running_step_wait_and_leaves_the_rest() {
-        let g = manual_prompt_first("Fix it");
-        let cx = cx(&g, NOTHING_TAKEN);
         let working = at_step("p", Phase::Working);
-        assert_eq!(pause(&cx, working.clone(), "lost").unwrap(), RunState { phase: needs("lost", Some(Resume::Prompt), false), ..working });
+        assert_eq!(pause(working.clone(), "lost"), RunState { phase: needs("lost", Some(Resume::Prompt)), ..working });
         let briefing = at_step("start", Phase::Briefing { sent_at: 1 });
-        assert_eq!(
-            pause(&cx, briefing.clone(), "lost").unwrap(),
-            RunState { briefed: false, phase: needs("lost", None, false), ..briefing }
-        );
-        let answering = at_step("mp", Phase::Working);
-        let lost = pause(&cx, answering, "Cleared.").unwrap();
-        assert!(matches!(&lost.phase, Phase::NeedsPerson { why, resume: None, .. } if why.contains("send your prompt again")));
-        for left_alone in [at_step("mp", Phase::Waiting { prefill: true, suggested: None }), at_step("start", Phase::Clearing { done: true })] {
-            assert_eq!(pause(&cx, left_alone.clone(), "lost").unwrap(), left_alone);
+        assert_eq!(pause(briefing.clone(), "lost"), RunState { briefed: false, phase: needs("lost", None), ..briefing });
+        for left_alone in [at_step("m", WAITING), at_step("start", Phase::Clearing { done: true })] {
+            assert_eq!(pause(left_alone.clone(), "lost"), left_alone);
         }
     }
 
     #[test]
     fn a_clear_during_a_step_makes_it_wait_and_owes_the_rules_again() {
-        let g = manual_prompt_first("Fix it");
-        let cx = cx(&g, NOTHING_TAKEN);
         let working = at_step("p", Phase::Working);
-        assert_eq!(
-            cleared_tab(&cx, &working, "Cleared.").unwrap(),
-            RunState { briefed: false, phase: needs("Cleared.", Some(Resume::Prompt), false), ..working }
-        );
+        assert_eq!(cleared_tab(&working, "Cleared."), RunState { briefed: false, phase: needs("Cleared.", Some(Resume::Prompt)), ..working });
         let clearing = at_step("start", Phase::Clearing { done: false });
-        assert_eq!(
-            cleared_tab(&cx, &clearing, "Cleared.").unwrap(),
-            RunState { briefed: false, phase: Phase::Clearing { done: true }, ..clearing }
-        );
-        // A draft step owes its paste again, now with the base info, under the new token.
-        let waiting = at_step("mp", Phase::Waiting { prefill: false, suggested: None });
-        assert_eq!(
-            cleared_tab(&cx, &waiting, "Cleared.").unwrap(),
-            RunState { briefed: false, prefill_token: Some(TOKEN), phase: Phase::Waiting { prefill: true, suggested: None }, ..waiting }
-        );
+        assert_eq!(cleared_tab(&clearing, "Cleared."), RunState { briefed: false, phase: Phase::Clearing { done: true }, ..clearing });
+        // A pause waits on, only no longer briefed.
+        let waiting = at_step("m", WAITING);
+        assert_eq!(cleared_tab(&waiting, "Cleared."), RunState { briefed: false, ..waiting });
     }
 
     #[test]
     fn a_restart_during_a_step_waits_with_what_continue_can_still_do() {
-        let g = manual_prompt_first("Fix it");
-        let cx = cx(&g, NOTHING_TAKEN);
-        let restarted = |state: RunState| restarted(&cx, &state).unwrap();
-        let working = restarted(at_step("p", Phase::Working));
-        assert!(matches!(&working.phase, Phase::NeedsPerson { why, resume: Some(Resume::Remind), .. } if why.contains("worked on this step")));
-        let answering = restarted(at_step("mp", Phase::Working));
-        assert!(matches!(&answering.phase, Phase::NeedsPerson { resume: None, prefill: true, .. }), "{answering:?}");
-        assert_eq!(answering.prefill_token, Some(TOKEN));
-        let clearing = restarted(at_step("start", Phase::Clearing { done: false }));
-        assert!(matches!(&clearing.phase, Phase::NeedsPerson { why, resume: None, .. } if why.contains("before the conversation was cleared")));
-        let briefing = restarted(at_step("start", Phase::Briefing { sent_at: 1 }));
+        let working = restarted(&at_step("p", Phase::Working));
+        assert!(matches!(&working.phase, Phase::NeedsPerson { why, resume: Some(Resume::Remind) } if why.contains("worked on this step")));
+        let clearing = restarted(&at_step("start", Phase::Clearing { done: false }));
+        assert!(matches!(&clearing.phase, Phase::NeedsPerson { why, resume: None } if why.contains("before the conversation was cleared")));
+        let briefing = restarted(&at_step("start", Phase::Briefing { sent_at: 1 }));
         assert!(!briefing.briefed && matches!(&briefing.phase, Phase::NeedsPerson { resume: None, .. }));
-        let waiting = at_step("p", needs("x", Some(Resume::Remind), false));
-        assert_eq!(restarted(waiting.clone()), waiting);
+        let waiting = at_step("p", needs("x", Some(Resume::Remind)));
+        assert_eq!(restarted(&waiting), waiting);
     }
 
     #[test]

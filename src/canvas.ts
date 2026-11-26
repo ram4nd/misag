@@ -1,6 +1,7 @@
 import Drawflow, { type ConnectionEvent } from "drawflow";
 import "drawflow/dist/drawflow.min.css";
 import type { Graph, Step } from "./flowEditor";
+import { icon } from "./icons";
 import { stepMode } from "./stepMode";
 
 /** What the user did on the canvas, in terms of the flow's steps and outputs. */
@@ -24,10 +25,10 @@ export interface Canvas {
   mark(id: string | null): void;
 }
 
-const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", title: "Tab title", end: "End" };
+const KIND_LABELS: Record<Step["kind"], string> = { start: "Start", prompt: "Prompt", title: "Tab title", end: "End", unknown: "Unknown" };
 
-/** What kind of step `s` is, as the canvas names it: a prompt step is a Pause or a Manual prompt by its mode. */
-const kindLabel = (s: Step) => ({ wait: "Pause", draft: "Manual prompt", send: KIND_LABELS[s.kind] })[stepMode(s) ?? "send"];
+/** What kind of step `s` is, as the canvas names it: a prompt step that only waits is a Pause. */
+const kindLabel = (s: Step) => (stepMode(s) === "wait" ? "Pause" : KIND_LABELS[s.kind]);
 
 /**
  * A Drawflow canvas showing a flow's steps, drawn in an element it adds to `canvasEl`.
@@ -135,19 +136,21 @@ export function createCanvas(canvasEl: HTMLElement, events: CanvasEvents): Canva
         const clears = s.clear ? `<span class="clears" title="Starts with /clear">/clear</span>` : "";
         const info =
           s.kind === "start" && s.text.trim() !== "" ? `<span class="info" title="Sends base info in the run's briefing">info</span>` : "";
-        // A pause that only waits says so in its kind; one after a prompt is marked.
-        const pauses = s.pause && stepMode(s) !== "wait" && stepMode(s) !== null ? `<span class="pauses" title="Waits for you once done">pause</span>` : "";
-        const html = `<div class="kind">${kindLabel(s)}${limit}${pauses}${clears}${info}</div><div class="title"></div>`;
+        // A step that pauses after Claude answers is marked with the pause icon (constant markup).
+        const mark = s.pause && stepMode(s) !== "wait" && stepMode(s) !== null
+          ? `<span class="pause-mark" title="Waits for you once done">${icon("pause", 12).outerHTML}</span>`
+          : "";
+        const html = `<div class="kind">${kindLabel(s)}${limit}${mark}${clears}${info}</div><div class="title"></div>`;
         // A tab title's class is not "title", which names the step's title inside every step.
-        // A step that is yours (a pause that only waits, or a prompt you write) is drawn as such.
-        const mode = stepMode(s);
-        const cls = s.kind === "title" ? "tab-title" : mode === "wait" || mode === "draft" ? "yours" : s.kind;
+        // A step that pauses is drawn blue.
+        const cls = s.kind === "title" ? "tab-title" : stepMode(s) !== null && s.pause ? "pauses" : s.kind;
         const id = df.addNode(s.kind, inputs, s.outputs.length, s.x, s.y, cls, {}, html, false);
         stepOf.set(String(id), s);
         drawnAs.set(s.id, id);
-        const node = el.querySelector(`#node-${id}`)!;
+        const node = el.querySelector<HTMLElement>(`#node-${id}`)!;
         // Text, not markup: titles are the user's.
         node.querySelector(".title")!.textContent = s.title;
+        if (s.kind === "unknown") node.title = `A kind of step this version does not know ("${s.unknownKind ?? ""}"): replace it with a new step`;
         s.outputs.forEach((output, i) => {
           const o = node.querySelector<HTMLElement>(`.outputs .output_${i + 1}`)!;
           o.dataset.label = output;

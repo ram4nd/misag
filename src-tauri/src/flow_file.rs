@@ -18,7 +18,7 @@ const ROW: f64 = 180.0;
 /// The fields each part of a file may have, as `write` writes them.
 const FILE_FIELDS: &[&str] = &["misagFlow", "name", "graph"];
 const GRAPH_FIELDS: &[&str] = &["version", "nodes", "edges"];
-const STEP_FIELDS: &[&str] = &["id", "kind", "title", "text", "outputs", "maxRuns", "clear", "pause", "draft", "note", "x", "y"];
+const STEP_FIELDS: &[&str] = &["id", "kind", "title", "text", "outputs", "maxRuns", "clear", "pause", "draft", "note", "unknownKind", "x", "y"];
 const EDGE_FIELDS: &[&str] = &["from", "output", "to"];
 
 /// The flow in `text` as its name and steps, checked like an edit (see `flows::check`).
@@ -68,6 +68,16 @@ fn check_fields(graph: &Map<String, Value>) -> Result<(), String> {
     let list = |key: &str| graph.get(key).and_then(Value::as_array).into_iter().flatten();
     for step in list("nodes") {
         known_fields(step, STEP_FIELDS, &format!("step \"{}\"", id(step, "id")))?;
+        // A newer version's kind loads as an unknown step from the database, but in a
+        // file, which is often written by hand or by Claude, a kind no version has is a typo.
+        if let Some(kind) = step.get("kind").and_then(Value::as_str)
+            && !flows::KNOWN_KINDS.contains(&kind)
+        {
+            return Err(format!("step \"{}\" has the kind {kind:?}, which no version of misag has (see misag flow help)", id(step, "id")));
+        }
+        if step.get("draft").is_some_and(|d| d != &Value::Bool(false)) && step.get("kind").and_then(Value::as_str) != Some("prompt") {
+            return Err(format!("step \"{}\" has \"draft\", which only a prompt step had (see misag flow help)", id(step, "id")));
+        }
         match (step.get("x"), step.get("y")) {
             (Some(_), None) => return Err(format!("step \"{}\" has an \"x\" but no \"y\": give both or neither", id(step, "id"))),
             (None, Some(_)) => return Err(format!("step \"{}\" has a \"y\" but no \"x\": give both or neither", id(step, "id"))),
@@ -175,24 +185,25 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_whose_prompts_pause_or_draft_reads_back_the_same() {
+    fn a_flow_whose_prompts_pause_reads_back_the_same() {
         let mut graph = runnable();
         (graph.nodes[1].pause, graph.nodes[1].note) = (true, "Check the diff.".into());
-        graph.nodes.push(crate::flows::tests::draft("d", &["sent"]));
         let graph = flows::stored(graph);
         let text = write("Deploy", &graph);
-        for field in ["\"pause\": true", "\"draft\": true", "\"note\": \"Check the diff.\""] {
+        for field in ["\"pause\": true", "\"note\": \"Check the diff.\""] {
             assert!(text.contains(field), "{field} in {text}");
         }
         assert_eq!(parse(&text).unwrap().1, graph);
     }
 
     #[test]
-    fn a_file_with_the_older_pause_and_manual_prompt_kinds_imports_as_prompt_steps() {
+    fn a_file_with_kinds_that_no_longer_exist_imports_them_as_unknown_steps() {
         let (_, graph) = parse(MINIMAL).unwrap();
         let check = graph.nodes.iter().find(|n| n.id == "check").unwrap();
-        assert_eq!((check.kind, check.pause), (Kind::Prompt, true));
-        assert_eq!(graph.version, 7, "stored in the format that holds it");
+        assert_eq!((check.kind, check.unknown_kind.as_deref()), (Kind::Unknown, Some("manual")));
+        assert_eq!(graph.version, 8, "stored in the format that holds it");
+        // Written back as found, and read again the same.
+        assert_eq!(parse(&write("Fix it", &graph)).unwrap().1, graph);
     }
 
     #[test]
@@ -248,8 +259,23 @@ mod tests {
         assert_eq!(err(r#"{"misagFlow": 1, "graph": {"nodes": [], "edges": []}}"#), "the flow has no \"name\"");
         assert_eq!(err(r#"{"misagFlow": 1, "name": " ", "graph": {"nodes": [], "edges": []}}"#), "the flow has no \"name\"");
         assert_eq!(err(r#"{"misagFlow": 1, "name": "x"}"#), "the flow has no \"graph\" with its steps");
-        let unknown = err(r#"{"misagFlow": 1, "name": "x", "graph": {"nodes": [{"id": "s", "kind": "loop"}], "edges": []}}"#);
-        assert!(unknown.starts_with("the steps cannot be read: "), "{unknown}");
+        let shapeless = err(r#"{"misagFlow": 1, "name": "x", "graph": {"nodes": [{"id": "s", "kind": 3}], "edges": []}}"#);
+        assert!(shapeless.starts_with("the steps cannot be read: "), "{shapeless}");
+    }
+
+    #[test]
+    fn a_kind_no_version_wrote_is_refused_so_a_typo_is_not_lost() {
+        let step = |kind: &str| format!(r#"{{"misagFlow": 1, "name": "x", "graph": {{"nodes": [{{"id": "start", "kind": "start"}}, {kind}], "edges": []}}}}"#);
+        let e = parse(&step(r#"{"id": "s", "kind": "promt", "outputs": ["ok"]}"#)).unwrap_err();
+        assert_eq!(e, "step \"s\" has the kind \"promt\", which no version of misag has (see misag flow help)");
+        assert!(parse(&step(r#"{"id": "s", "kind": "Prompt", "outputs": ["ok"]}"#)).is_err());
+        // Older versions' kinds, and an unknown step as this version exports it, still import.
+        for kind in [r#""manual""#, r#""pause""#, r#""manual_prompt""#, r#""unknown", "unknownKind": "loop""#] {
+            parse(&step(&format!(r#"{{"id": "s", "kind": {kind}, "outputs": ["ok"]}}"#))).unwrap_or_else(|e| panic!("{kind}: {e}"));
+        }
+        // Only a prompt step was ever a draft.
+        let e = parse(&step(r#"{"id": "s", "kind": "title", "draft": true, "outputs": ["ok"]}"#)).unwrap_err();
+        assert_eq!(e, "step \"s\" has \"draft\", which only a prompt step had (see misag flow help)");
     }
 
     #[test]

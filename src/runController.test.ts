@@ -30,7 +30,6 @@ vi.mock("@tauri-apps/api/core", () => ({
       if (backend.tabTitles instanceof Error) throw backend.tabTitles;
       return backend.tabTitles;
     }
-    if (cmd === "flow_prefill_text") return { text: "Fix the issues", token: 1 };
     if (cmd === "flow_continue") return { stepId: "fix", prompt: "Fix what the review found", briefs: true };
     if (cmd === "flow_resume") return { stepId: "s", prompt: "Go on with the step", briefs: false };
     if (cmd === "flow_cleared") return { state: "gone" };
@@ -437,31 +436,6 @@ describe("starting a flow", () => {
   });
 });
 
-describe("a manual prompt's draft", () => {
-  const run = { id: 8, tabId: "t1", stepId: "m", step: "Manual prompt", flowId: 1, status: "manual", prefill: true } as unknown as Run;
-
-  test("goes in after a focus report from clicking the run bar", async () => {
-    runs.typed(tab, "\x1b[O");
-    backend.runs = [run];
-    await runs.poll();
-    await vi.runAllTimersAsync();
-    expect(typed).toEqual(["\x1b[200~Fix the issues\x1b[201~"]);
-  });
-
-  test("is still taken back out on stop after a focus report", async () => {
-    backend.runs = [run];
-    await runs.poll();
-    await vi.runAllTimersAsync();
-    backend.runs = [];
-    runs.typed(tab, "\x1b[O");
-    typed = [];
-    const stopped = runs.stop(run);
-    await vi.runAllTimersAsync();
-    await stopped;
-    expect(typed).toEqual(["\x03"]);
-  });
-});
-
 describe("reading the runs", () => {
   test("a reply that comes in after a newer one is dropped", async () => {
     let answerOld!: (runs: unknown[]) => void;
@@ -500,14 +474,6 @@ describe("a tab that does not take what is typed", () => {
     expect(backend.calls).toContain("flow_stop");
   });
 
-  test("a manual prompt's draft it refuses is not recorded as pasted", async () => {
-    refuse();
-    backend.runs = [{ id: 8, tabId: "t1", stepId: "m", step: "Manual prompt", flowId: 1, status: "manual", prefill: true }];
-    await runs.poll();
-    await vi.runAllTimersAsync();
-    expect(backend.calls).toContain("flow_prefill_text");
-    expect(backend.calls).not.toContain("flow_prefilled");
-  });
 });
 
 

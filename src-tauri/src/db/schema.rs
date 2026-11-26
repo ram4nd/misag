@@ -155,12 +155,12 @@ const MIGRATIONS: &[&str] = &[r#"
     ALTER TABLE settings ADD COLUMN finish_sound TEXT NOT NULL DEFAULT 'off'
         CHECK (finish_sound IN ('off', 'chime', 'bell', 'pop'));
 "#, r#"
-    -- 1 while a run waits at a manual prompt whose text the app has yet to put into
-    -- Claude's input (see runs::prefill_text).
+    -- 1 while a run waited at a manual prompt whose text the app had yet to put into
+    -- Claude's input. Unused since manual prompts went: see runs::RunState::from_columns.
     ALTER TABLE flow_runs ADD COLUMN prefill INTEGER NOT NULL DEFAULT 0 CHECK (prefill IN (0, 1));
 "#, r#"
-    -- Names the paste a run owes while prefill is 1, so the record of an earlier
-    -- paste does not cancel one owed since (see runs::prefilled).
+    -- Named the paste a run owed while prefill was 1. Unused since manual prompts
+    -- went: see runs::RunState::from_columns.
     ALTER TABLE flow_runs ADD COLUMN prefill_token INTEGER;
 "#, r#"
     -- 1 while a run waits at Start for Claude's reply to its briefing (see
@@ -211,11 +211,10 @@ const MIGRATIONS: &[&str] = &[r#"
         -- 0 while Claude lacks Start's base info: from a run's start, and after each
         -- /clear in its tab, until a prompt carries it (see runs::go).
         briefed       INTEGER NOT NULL DEFAULT 1 CHECK (briefed IN (0, 1)),
-        -- 1 while a run waits at a manual prompt whose text the app has yet to put
-        -- into Claude's input (see runs::prefill_text).
+        -- 1 while a run waited at a manual prompt whose text the app had yet to put
+        -- into Claude's input. Unused since: see runs::RunState::from_columns.
         prefill       INTEGER NOT NULL DEFAULT 0 CHECK (prefill IN (0, 1)),
-        -- Names the paste a run owes while prefill is 1, so the record of an earlier
-        -- paste does not cancel one owed since (see runs::prefilled).
+        -- Named the paste a run owed while prefill was 1. Unused since.
         prefill_token INTEGER,
         -- 1 while a run waits at Start for Claude's reply to its briefing (see
         -- runs::on_stop): only that reply takes the first step.
@@ -240,7 +239,8 @@ const MIGRATIONS: &[&str] = &[r#"
                    OR (status = 'running' AND clear IS NULL AND briefing_at IS NOT NULL)),
         CONSTRAINT briefing_at_only_when_briefing
             CHECK (status IN ('done', 'stopped') OR briefing = 1 OR briefing_at IS NULL),
-        -- A paste is owed only at a manual prompt (Waiting, NeedsPerson).
+        -- A paste was owed only at a manual prompt (Waiting, NeedsPerson); every save
+        -- writes 0 since manual prompts went.
         CONSTRAINT prefill_only_when_waiting
             CHECK (status IN ('done', 'stopped') OR prefill = 0 OR status IN ('manual', 'attention')),
         -- The note that a flow is finished is owed only by an ended run.
@@ -280,7 +280,7 @@ const MIGRATIONS: &[&str] = &[r#"
 "#, r#"
     -- The output Claude picked at a prompt step that pauses once done, which the
     -- person goes on by with ▶ (see runs::Phase::Waiting): set only while the run
-    -- waits for the person, owing no paste (Claude has already answered). Like
+    -- waits for the person, owing no paste (manual prompts, which owed one, are gone). Like
     -- typed, it holds active runs only: an ended run keeps what it was left with,
     -- and runs::RunState::from_columns ignores it there.
     ALTER TABLE flow_runs ADD COLUMN suggested TEXT
@@ -303,8 +303,8 @@ fn normalise_runs(conn: &Connection) -> rusqlite::Result<Vec<i64>> {
         [],
     )?;
     // Then the active rows it refuses wait for the person where they are, keeping
-    // the steps, what Claude has (briefed), the last paste's token and a note a run
-    // needing attention had: the person sees the run and stops it, or picks an
+    // the steps, what Claude has (briefed), the token of a paste a manual prompt owed
+    // (which nothing reads now that they are gone) and a note a run needing attention had: the person sees the run and stops it, or picks an
     // output if they know where it was.
     let mut stmt = conn.prepare(
         "UPDATE flow_runs SET
@@ -707,7 +707,7 @@ mod tests {
         let suggested: Option<String> = conn.query_row("SELECT suggested FROM flow_runs", [], |r| r.get(0)).unwrap();
         assert_eq!(suggested, None);
         let runs = crate::runs::active(&conn).unwrap();
-        assert_eq!((runs[0].status, runs[0].suggested.clone(), runs[0].note.as_deref()), (crate::runs::Status::Manual, None, Some("Try it")));
+        assert_eq!((runs[0].status, runs[0].suggested.clone(), runs[0].outputs.clone()), (crate::runs::Status::Manual, None, vec!["ok".to_string()]));
     }
 
     #[test]

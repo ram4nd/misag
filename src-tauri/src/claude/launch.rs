@@ -84,7 +84,7 @@ mod tests {
         // when its session ends, so nothing is left waiting on background tasks.
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0], *hook);
         assert_eq!(settings["hooks"]["SessionEnd"][0]["hooks"][0], *hook);
-        // And when the person sends a prompt, which a manual prompt step waits for.
+        // And when a prompt is sent, which a run moved on by hand waits for.
         assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0], *hook);
         assert_eq!(settings.as_object().unwrap().len(), 1, "only the hook");
     }

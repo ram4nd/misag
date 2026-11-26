@@ -15,13 +15,13 @@ Without flows, misag is still a good home for your agents: a tab per agent, a wo
 You build a flow on a canvas from a few kinds of steps:
 
 - **Start**, with optional base info (where things are, what Claude should know), and an option to begin each run with `/clear` in a fresh conversation.
-- **Prompt**, sent to Claude. A prompt step can also be yours to write ("Write it myself": its text is put into Claude's input as a draft for you to finish and send), and it can pause when done ("Pause when done": the run waits for you, with Claude's choice ready to accept with ▶, and an optional note on what to check). A pause with no prompt only waits for you.
+- **Prompt**, sent to Claude. A prompt step can pause when done ("Pause when done": the run waits for you, with Claude's choice ready to accept with ▶, and an optional note on what to check). A pause with no prompt only waits for you.
 - **Tab title**, where Claude names the tab after what you asked it.
 - **End**, though an output that leads nowhere ends the flow too.
 
 Each step has outputs, short words such as `pass, fail`, and each output leads to the next step, an earlier one included, which makes loops like review, fix, review again. A step can have a run limit, so a loop cannot run forever.
 
-When you press ▶, misag briefs Claude on the rules, then sends the steps one at a time. Claude ends each reply with the output it picked (`FLOW: pass`), and misag's Claude Code hooks move the run on by themselves. The run stops for you when a step pauses or is yours to write, when Claude asks for you (`FLOW: attention`), or when a reply cannot be followed. You can always pick an output yourself, have Claude go on, or stop the run.
+When you press ▶, misag briefs Claude on the rules, then sends the steps one at a time. Claude ends each reply with the output it picked (`FLOW: pass`), and misag's Claude Code hooks move the run on by themselves. The run stops for you when a step pauses, when Claude asks for you (`FLOW: attention`), or when a reply cannot be followed. You can always pick an output yourself, have Claude go on, or stop the run.
 
 Flows export and import as JSON files. Claude can write them too: ask it in a misag tab to "run `misag flow help`, then add a misag flow that …".
 

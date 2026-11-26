@@ -812,18 +812,6 @@ pub fn flow_cleared(db: State<'_, Db>, run_id: i64) -> Result<crate::runs::Clear
     Ok(db.with_conn(|c| runs::cleared(c, run_id))?)
 }
 
-/// The text to put into Claude's input for the run's draft step, if the app owes it (see `runs::prefill_text`).
-#[tauri::command(async)]
-pub fn flow_prefill_text(db: State<'_, Db>, run_id: i64, step_id: String) -> Result<Option<crate::runs::Prefill>, CommandError> {
-    Ok(db.with_conn(|c| runs::prefill_text(c, run_id, &step_id))?)
-}
-
-/// The app put the run's draft step into Claude's input (see `runs::prefilled`).
-#[tauri::command(async)]
-pub fn flow_prefilled(db: State<'_, Db>, run_id: i64, step_id: String, token: i64) -> Result<(), CommandError> {
-    Ok(db.with_conn(|c| runs::prefilled(c, run_id, &step_id, token))?)
-}
-
 #[tauri::command(async)]
 pub fn flow_continue(db: State<'_, Db>, run_id: i64, step_id: String, output: String) -> Result<Option<crate::runs::StepPrompt>, CommandError> {
     Ok(db.with_conn(|c| runs::proceed(c, run_id, &step_id, &output))?)

@@ -183,8 +183,8 @@ fn ended(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Outcome, String>
 
 /// Tells the tab's flow run, if any, that the person sent a prompt; returns the
 /// hook output that adds a finished flow's note to Claude's context, if one is
-/// owed. If it cannot, a run waiting at a manual prompt waits for the person
-/// instead, as it would never see Claude's answer. Skipped across an upgrade (see
+/// owed. If it cannot, a run waiting for the prompt misag typed waits for the
+/// person instead, as it would never see Claude's answer. Skipped across an upgrade (see
 /// `Outcome::Skipped`).
 fn prompted(input: &str, tab_id: &TabId, db_path: &Path) -> Result<Outcome, String> {
     let Some(mut conn) = db::connect_if_current(db_path)? else { return Ok(Outcome::Skipped) };
@@ -206,7 +206,7 @@ fn hook(input: impl Read, tab_id: Option<&TabId>, db_path: Option<&Path>, claude
 /// Reads one hook payload from `input`: a SessionStart is recorded for `tab_id`,
 /// with the Claude process that sent it, a Stop records the background tasks and
 /// moves the tab's flow run on, a SessionEnd forgets the background tasks, and a
-/// UserPromptSubmit tells a run waiting at a manual prompt that the person sent it
+/// UserPromptSubmit tells a run waiting for the prompt misag typed that it was sent
 /// (and hands Claude a finished flow's note, if one is owed). Also returns the hook
 /// event the payload is for, None if the hook did not get as far as reading it.
 fn handle(
@@ -367,44 +367,43 @@ mod tests {
         assert_eq!(db.load_layout().unwrap().tabs[0].kind, TabKind::Claude { claude_session: Some(id()) });
     }
 
-    #[test]
-    fn the_person_s_prompt_moves_a_manual_prompt_on_to_claude_s_answer() {
-        let path = temp_db("hook-prompt");
-        let db = Db::open(path.clone()).unwrap();
+    /// A run of a flow, in tab-1 of a database at `path`, at its first step: a prompt step
+    /// the person moved on by hand into a step whose prompt misag typed.
+    fn typed_run(path: &std::path::Path) -> rusqlite::Connection {
+        let db = Db::open(path.to_path_buf()).unwrap();
         let flow = db.create_flow("F").unwrap().id;
-        let mut g = crate::flows::tests::runnable();
-        g.nodes.push(crate::flows::tests::draft("mp", &["sent"]));
-        g.edges[0].to = "mp".into();
-        g.edges.push(crate::flows::tests::edge("mp", "sent", "p"));
-        db.save_flow_graph(flow, &g).unwrap();
-        let mut conn = db::connect_existing(&path).unwrap();
-        crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
+        db.save_flow_graph(flow, &crate::flows::tests::runnable()).unwrap();
+        let mut conn = db::connect_existing(path).unwrap();
+        let run = crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap().run_id;
         crate::runs::on_stop(&mut conn, &tid("tab-1"), Some("Ready")).unwrap();
-        let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit","prompt":"Fix it"}}"#);
-        // Nothing is printed: a UserPromptSubmit hook's output would reach Claude.
-        assert_eq!(hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap(), Outcome::Prompted(None));
-        assert_eq!(crate::runs::active(&conn).unwrap()[0].status, crate::runs::Status::Running);
+        crate::runs::proceed(&mut conn, run, "p", "fail").unwrap();
+        conn
     }
 
     #[test]
-    fn a_prompt_the_hook_cannot_read_makes_the_manual_prompt_wait_for_the_person() {
+    fn the_person_s_prompt_reaches_the_run_waiting_for_the_prompt_misag_typed() {
+        let path = temp_db("hook-prompt");
+        let conn = typed_run(&path);
+        let prompt = crate::flows::prompt_text(&crate::flows::tests::runnable().nodes[1]);
+        let payload = serde_json::json!({ "session_id": ID, "hook_event_name": "UserPromptSubmit", "prompt": prompt }).to_string();
+        // Nothing is printed: a UserPromptSubmit hook's output would reach Claude.
+        assert_eq!(hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap(), Outcome::Prompted(None));
+        // Its prompt was seen sent, so Claude's next reply is the step's.
+        assert_eq!(crate::runs::on_stop(&mut db::connect_existing(&path).unwrap(), &tid("tab-1"), Some("FLOW: pass")).unwrap(), None);
+        assert_eq!(crate::runs::active(&conn).unwrap(), vec![]);
+    }
+
+    #[test]
+    fn a_prompt_the_hook_cannot_read_makes_the_run_wait_for_the_person() {
         let path = temp_db("hook-prompt-bad");
-        let db = Db::open(path.clone()).unwrap();
-        let flow = db.create_flow("F").unwrap().id;
-        let mut g = crate::flows::tests::runnable();
-        g.nodes.push(crate::flows::tests::draft("mp", &["sent"]));
-        g.edges[0].to = "mp".into();
-        db.save_flow_graph(flow, &g).unwrap();
-        let mut conn = db::connect_existing(&path).unwrap();
-        crate::runs::start(&mut conn, flow, &tid("tab-1")).unwrap();
-        crate::runs::on_stop(&mut conn, &tid("tab-1"), Some("Ready")).unwrap();
+        let conn = typed_run(&path);
         let payload = format!(r#"{{"session_id":"{ID}","hook_event_name":"UserPromptSubmit"}}"#);
         let err = hook(payload.as_bytes(), Some(&tid("tab-1")), Some(&path), Some(42)).unwrap_err();
         assert!(err.contains("could not tell the flow run about the prompt"), "{err}");
-        // Not left at "Waiting for you" while Claude answers a prompt the run never saw.
+        // Not left waiting for a reply the run would never take for the step's.
         let run = &crate::runs::active(&conn).unwrap()[0];
         assert_eq!(run.status, crate::runs::Status::Attention);
-        assert!(run.note.as_deref().unwrap().contains("Pick an output"), "{:?}", run.note);
+        assert!(run.note.as_deref().unwrap().contains("press Continue"), "{:?}", run.note);
     }
 
     #[test]
